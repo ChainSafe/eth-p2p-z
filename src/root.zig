@@ -23,6 +23,13 @@ pub const QuicTransport = transport.QuicTransport;
 
 pub const PubSubMessage = protobuf.rpc.Message;
 
+// New comptime API modules (Zig 0.16 rewrite)
+pub const tls = security.tls;
+pub const ping = @import("protocol/ping.zig");
+pub const quic_new = @import("transport/quic/quic.zig");
+pub const quic_engine_new = @import("transport/quic/engine.zig");
+pub const Switch = swarm.Switch;
+
 test {
     std.testing.refAllDeclsRecursive(@This());
 }

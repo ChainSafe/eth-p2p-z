@@ -1,722 +1,511 @@
-const lsquic = @cImport({
-    @cInclude("lsquic.h");
-    @cInclude("lsquic_types.h");
-    @cInclude("lsxpack_header.h");
-});
 const std = @import("std");
-const builtin = @import("builtin");
-const libp2p = @import("root.zig");
-const quic = libp2p.transport.quic;
-const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
-const mss = protocols.mss;
-const multiaddr = @import("multiaddr").multiaddr;
-const Multiaddr = multiaddr.Multiaddr;
-const MultiaddrProtocol = multiaddr.Protocol;
-const io_loop = libp2p.thread_event_loop;
-const net = std.net;
-const posix = std.posix;
-const mem = std.mem;
+const Io = std.Io;
+const log = std.log.scoped(.@"switch");
 
-const has_getifaddrs = switch (builtin.target.os.tag) {
-    .windows, .wasi => false,
-    else => true,
+const transport_mod = @import("transport/transport.zig");
+const protocol_mod = @import("protocol/protocol.zig");
+const multistream = @import("protocol/multistream.zig");
+const identify_mod = @import("protocol/identify.zig");
+const engine_mod = @import("transport/quic/engine.zig");
+const QuicEngine = engine_mod.QuicEngine;
+const quic_mod = @import("transport/quic/quic.zig");
+const multiaddr = @import("multiaddr");
+const Multiaddr = multiaddr.Multiaddr;
+const ssl = @import("ssl");
+const net = Io.net;
+
+/// Configuration for comptime Switch composition.
+pub const SwitchConfig = struct {
+    /// Transport types (must satisfy assertTransportInterface).
+    transports: []const type,
+    /// Protocol types (must satisfy assertProtocolInterface — Handler structs with id, handleInbound, handleOutbound).
+    protocols: []const type,
 };
 
-const IFF_LOOPBACK: u32 = 0x8;
+/// Runtime configuration for the Switch's QUIC engine infrastructure.
+pub const EngineConfig = struct {
+    host_key: ?*ssl.EVP_PKEY = null,
+};
 
-const IfAddrs = if (has_getifaddrs)
-    extern struct {
-        ifa_next: ?*IfAddrs,
-        ifa_name: ?[*:0]const u8,
-        ifa_flags: u32,
-        ifa_addr: ?*posix.sockaddr,
-        ifa_netmask: ?*posix.sockaddr,
-        ifa_dstaddr: ?*posix.sockaddr,
-        ifa_data: ?*anyopaque,
+/// Comptime-composed libp2p Switch.
+///
+/// Validates transports and protocols at compile time, dispatches inbound
+/// streams via multistream-select to the matching protocol handler.
+/// Uses Io.Group.async for concurrent connection/stream handling (cooperative fibers).
+pub fn Switch(comptime config: SwitchConfig) type {
+    // Compile-time validation
+    inline for (config.transports) |T| {
+        comptime transport_mod.assertTransportInterface(T);
     }
-else
-    opaque {};
-
-const getifaddrs_fn = if (has_getifaddrs)
-    @extern(*const fn (*?*IfAddrs) callconv(.c) i32, .{ .name = "getifaddrs" })
-else
-    @as(*const fn (*?*IfAddrs) callconv(.c) i32, undefined);
-
-const freeifaddrs_fn = if (has_getifaddrs)
-    @extern(*const fn (?*IfAddrs) callconv(.c) void, .{ .name = "freeifaddrs" })
-else
-    @as(*const fn (?*IfAddrs) callconv(.c) void, undefined);
-
-/// The Switch struct is the main entry point for managing connections and protocol handlers.
-/// It acts as a central hub for handling incoming and outgoing connections,
-/// as well as managing protocol handlers for different protocols.
-/// It supports multiple transports, but currently only one transport is supported at a time.
-/// The Switch is responsible for creating and managing connections, listeners, and protocol handlers.
-/// It also provides methods for dialing peers, listening for incoming connections,
-/// and handling protocol messages.
-pub const Switch = struct {
-    mss_handler: mss.MultistreamSelectHandler,
-
-    // TODO: In the future, we should support multiple transports.
-    // Only one transport is supported at a time.
-    transport: *quic.QuicTransport,
-
-    // TODO: Once peerid is implemented, we can use it to identify connections.
-    // For now, we use the peer address as the key.
-    outgoing_connections: std.StringArrayHashMap(*quic.QuicConnection),
-
-    allocator: Allocator,
-
-    listeners: std.StringArrayHashMap(quic.QuicListener),
-
-    incoming_connections: std.ArrayList(*quic.QuicConnection),
-
-    is_stopping: std.atomic.Value(bool),
-
-    stopped_notify: std.Thread.ResetEvent,
-
-    pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
-        self.* = Switch{
-            .transport = transport,
-            .outgoing_connections = std.StringArrayHashMap(*quic.QuicConnection).init(allocator),
-            .allocator = allocator,
-            .listeners = std.StringArrayHashMap(quic.QuicListener).init(allocator),
-            .incoming_connections = .empty,
-            .is_stopping = std.atomic.Value(bool).init(false),
-            .mss_handler = mss.MultistreamSelectHandler.init(allocator),
-            .stopped_notify = .{},
-        };
+    inline for (config.protocols) |P| {
+        comptime protocol_mod.assertProtocolInterface(P);
     }
 
-    pub fn deinit(self: *Switch) void {
-        self.cleanResources();
-    }
+    return struct {
+        const Self = @This();
 
-    pub fn stop(self: *Switch) void {
-        self.doClose();
+        /// Comptime-generated tuple type holding one instance per registered protocol handler.
+        const HandlerTuple = std.meta.Tuple(config.protocols);
 
-        self.stopped_notify.wait();
-    }
+        allocator: Allocator,
+        handlers: HandlerTuple,
+        server_engine: ?*QuicEngine = null,
+        client_engine: ?*QuicEngine = null,
+        connections: std.StringHashMap(*engine_mod.QuicConnection),
+        background: Io.Group,
+        engine_config: EngineConfig,
 
-    pub fn doClose(self: *Switch) void {
-        if (self.is_stopping.swap(true, .acq_rel)) {
-            return;
+        /// Protocol IDs for multistream-select negotiation (computed at comptime).
+        const supported_protocol_ids = protocol_mod.protocolIds(config.protocols);
+
+        pub fn init(allocator: Allocator, engine_config: EngineConfig, handlers: HandlerTuple) Self {
+            return .{
+                .allocator = allocator,
+                .handlers = handlers,
+                .connections = std.StringHashMap(*engine_mod.QuicConnection).init(allocator),
+                .background = .init,
+                .engine_config = engine_config,
+            };
         }
 
-        var listener_iter = self.listeners.iterator();
-        while (listener_iter.next()) |entry| {
-            entry.value_ptr.stop() catch unreachable;
+        /// Tear down the Switch. Stops all background fibers and engines if
+        /// close() was not already called, then frees resources.
+        pub fn deinit(self: *Self, io: Io) void {
+            // Stop background fibers and engines if close() wasn't called
+            self.close(io);
+            self.connections.deinit();
+            if (self.server_engine) |eng| {
+                eng.deinit();
+                self.server_engine = null;
+            }
+            if (self.client_engine) |eng| {
+                eng.deinit();
+                self.client_engine = null;
+            }
         }
 
-        self.transport.stop() catch unreachable;
+        // ── Swarm API (Tasks 3-6) ──────────────────────────────────────────
 
-        self.stopped_notify.set();
-    }
+        /// Start listening for inbound QUIC connections on the given multiaddr.
+        /// Creates the server engine lazily on first call.
+        pub fn listen(self: *Self, io: Io, addr: Multiaddr) !void {
+            const parsed = try quic_mod.parseQuicMultiaddr(addr);
 
-    const ListenCallbackCtx = struct {
-        network_switch: *Switch,
-        // user-defined context for the callback
-        callback_ctx: ?*anyopaque,
-        // user-defined callback function
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-
-        fn listenCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
-            const self: *ListenCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            const conn = res catch |err| {
-                self.callback(self.callback_ctx, err);
-                return;
-            };
-
-            conn.onStream(self, newStreamCallback);
-            conn.close_ctx = .{
-                .callback = Switch.onIncomingConnectionClose,
-                .callback_ctx = self.network_switch,
-                .active_callback_ctx = null,
-                .active_callback = null,
-            };
-            self.network_switch.incoming_connections.append(self.network_switch.allocator, conn) catch unreachable;
-        }
-
-        fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
-            const self: *ListenCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            const stream = res catch |err| {
-                self.callback(self.callback_ctx, err);
-                return;
-            };
-
-            if (stream.close_ctx == null) {
-                stream.close_ctx = .{
-                    .callback_ctx = null,
-                    .callback = null,
-                    .active_callback_ctx = null,
-                    .active_callback = null,
-                };
+            if (self.server_engine == null) {
+                const eng = try QuicEngine.init(self.allocator, .{
+                    .is_server = true,
+                    .host_key = self.engine_config.host_key,
+                });
+                eng.setIo(io);
+                self.server_engine = eng;
             }
 
-            self.network_switch.mss_handler.onResponderStart(stream, self.callback_ctx, self.callback) catch |err| {
-                std.log.warn("Failed to start responder: {}", .{err});
-                self.callback(self.callback_ctx, err);
+            const eng = self.server_engine.?;
+            try eng.bindSocket(io, &parsed.ip);
+            eng.startBackgroundLoops(io);
 
-                // TODO: There is an error thrown in the lsquic library when close the stream in the server mode.
-                // So that right now the stream will be closed when the connection close function called.
-                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
-                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                // stream.close(null, struct {
-                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                // }.callback);
-                // stream.deinit();
-                // stream.conn.engine.allocator.destroy(stream);
-                return;
-            };
-
-            // `onResponderStart` should set the stream's protocol message handler.
-            stream.proto_msg_handler.?.onActivated(stream) catch |err| {
-                std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
-                self.callback(self.callback_ctx, err);
-
-                // TODO: There is an error thrown in the lsquic library when close the stream in the server mode.
-                // So that right now the stream will be closed when the connection close function called.
-                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
-                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                // stream.close(null, struct {
-                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                // }.callback);
-                // stream.proto_msg_handler.?.onClose(stream) catch |e| {
-                //     std.log.warn("Protocol message handler failed with error: {}.", .{e});
-                // };
-                // stream.deinit();
-                // stream.conn.engine.allocator.destroy(stream);
-                return;
-            };
+            self.background.async(io, Self.acceptLoop, .{ self, io });
         }
-    };
 
-    const StreamCallbackCtx = struct {
-        network_switch: *Switch,
-        proposed_protocols: []const []const u8,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+        /// Returns the server engine's bound address (useful for port-0 tests).
+        pub fn listenAddrs(self: *const Self) ?net.IpAddress {
+            const eng = self.server_engine orelse return null;
+            const sock = eng.socket orelse return null;
+            return sock.address;
+        }
 
-        fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
-            const self: *StreamCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            defer self.network_switch.allocator.destroy(self);
+        /// Dial a remote peer via QUIC multiaddr.
+        /// Creates the client engine lazily on first call. Returns peer_id bytes
+        /// (owned by the connections map — valid until peer disconnects).
+        pub fn dial(self: *Self, io: Io, addr: Multiaddr) ![]const u8 {
+            const parsed = try quic_mod.parseQuicMultiaddr(addr);
 
-            const stream = res catch |err| {
-                self.callback(self.callback_ctx, err);
-                return;
-            };
-
-            if (stream.close_ctx == null) {
-                stream.close_ctx = .{
-                    .callback_ctx = null,
-                    .callback = null,
-                    .active_callback_ctx = null,
-                    .active_callback = null,
-                };
+            if (self.client_engine == null) {
+                const eng = try QuicEngine.init(self.allocator, .{
+                    .is_server = false,
+                    .host_key = self.engine_config.host_key,
+                });
+                eng.setIo(io);
+                try eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
+                eng.startBackgroundLoops(io);
+                self.client_engine = eng;
             }
 
-            stream.proposed_protocols = self.proposed_protocols;
+            const eng = self.client_engine.?;
+            var remote_sa = engine_mod.ipAddressToSockaddr(parsed.ip);
+            const local_bound = (eng.socket orelse return error.NoSocket).address;
+            var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
+            const conn = try eng.connect(io, @ptrCast(@alignCast(&remote_sa)), @ptrCast(@alignCast(&local_sa)));
 
-            self.network_switch.mss_handler.onInitiatorStart(stream, self.callback_ctx, self.callback) catch |err| {
-                std.log.warn("Failed to start initiator: {}", .{err});
-                self.callback(self.callback_ctx, err);
+            // Wait for TLS handshake — suspends until onHskDone fires
+            const peer_id = conn.waitHandshake(io) catch return error.HandshakeFailed;
+            var pid_buf: [128]u8 = undefined;
+            const raw_peer_id = peer_id.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
 
-                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
-                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                }.callback);
-                return;
-            };
+            // Register connection (heap-owned key)
+            const owned_pid = try self.allocator.dupe(u8, raw_peer_id);
+            errdefer self.allocator.free(owned_pid);
+            try self.connections.put(owned_pid, conn);
 
-            // `onInitiatorStart` should set the stream's protocol message handler.
-            stream.proto_msg_handler.?.onActivated(stream) catch |err| {
-                std.log.warn("Proto message handler failed with error: {}. ", .{err});
-                self.callback(self.callback_ctx, err);
+            // Spawn connection handler in background
+            self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn });
 
-                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
-                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                }.callback);
-                stream.proto_msg_handler.?.onClose(stream) catch |e| {
-                    std.log.warn("Protocol message handler failed with error: {}.", .{e});
-                };
-                return;
-            };
+            return owned_pid;
         }
-    };
 
-    const ConnectCallbackCtx = struct {
-        network_switch: *Switch,
-        address: Multiaddr,
-        proposed_protocols: []const []const u8,
-        user_callback_ctx: ?*anyopaque,
-        user_callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-
-        fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
-            const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            defer self.network_switch.allocator.destroy(self);
-
-            const conn = res catch |err| {
-                std.log.warn("Connection failed: {}", .{err});
-                self.user_callback(self.user_callback_ctx, err);
-                return;
-            };
-
-            conn.close_ctx = .{
-                .callback = Switch.onOutgoingConnectionClose,
-                .callback_ctx = self.network_switch,
-                .active_callback = null,
-                .active_callback_ctx = null,
-            };
-
-            const address_str = self.address.toString(self.network_switch.allocator) catch |err| {
-                std.log.warn("Failed to convert address to string: {}", .{err});
-                self.user_callback(self.user_callback_ctx, err);
-                return;
-            };
-
-            self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
-
-            const stream_ctx = self.network_switch.allocator.create(StreamCallbackCtx) catch unreachable;
-            stream_ctx.* = StreamCallbackCtx{
-                .network_switch = self.network_switch,
-                .callback_ctx = self.user_callback_ctx,
-                .callback = self.user_callback,
-                .proposed_protocols = self.proposed_protocols,
-            };
-
-            conn.newStream(stream_ctx, StreamCallbackCtx.newStreamCallback);
+        /// Background fiber: accepts inbound connections from the server engine.
+        fn acceptLoop(self: *Self, io: Io) void {
+            const eng = self.server_engine orelse return;
+            while (true) {
+                const conn = eng.accept(io) catch return;
+                self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn });
+            }
         }
-    };
 
-    pub fn newStream(
-        self: *Switch,
-        address: Multiaddr,
-        proposed_protocols: []const []const u8,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    ) void {
-        if (self.is_stopping.load(.acquire)) {
-            callback(callback_ctx, error.SwitchStopped);
-            return;
-        }
-        const address_str = address.toString(self.allocator) catch |err| {
-            std.log.warn("Failed to convert address to string: {}", .{err});
-            callback(callback_ctx, err);
-            return;
-        };
-        defer self.allocator.free(address_str);
+        /// Manages a single QUIC connection's lifecycle.
+        /// Extracts peer_id from TLS, registers in connections map (if not already
+        /// registered by dial), accepts streams. Connection map cleanup is handled
+        /// by close()/deinit() — NOT by this task's defers — to avoid races.
+        fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection) void {
+            // Wait for TLS handshake to complete (server: immediate, client: suspends)
+            var pid_buf: [128]u8 = undefined;
+            const peer_id: ?[]const u8 = if (conn.waitHandshake(io)) |pid|
+                pid.toBytes(&pid_buf) catch null
+            else |_|
+                null;
 
-        // Check if the connection already exists.
-        if (self.outgoing_connections.get(address_str)) |conn| {
-            // If the connection already exists, we can just create a new stream on it.
-            const stream_ctx = self.allocator.create(StreamCallbackCtx) catch unreachable;
-            stream_ctx.* = StreamCallbackCtx{
-                .network_switch = self,
-                .callback_ctx = callback_ctx,
-                .callback = callback,
-                .proposed_protocols = proposed_protocols,
-            };
-
-            conn.newStream(stream_ctx, StreamCallbackCtx.newStreamCallback);
-        } else {
-            const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
-            connect_ctx.* = ConnectCallbackCtx{
-                .network_switch = self,
-                .address = address,
-                .proposed_protocols = proposed_protocols,
-                .user_callback_ctx = callback_ctx,
-                .user_callback = callback,
-            };
-            self.transport.dial(address, connect_ctx, ConnectCallbackCtx.connectCallback);
-        }
-    }
-
-    pub fn listen(
-        self: *Switch,
-        address: Multiaddr,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    ) !void {
-        if (self.is_stopping.load(.acquire)) {
-            return error.SwitchStopped;
-        }
-        const address_str = try address.toString(self.allocator);
-
-        const gop = self.listeners.getOrPut(address_str) catch unreachable;
-
-        if (gop.found_existing) {
-            self.allocator.free(address_str);
-            try gop.value_ptr.listen(address);
-            return;
-        } else {
-            const accept_callback_ctx = self.allocator.create(ListenCallbackCtx) catch unreachable;
-            accept_callback_ctx.* = ListenCallbackCtx{
-                .network_switch = self,
-                .callback_ctx = callback_ctx,
-                .callback = callback,
-            };
-
-            gop.value_ptr.* = self.transport.newListener(accept_callback_ctx, ListenCallbackCtx.listenCallback);
-
-            gop.value_ptr.listen(address) catch |err| {
-                self.allocator.destroy(accept_callback_ctx);
-                const removed_entry = self.listeners.fetchOrderedRemove(address_str).?;
-                self.allocator.free(removed_entry.key);
-                std.log.warn("Failed to start listener on {s}: {s}", .{ address_str, @errorName(err) });
-                return error.ListenerStartFailed;
-            };
-        }
-    }
-
-    pub fn addProtocolHandler(
-        self: *Switch,
-        proto_id: protocols.ProtocolId,
-        handler: protocols.AnyProtocolHandler,
-    ) !void {
-        try self.mss_handler.addProtocolHandler(proto_id, handler);
-    }
-
-    pub const ListenAddressError = Allocator.Error || posix.GetHostNameError || multiaddr.Error || error{ AddressResolutionFailed, NoUsableAddress };
-
-    pub fn listenMultiaddrs(self: *Switch, allocator: Allocator) ListenAddressError!std.ArrayList([]u8) {
-        var results: std.ArrayList([]u8) = .empty;
-        errdefer Switch.freeListenMultiaddrs(allocator, &results);
-
-        var host_addrs = try collectHostAddrs(allocator);
-        defer host_addrs.deinit(allocator);
-
-        var listener_iter = self.listeners.iterator();
-        while (listener_iter.next()) |entry| {
-            const key_slice = entry.key_ptr.*;
-            var base_ma = Multiaddr.fromString(allocator, key_slice) catch |err| {
-                std.log.warn("failed to parse listener multiaddr {s}: {s}", .{ key_slice, @errorName(err) });
-                continue;
-            };
-            defer base_ma.deinit();
-
-            const ip_index = findIpComponentIndex(base_ma) orelse continue;
-
-            for (host_addrs.items) |host| {
-                const proto = host.toProtocol();
-                const maybe_ma = base_ma.replace(allocator, ip_index, proto) catch |err| {
-                    std.log.warn(
-                        "failed to update listener multiaddr {s} with host protocol: {s}",
-                        .{ key_slice, @errorName(err) },
-                    );
-                    continue;
-                };
-                if (maybe_ma) |mut_ma| {
-                    defer mut_ma.deinit();
-                    const addr_str = mut_ma.toString(allocator) catch |err| {
-                        std.log.warn(
-                            "unable to render listener multiaddr for {s}: {s}",
-                            .{ key_slice, @errorName(err) },
-                        );
-                        continue;
-                    };
-                    if (!containsString(results.items, addr_str)) {
-                        results.append(allocator, addr_str) catch |err| {
-                            allocator.free(addr_str);
-                            return err;
+            // Register if not already registered (accepted connections from listen)
+            if (peer_id) |pid| {
+                if (!self.connections.contains(pid)) {
+                    const owned = self.allocator.dupe(u8, pid) catch null;
+                    if (owned) |key| {
+                        self.connections.put(key, conn) catch {
+                            self.allocator.free(key);
                         };
-                    } else {
-                        allocator.free(addr_str);
                     }
+                }
+
+                // Auto-trigger identify (like go-libp2p's IDService).
+                // Runs in background so it doesn't block stream acceptance.
+                self.background.async(io, Self.identifyPeer, .{ self, io, pid });
+            }
+
+            // Accept streams loop — blocks until connection closes or engine stops.
+            // Note: stream_group tasks are implicitly cleaned up when the parent
+            // group (self.background) is canceled by close().
+            while (true) {
+                const s_inner = conn.acceptStream(io) catch break;
+                self.background.async(io, Self.swarmStreamTask, .{
+                    self, io, quic_mod.Stream{ .inner = s_inner }, SwarmStreamCtx{ .peer_id = peer_id },
+                });
+            }
+        }
+
+        /// Concrete context type for swarm stream tasks (Io.Group.async requires
+        /// concrete types — anytype cannot be used with ArgsTuple).
+        const SwarmStreamCtx = struct {
+            peer_id: ?[]const u8 = null,
+        };
+
+        /// Whether identify is registered as a protocol (comptime check).
+        const has_identify = blk: {
+            for (config.protocols) |P| {
+                if (P == identify_mod.Handler) break :blk true;
+            }
+            break :blk false;
+        };
+
+        /// Auto-trigger identify on a newly connected peer.
+        /// No-op if identify is not registered in this Switch's protocols.
+        fn identifyPeer(self: *Self, io: Io, peer_id: []const u8) void {
+            if (has_identify) {
+                self.newStream(io, peer_id, identify_mod.Handler) catch |err| {
+                    log.warn("auto-identify failed for peer: {}", .{err});
+                };
+            }
+        }
+
+        /// Handles a single inbound stream: multistream-negotiate then dispatch.
+        fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: SwarmStreamCtx) void {
+            var mutable_stream = s;
+            self.dispatchStream(io, &mutable_stream, ctx) catch return;
+        }
+
+        /// Open a new outbound stream to a connected peer.
+        /// Looks up the connection by peer_id, opens a QUIC stream, negotiates
+        /// the protocol via multistream-select, and runs handleOutbound.
+        /// peer_id is automatically passed as ctx.peer_id.
+        pub fn newStream(self: *Self, io: Io, peer_id: []const u8, comptime P: type) !void {
+            comptime protocol_mod.assertProtocolInterface(P);
+            const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+            const s_inner = try conn.openStream(io);
+            var s = quic_mod.Stream{ .inner = s_inner };
+            _ = try multistream.negotiateOutbound(io, &s, &.{P.id});
+            inline for (config.protocols, 0..) |Proto, i| {
+                if (Proto == P) {
+                    try self.handlers[i].handleOutbound(io, &s, .{
+                        .peer_id = @as(?[]const u8, peer_id),
+                    });
+                    return;
                 }
             }
         }
 
-        if (results.items.len == 0) {
-            return error.NoUsableAddress;
+        /// Gracefully shut down the Switch.
+        /// Cancels background fibers, stops engines, notifies handlers, cleans up.
+        pub fn close(self: *Self, io: Io) void {
+            // Cancel ALL background fibers: accept loops, connection tasks, AND
+            // stream tasks (all spawned on self.background).
+            self.background.cancel(io);
+
+            // Stop engines (closes their internal background loops).
+            // Must happen after canceling Switch fibers, since those fibers
+            // may be blocked on engine IO operations.
+            if (self.server_engine) |eng| eng.stop(io);
+            if (self.client_engine) |eng| eng.stop(io);
+
+            // Notify handlers, free connection objects, and free map keys
+            var it = self.connections.iterator();
+            while (it.next()) |entry| {
+                self.notifyPeerDisconnected(@as(?[]const u8, entry.key_ptr.*));
+                entry.value_ptr.*.deinit();
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.connections.clearRetainingCapacity();
         }
 
-        return results;
-    }
+        /// Negotiate protocol on an inbound stream and dispatch to handler.
+        /// io flows directly through multistream and protocol handler -- no adapter.
+        pub fn dispatchStream(self: *Self, io: Io, s: anytype, ctx: anytype) !void {
+            const proto_id = try multistream.negotiateInbound(io, s, &supported_protocol_ids);
 
-    pub fn freeListenMultiaddrs(allocator: Allocator, list: *std.ArrayList([]u8)) void {
-        for (list.items) |addr| {
-            allocator.free(addr);
+            inline for (config.protocols, 0..) |P, i| {
+                if (std.mem.eql(u8, proto_id, P.id)) {
+                    try self.handlers[i].handleInbound(io, s, ctx);
+                    return;
+                }
+            }
         }
-        list.deinit(allocator);
-    }
 
-    const HostAddr = union(enum) {
-        ipv4: [4]u8,
-        ipv6: [16]u8,
+        /// Get a mutable pointer to the handler instance for protocol P.
+        /// Allows callers to access handler state directly (e.g. identify results).
+        pub fn getHandler(self: *Self, comptime P: type) *P {
+            inline for (config.protocols, 0..) |Proto, i| {
+                if (Proto == P) return &self.handlers[i];
+            }
+            @compileError("Protocol '" ++ @typeName(P) ++ "' not registered in Switch");
+        }
 
-        fn toProtocol(self: HostAddr) MultiaddrProtocol {
-            return switch (self) {
-                .ipv4 => |bytes| MultiaddrProtocol{ .Ip4 = net.Ip4Address.init(bytes, 0) },
-                .ipv6 => |bytes| MultiaddrProtocol{ .Ip6 = net.Ip6Address.init(bytes, 0, 0, 0) },
+        /// Notify all protocol handlers that a peer has disconnected.
+        /// Only calls handlers that declare `onPeerDisconnected` (comptime check).
+        /// Matches rust-libp2p's FromSwarm::ConnectionClosed pattern.
+        pub fn notifyPeerDisconnected(self: *Self, peer_id: ?[]const u8) void {
+            const pid = peer_id orelse return;
+            inline for (config.protocols, 0..) |P, i| {
+                if (@hasDecl(P, "onPeerDisconnected")) {
+                    self.handlers[i].onPeerDisconnected(pid);
+                }
+            }
+        }
+    };
+}
+
+// --- Tests ---
+
+test "Switch comptime validation accepts valid config" {
+    const MockTransport = struct {
+        pub const Connection = struct {
+            pub const Stream = StreamType;
+            const StreamType = struct {
+                pub fn read(_: *@This(), _: Io, _: []u8) anyerror!usize {
+                    return 0;
+                }
+                pub fn write(_: *@This(), _: Io, _: []const u8) anyerror!usize {
+                    return 0;
+                }
+                pub fn close(_: *@This(), _: Io) void {}
             };
+            pub fn openStream(_: *@This(), _: Io) !StreamType {
+                return .{};
+            }
+            pub fn acceptStream(_: *@This(), _: Io) !StreamType {
+                return .{};
+            }
+            pub fn close(_: *@This(), _: Io) void {}
+        };
+        pub const Stream = Connection.StreamType;
+        pub const Listener = struct {
+            pub fn accept(_: *@This(), _: Io) !Connection {
+                return .{};
+            }
+            pub fn close(_: *@This(), _: Io) void {}
+        };
+        pub fn dial(_: *@This(), _: Io, _: anytype) !Connection {
+            return .{};
+        }
+        pub fn listen(_: *@This(), _: Io, _: anytype) !Listener {
+            return .{};
+        }
+        pub fn matchesMultiaddr(_: anytype) bool {
+            return false;
         }
     };
 
-    fn collectHostAddrs(allocator: Allocator) ListenAddressError!std.ArrayList(HostAddr) {
-        if (has_getifaddrs) {
-            const maybe_result = collectHostAddrsFromInterfaces(allocator) catch |err| switch (err) {
-                error.AddressResolutionFailed, error.NoUsableAddress => null,
-                else => return err,
-            };
-            if (maybe_result) |res| {
-                return res;
-            }
-        }
+    const MockProtocol = struct {
+        pub const id = "/test/mock/1.0.0";
+        pub fn handleInbound(_: *@This(), _: Io, _: anytype, _: anytype) !void {}
+        pub fn handleOutbound(_: *@This(), _: Io, _: anytype, _: anytype) !void {}
+    };
 
-        return collectHostAddrsFromHostname(allocator);
+    const TestSwitch = Switch(.{
+        .transports = &.{MockTransport},
+        .protocols = &.{MockProtocol},
+    });
+
+    const io = std.testing.io;
+    var sw = TestSwitch.init(std.testing.allocator, .{}, .{MockProtocol{}});
+    defer sw.deinit(io);
+
+    // Verify protocol IDs are correct
+    try std.testing.expectEqualStrings("/test/mock/1.0.0", TestSwitch.supported_protocol_ids[0]);
+}
+
+test "Swarm ping over QUIC" {
+    const ping_mod = @import("protocol/ping.zig");
+    const tls_mod = @import("security/tls.zig");
+    const ma = multiaddr;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key1);
+    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key2);
+
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{ping_mod.Handler},
+    });
+
+    // Server
+    var server = Node.init(allocator, .{ .host_key = key1 }, .{ping_mod.Handler{}});
+    defer server.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr.deinit();
+    server.listen(io, listen_addr) catch return;
+
+    // Client
+    var client = Node.init(allocator, .{ .host_key = key2 }, .{ping_mod.Handler{}});
+    defer client.deinit(io);
+
+    const bound = server.listenAddrs() orelse return;
+    const port = switch (bound) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr.deinit();
+
+    const peer_id = client.dial(io, dial_addr) catch return;
+
+    // Ping via newStream — Handler generates payload and measures RTT internally
+    client.newStream(io, peer_id, ping_mod.Handler) catch |err| {
+        log.warn("ping failed: {}", .{err});
+    };
+
+    client.close(io);
+    server.close(io);
+}
+
+test "Swarm gossipsub subscription over QUIC" {
+    const gossipsub_service = @import("protocol/gossipsub/service.zig");
+    const tls_mod = @import("security/tls.zig");
+    const ma = multiaddr;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key1);
+    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key2);
+
+    // Server gossipsub
+    const svc1 = gossipsub_service.Service.init(allocator, .{}) catch return;
+    defer svc1.deinit();
+
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{gossipsub_service.Handler},
+    });
+    var server = Node.init(allocator, .{ .host_key = key1 }, .{gossipsub_service.Handler{ .svc = svc1 }});
+    defer server.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr.deinit();
+    server.listen(io, listen_addr) catch return;
+
+    // Client gossipsub
+    const svc2 = gossipsub_service.Service.init(allocator, .{}) catch return;
+    defer svc2.deinit();
+    svc2.subscribe("test-topic") catch return;
+
+    var client = Node.init(allocator, .{ .host_key = key2 }, .{gossipsub_service.Handler{ .svc = svc2 }});
+    defer client.deinit(io);
+
+    const bound = server.listenAddrs() orelse return;
+    const port = switch (bound) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr.deinit();
+
+    const peer_id = client.dial(io, dial_addr) catch return;
+
+    // Open gossipsub stream -- newStream auto-provides peer_id ctx
+    client.newStream(io, peer_id, gossipsub_service.Handler) catch return;
+
+    // Wait for subscription RPC to arrive
+    const sleep_timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(100),
+        .clock = .awake,
+    } };
+    sleep_timeout.sleep(io) catch {};
+
+    // Verify subscription event on server
+    const events = svc1.drainEvents() catch return;
+    defer allocator.free(events);
+    var found = false;
+    for (events) |event| {
+        switch (event) {
+            .subscription_changed => found = true,
+            else => {},
+        }
+    }
+    if (!found) {
+        log.warn("gossipsub subscription event not found in {} events", .{events.len});
     }
 
-    fn collectHostAddrsFromInterfaces(allocator: Allocator) ListenAddressError!std.ArrayList(HostAddr) {
-        comptime {
-            if (!has_getifaddrs) @compileError("collectHostAddrsFromInterfaces is unavailable on this target");
-        }
-
-        var result: std.ArrayList(HostAddr) = .empty;
-        errdefer result.deinit(allocator);
-
-        var ifaddrs_head: ?*IfAddrs = null;
-        if (getifaddrs_fn(&ifaddrs_head) != 0) {
-            return error.AddressResolutionFailed;
-        }
-        defer freeifaddrs_fn(ifaddrs_head);
-
-        var cursor = ifaddrs_head;
-        while (cursor) |ifa| : (cursor = ifa.*.ifa_next) {
-            const addr_ptr = ifa.*.ifa_addr orelse continue;
-            if ((ifa.*.ifa_flags & IFF_LOOPBACK) != 0) continue;
-
-            switch (addr_ptr.*.family) {
-                posix.AF.INET => {
-                    const bytes: *const [16]u8 = @ptrCast(addr_ptr);
-                    // IPv4 address is at offset 4-7 in sockaddr_in (2 bytes family + 2 bytes port + 4 bytes addr)
-                    const ip_bytes: [4]u8 = bytes[4..8].*;
-                    if (ip_bytes[0] == 127 or ip_bytes[0] == 0) continue;
-                    const candidate = HostAddr{ .ipv4 = ip_bytes };
-                    if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(allocator, candidate);
-                    }
-                },
-                posix.AF.INET6 => {
-                    const bytes: *const [28]u8 = @ptrCast(addr_ptr);
-                    // IPv6 address is at offset 8-23 in sockaddr_in6
-                    const ip_bytes: [16]u8 = bytes[8..24].*;
-                    if (isIpv6Loopback(ip_bytes) or isIpv6Unspecified(ip_bytes) or isIpv6LinkLocal(ip_bytes)) {
-                        continue;
-                    }
-                    const candidate = HostAddr{ .ipv6 = ip_bytes };
-                    if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(allocator, candidate);
-                    }
-                },
-                else => continue,
-            }
-        }
-
-        if (result.items.len == 0) {
-            return error.NoUsableAddress;
-        }
-
-        return result;
-    }
-
-    fn collectHostAddrsFromHostname(allocator: Allocator) ListenAddressError!std.ArrayList(HostAddr) {
-        var result: std.ArrayList(HostAddr) = .empty;
-        errdefer result.deinit(allocator);
-
-        var hostname_buf: [posix.HOST_NAME_MAX]u8 = undefined;
-        const hostname = try posix.gethostname(&hostname_buf);
-
-        const addr_list = net.getAddressList(allocator, hostname, 0) catch |err| {
-            return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.AddressResolutionFailed,
-            };
-        };
-        defer addr_list.deinit();
-
-        for (addr_list.addrs) |addr| {
-            switch (addr.any.family) {
-                posix.AF.INET => {
-                    const ip_bytes = mem.toBytes(addr.in.sa.addr);
-                    if (ip_bytes[0] == 127 or ip_bytes[0] == 0) continue;
-                    const candidate = HostAddr{ .ipv4 = ip_bytes };
-                    if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(allocator, candidate);
-                    }
-                },
-                posix.AF.INET6 => {
-                    const ip_bytes = mem.toBytes(addr.in6.sa.addr);
-                    if (isIpv6Loopback(ip_bytes) or isIpv6Unspecified(ip_bytes) or isIpv6LinkLocal(ip_bytes)) {
-                        continue;
-                    }
-                    const candidate = HostAddr{ .ipv6 = ip_bytes };
-                    if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(allocator, candidate);
-                    }
-                },
-                else => {},
-            }
-        }
-
-        if (result.items.len == 0) {
-            return error.NoUsableAddress;
-        }
-
-        return result;
-    }
-
-    fn containsHostAddr(haystack: []const HostAddr, needle: HostAddr) bool {
-        for (haystack) |existing| {
-            switch (existing) {
-                .ipv4 => |bytes| switch (needle) {
-                    .ipv4 => |other| if (mem.eql(u8, &bytes, &other)) return true,
-                    else => {},
-                },
-                .ipv6 => |bytes| switch (needle) {
-                    .ipv6 => |other| if (mem.eql(u8, &bytes, &other)) return true,
-                    else => {},
-                },
-            }
-        }
-        return false;
-    }
-
-    fn containsString(haystack: [][]u8, needle: []const u8) bool {
-        for (haystack) |candidate| {
-            if (mem.eql(u8, candidate, needle)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    fn findIpComponentIndex(ma: Multiaddr) ?usize {
-        var iter = ma.iterator();
-        var index: usize = 0;
-        while (true) : (index += 1) {
-            const opt_proto = iter.next() catch return null;
-            const proto = opt_proto orelse break;
-            switch (proto) {
-                .Ip4, .Ip6 => return index,
-                else => {},
-            }
-        }
-        return null;
-    }
-
-    fn isIpv6Loopback(bytes: [16]u8) bool {
-        for (bytes[0..15]) |b| {
-            if (b != 0) return false;
-        }
-        return bytes[15] == 1;
-    }
-
-    fn isIpv6Unspecified(bytes: [16]u8) bool {
-        for (bytes) |b| {
-            if (b != 0) return false;
-        }
-        return true;
-    }
-
-    fn isIpv6LinkLocal(bytes: [16]u8) bool {
-        return bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0x80;
-    }
-
-    fn onOutgoingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
-        const self: *Switch = @ptrCast(@alignCast(ctx.?));
-
-        const conn = res catch |err| {
-            std.log.warn("Connection close callback failed with error: {any}", .{err});
-            return;
-        };
-
-        if (conn.connect_ctx == null) {
-            std.log.err("Cannot remove outgoing connection: connect_ctx is null.", .{});
-            return;
-        }
-
-        const address_str = std.fmt.allocPrint(self.allocator, "{}", .{conn.connect_ctx.?.address}) catch unreachable;
-        defer self.allocator.free(address_str);
-
-        if (self.outgoing_connections.fetchOrderedRemove(address_str)) |removed_entry| {
-            // The value of the entry is the connection pointer, which is the same as `conn`.
-            // The key is the address string, which was allocated and stored in the HashMap.
-            // We must free the key's memory.
-            self.allocator.free(removed_entry.key);
-
-            // The connection object itself is managed by the QuicEngine's allocator
-            // and is destroyed in `onConnClosed` after this callback returns.
-            // So we should NOT destroy `conn` here.
-            return;
-        }
-
-        // If the connection was not found in the outgoing connections, it might have been closed already.
-        // This might indicate a logic error elsewhere, but is safe to ignore
-        std.log.warn("Outgoing connection close callback invoked, but connection not found in the outgoing connections list.", .{});
-    }
-
-    fn onIncomingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
-        const self: *Switch = @ptrCast(@alignCast(ctx.?));
-
-        const conn = res catch |err| {
-            std.log.warn("Connection close callback failed with error: {any}", .{err});
-            return;
-        };
-
-        for (self.incoming_connections.items, 0..) |item, i| {
-            if (item == conn) {
-                // Found the connection, now remove it by its index.
-                _ = self.incoming_connections.orderedRemove(i);
-
-                // The connection is removed from the list, but we do not need to free it here.
-                // It will be closed and cleaned up by the QuicEngine.
-                return;
-            }
-        }
-
-        // This code is reached if the connection was not found in the list, which might
-        // indicate a logic error elsewhere, but is safe to ignore for now.
-        std.log.warn("Incoming connection close callback invoked, but connection not found in the list.", .{});
-    }
-
-    fn cleanResources(self: *Switch) void {
-        var listener_iter = self.listeners.iterator();
-        while (listener_iter.next()) |entry| {
-            var listener = entry.value_ptr.*;
-            listener.deinit(); // This should close the listener's engine.
-
-            if (listener.listen_callback_ctx) |lctx| {
-                const accept_ctx: *ListenCallbackCtx = @ptrCast(@alignCast(lctx));
-                self.allocator.destroy(accept_ctx);
-            }
-            self.allocator.free(entry.key_ptr.*);
-        }
-        // Call it here because the listeners and transports all used quic engine,
-        // so we need to clean up the global state.
-        // TODO: Can we not expose lsquic to switch?
-        // lsquic.lsquic_global_cleanup();
-        self.listeners.deinit();
-
-        self.mss_handler.deinit();
-
-        // Iterate through any remaining outgoing connections and free their keys
-        // before deinitializing the HashMap. This prevents memory leaks if connections
-        // were not gracefully removed during the shutdown process.
-        var out_iter = self.outgoing_connections.iterator();
-        while (out_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.outgoing_connections.deinit();
-        self.incoming_connections.deinit(self.allocator);
-
-        self.finalCleanup();
-    }
-
-    fn finalCleanup(_: *Switch) void {
-        lsquic.lsquic_global_cleanup();
-    }
-};
+    client.close(io);
+    server.close(io);
+}
