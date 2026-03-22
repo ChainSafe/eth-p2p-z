@@ -1,5 +1,5 @@
 const std = @import("std");
-const ProtoGenStep = @import("gremlin").ProtoGenStep;
+// ProtoGenStep removed for Zig 0.16 (proto files pre-generated)
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -69,13 +69,6 @@ pub fn build(b: *std.Build) void {
     });
     const secp_module = secp_dep.module("secp256k1");
 
-    const protobuf = ProtoGenStep.create(
-        b,
-        .{
-            .proto_sources = b.path("src/proto"),
-            .target = b.path("src/proto"),
-        },
-    );
 
     const peer_id_dep = multiaddr_dep.builder.dependency("peer_id", .{
         .target = target,
@@ -134,7 +127,6 @@ pub fn build(b: *std.Build) void {
         .name = "zig-libp2p",
         .root_module = exe_module,
     });
-    libp2p_exe.step.dependOn(&protobuf.step);
 
     libp2p_exe.root_module.linkLibrary(lsquic_artifact);
     libp2p_exe.root_module.linkSystemLibrary(zlib_system_name, .{});
@@ -161,7 +153,6 @@ pub fn build(b: *std.Build) void {
         .name = "libp2p-transport-interop",
         .root_module = interop_module,
     });
-    transport_interop_exe.step.dependOn(&protobuf.step);
     transport_interop_exe.root_module.linkLibrary(lsquic_artifact);
     transport_interop_exe.root_module.linkSystemLibrary(zlib_system_name, .{});
     b.installArtifact(transport_interop_exe);
@@ -209,7 +200,6 @@ pub fn build(b: *std.Build) void {
     libp2p_lib_unit_tests.root_module.linkLibrary(lsquic_artifact);
     libp2p_lib_unit_tests.root_module.linkSystemLibrary(zlib_system_name, .{});
 
-    libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
     const exe_test_module = b.createModule(.{
@@ -231,7 +221,6 @@ pub fn build(b: *std.Build) void {
     const libp2p_exe_unit_tests = b.addTest(.{
         .root_module = exe_test_module,
     });
-    libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
     libp2p_exe_unit_tests.root_module.linkLibrary(lsquic_artifact);
     libp2p_exe_unit_tests.root_module.linkSystemLibrary(zlib_system_name, .{});
