@@ -46,8 +46,8 @@
             .hash = "cache-0.0.0-winRwKaSAAAKIcUzY8IXwcbH050imeWPFMbPW_sCdPLF",
         },
         .secp256k1 = .{
-            .url = "git+https://github.com/blockblaz/libsecp256k1-zig#518a1370b66c6b575b4831c4a1a182f5b30b3d75",
-            .hash = "secp256k1-0.0.3-vtxi58DhAABoPpDgG3wagaDXiHHIDezLOPE0BI4V0bDS",
+            .url = "git+https://github.com/lodekeeper-z/libsecp256k1-zig?ref=chore/zig-master#0247f652dda8407e1a601818ec8ae34fa83e4631",
+            .hash = "secp256k1-0.0.3-vtxi5xneAACM-Qf2dXxlAa5me4nmxItBYI6mlR6Iwhuh",
         },
         .multiaddr = .{
             .url = "git+https://github.com/zen-eth/multiaddr-zig#1f2493ad75870e98befe64fd54f642b023c82190",

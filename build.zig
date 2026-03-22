@@ -106,12 +106,12 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
         .linkage = .static,
     });
-    libp2p_lib.linkLibrary(lsquic_artifact);
+    libp2p_lib.root_module.linkLibrary(lsquic_artifact);
     const zlib_system_name = switch (target.result.os.tag) {
         .windows => "zlib1",
         else => "z",
     };
-    libp2p_lib.linkSystemLibrary(zlib_system_name);
+    libp2p_lib.root_module.linkSystemLibrary(zlib_system_name, .{});
     b.installArtifact(libp2p_lib);
 
     const exe_module = b.createModule(.{
@@ -136,8 +136,8 @@ pub fn build(b: *std.Build) void {
     });
     libp2p_exe.step.dependOn(&protobuf.step);
 
-    libp2p_exe.linkLibrary(lsquic_artifact);
-    libp2p_exe.linkSystemLibrary(zlib_system_name);
+    libp2p_exe.root_module.linkLibrary(lsquic_artifact);
+    libp2p_exe.root_module.linkSystemLibrary(zlib_system_name, .{});
     b.installArtifact(libp2p_exe);
 
     const interop_module = b.createModule(.{
@@ -162,8 +162,8 @@ pub fn build(b: *std.Build) void {
         .root_module = interop_module,
     });
     transport_interop_exe.step.dependOn(&protobuf.step);
-    transport_interop_exe.linkLibrary(lsquic_artifact);
-    transport_interop_exe.linkSystemLibrary(zlib_system_name);
+    transport_interop_exe.root_module.linkLibrary(lsquic_artifact);
+    transport_interop_exe.root_module.linkSystemLibrary(zlib_system_name, .{});
     b.installArtifact(transport_interop_exe);
 
     const transport_interop_run_cmd = b.addRunArtifact(transport_interop_exe);
@@ -206,8 +206,8 @@ pub fn build(b: *std.Build) void {
         .filters = filters orelse &.{},
     });
 
-    libp2p_lib_unit_tests.linkLibrary(lsquic_artifact);
-    libp2p_lib_unit_tests.linkSystemLibrary(zlib_system_name);
+    libp2p_lib_unit_tests.root_module.linkLibrary(lsquic_artifact);
+    libp2p_lib_unit_tests.root_module.linkSystemLibrary(zlib_system_name, .{});
 
     libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
@@ -233,8 +233,8 @@ pub fn build(b: *std.Build) void {
     });
     libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
-    libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
-    libp2p_exe_unit_tests.linkSystemLibrary(zlib_system_name);
+    libp2p_exe_unit_tests.root_module.linkLibrary(lsquic_artifact);
+    libp2p_exe_unit_tests.root_module.linkSystemLibrary(zlib_system_name, .{});
     // // for exe, lib, tests, etc.
     // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
     // // for coroutines api
