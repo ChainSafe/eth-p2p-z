@@ -249,7 +249,7 @@ fn parseHostPort(allocator: std.mem.Allocator, value: []const u8) !ParsedHostPor
 }
 
 fn getRequiredOwned(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch |err| {
+    return std.posix.getenv(key) orelse {
         if (err == error.EnvironmentVariableNotFound) {
             std.log.err("missing required env var {s}", .{key});
         }
