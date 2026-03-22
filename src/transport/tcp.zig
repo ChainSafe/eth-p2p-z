@@ -705,7 +705,7 @@ const ConnHolder = struct {
 };
 
 test "dial connection refused" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
     const opts = XevTransport.Options{
         .backlog = 128,
@@ -749,7 +749,7 @@ test "dial connection refused" {
 }
 
 test "dial and accept" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
 
     var mock_initiator = MockConnInitiator{};
@@ -1099,7 +1099,7 @@ pub const ClientEchoHandler = struct {
 };
 
 test "echo read and write" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
 
     const server_handler = try ServerEchoHandler.create(allocator);

@@ -4,4 +4,7 @@ build/
 build-*/
 docgen_tmp/
 .DS_Store
-*.pemzig-pkg/
+*.pem
+zig-pkg/
+main
+root.o

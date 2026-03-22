@@ -346,7 +346,7 @@ const AppSwitch = libp2p.Switch(.{
 // ── Entry point ──────────────────────────────────────────────────────────
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const check = gpa.deinit();
         if (check == .leak) log.warn("memory leaked from GPA", .{});

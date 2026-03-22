@@ -336,7 +336,7 @@ test "FrameDecoder rejects oversized message" {
 }
 
 test "FrameDecoder memory management" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

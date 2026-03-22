@@ -51,7 +51,22 @@ pub const Handler = struct {
     }
 
     fn fillRandom(buf: []u8) void {
-        std.c.arc4random_buf(buf.ptr, buf.len);
+        const native_os = @import("builtin").os.tag;
+        if (native_os == .linux) {
+            var filled: usize = 0;
+            while (filled < buf.len) {
+                const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
+                switch (std.posix.errno(rc)) {
+                    .SUCCESS => {
+                        filled += @intCast(rc);
+                    },
+                    .INTR => continue,
+                    else => @panic("getrandom failed"),
+                }
+            }
+        } else {
+            std.c.arc4random_buf(buf.ptr, buf.len);
+        }
     }
 };
 

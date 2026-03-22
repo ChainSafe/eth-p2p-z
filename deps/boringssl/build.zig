@@ -20,7 +20,8 @@ pub fn build(b: *std.Build) void {
             .pic = if (force_pic == true) true else null,
         }),
     });
-    libfipsmodule.root_module.linkSystemLibrary("c++", .{});
+    // Use Zig's bundled libc++ instead of system c++
+    libfipsmodule.root_module.link_libcpp = true;
     libfipsmodule.root_module.addIncludePath(ssl_source.path("include"));
     libfipsmodule.root_module.addCSourceFiles(.{
         .root = ssl_source.path("."),
@@ -41,7 +42,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     libcrypto.root_module.linkSystemLibrary("c", .{});
-    libcrypto.root_module.linkSystemLibrary("c++", .{});
+    libcrypto.root_module.link_libcpp = true;
     libcrypto.root_module.linkLibrary(libfipsmodule);
     libcrypto.root_module.addIncludePath(ssl_source.path("include"));
     libcrypto.root_module.addCSourceFiles(.{
@@ -63,7 +64,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     libssl.root_module.linkSystemLibrary("c", .{});
-    libssl.root_module.linkSystemLibrary("c++", .{});
+    libssl.root_module.link_libcpp = true;
     libssl.root_module.linkLibrary(libcrypto);
     libssl.root_module.addIncludePath(ssl_source.path("include"));
     libssl.installHeadersDirectory(ssl_source.path("include"), "", .{});
@@ -170,7 +171,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     libpki.root_module.linkSystemLibrary("c", .{});
-    libpki.root_module.linkSystemLibrary("c++", .{});
+    libpki.root_module.link_libcpp = true;
     libpki.root_module.linkLibrary(libcrypto);
     libpki.root_module.addIncludePath(ssl_source.path("include"));
     libpki.root_module.addCSourceFiles(.{

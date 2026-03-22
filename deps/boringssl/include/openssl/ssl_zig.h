@@ -20,7 +20,7 @@
 // use GCC extension type keywords that Zig's translate-c cannot parse.
 // Block the entire floatn.h/floatn-common.h headers via include guards, then
 // manually define only the macros that downstream glibc headers need.
-#if defined(__aarch64__) && defined(__linux__)
+#if defined(__linux__)
 // Block the problematic headers entirely
 #define _BITS_FLOATN_H
 #define _BITS_FLOATN_COMMON_H

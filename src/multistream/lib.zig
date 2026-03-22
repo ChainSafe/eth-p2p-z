@@ -7,5 +7,5 @@ pub const proto_binding = @import("protocol_binding.zig");
 pub const multistream = @import("multistream.zig");
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }

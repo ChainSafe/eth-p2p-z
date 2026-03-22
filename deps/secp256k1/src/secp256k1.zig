@@ -8,9 +8,24 @@ const schnorr_lib = @import("schnorr.zig");
 pub const constants = @import("constants.zig");
 
 /// Fill buffer with cryptographically secure random bytes.
-/// Uses OS-specific CSPRNG (arc4random_buf on macOS/BSD, getrandom on Linux).
+/// Uses the Linux getrandom syscall or arc4random_buf on other platforms.
 fn fillRandom(buf: []u8) void {
-    std.c.arc4random_buf(buf.ptr, buf.len);
+    const native_os = @import("builtin").os.tag;
+    if (native_os == .linux) {
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    filled += @intCast(rc);
+                },
+                .INTR => continue,
+                else => @panic("getrandom failed"),
+            }
+        }
+    } else {
+        std.c.arc4random_buf(buf.ptr, buf.len);
+    }
 }
 
 /// The main error type for this library.

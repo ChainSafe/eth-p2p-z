@@ -4,24 +4,30 @@
     .fingerprint = 0x227d092b880b3d4a,
     .dependencies = .{
         .secp256k1 = .{
-            .path = "deps/secp256k1",
+            .url = "git+https://github.com/lodekeeper-z/libsecp256k1-zig?ref=chore/zig-0.16#f7c222c1db6ed05a4bc3c846c99c74a48030ccc0",
+            .hash = "secp256k1-0.0.3-vtxi52DlAACWpvk86ANLPfm1wBpE1suSYU_fWsqN0Odf",
         },
         .lsquic = .{
-            .path = "deps/lsquic",
+            .url = "git+https://github.com/lodekeeper-z/lsquic?ref=chore/zig-0.16#4bfbe340766c0e3086f84c087f977b30c57aa897",
+            .hash = "lsquic-0.0.0-jO7gdjYhAADPn9888yC5WJKcpSVx4mrsbyMeDoowRsVB",
         },
         .boringssl = .{
-            .path = "deps/boringssl",
+            .url = "git+https://github.com/lodekeeper-z/boringssl-zig?ref=chore/zig-0.16#bcf2ea9bfcb5e8604e242e339639a7d675017c0d",
+            .hash = "boringssl-0.1.0-VtJeWTleAACsgLYAQ7t0C1TzbVq3YKQ3ZDRaFN-5Ncg-",
         },
         .multiaddr = .{
-            .path = "deps/multiaddr",
+            .url = "git+https://github.com/lodekeeper-z/multiaddr-zig?ref=chore/zig-0.16#66b6b14921d9e959d85efec00791e73da1fab510",
+            .hash = "multiaddr-0.1.0-Cjaydii8AAC8UsZQDT41WSuXs4VFA2H9_irXf83DcdPT",
         },
         .gremlin = .{
-            .path = "deps/gremlin",
+            .url = "git+https://github.com/lodekeeper-z/gremlin.zig?ref=chore/zig-0.16#ad39c9eadf33d1e64edd717fe354daf3dbcaaf24",
+            .hash = "gremlin-0.1.0-E2s91ZbqEgAiaqZcBf292Yf5zDpdUOKpI1V2NlsdQ7E2",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "interop",
     },
 }

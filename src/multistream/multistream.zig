@@ -534,7 +534,7 @@ const ConnHolder = struct {
 };
 
 test "Multistream Negotiator with Insecure Protocol" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
 
     var insecure_channel: insecure.InsecureChannel = undefined;

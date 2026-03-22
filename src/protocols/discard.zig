@@ -363,7 +363,7 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
 }
 
 test "discard protocol using switch" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {
@@ -554,7 +554,7 @@ test "discard protocol using switch" {
 }
 
 test "discard protocol using switch with secp256k1 identities" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         @import("../secp_context.zig").deinit();
         const leaked = gpa.deinit();
@@ -717,7 +717,7 @@ test "discard protocol using switch with secp256k1 identities" {
 }
 
 test "discard transport rejects secp256k1 certificate key" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {
@@ -742,7 +742,7 @@ test "discard transport rejects secp256k1 certificate key" {
 }
 
 test "switch newStream connects to multiple peers" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {
@@ -1122,7 +1122,7 @@ test "no supported protocols error" {
 }
 
 test "discard protocol with 5 concurrent clients" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

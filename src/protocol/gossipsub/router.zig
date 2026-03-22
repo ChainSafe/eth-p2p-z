@@ -1823,7 +1823,7 @@ test "Router GRAFT rejects when not subscribed" {
 }
 
 test "Router memory management" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {
@@ -2109,7 +2109,7 @@ test "Router v1.1 GRAFT rejected for low-score peer" {
 }
 
 test "Router memory management with v1.2/v1.3 features" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {
