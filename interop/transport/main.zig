@@ -328,7 +328,7 @@ const PingResultCtx = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const check = gpa.deinit();
         if (check == .leak) std.log.warn("memory leaked from GPA", .{});
