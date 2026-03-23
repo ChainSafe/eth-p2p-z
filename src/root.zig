@@ -17,6 +17,8 @@ pub const quic_engine_new = @import("transport/quic/engine.zig");
 pub const swarm = @import("switch.zig");
 pub const Switch = swarm.Switch;
 
+pub const gossipsub = @import("protocol/gossipsub/gossipsub.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
