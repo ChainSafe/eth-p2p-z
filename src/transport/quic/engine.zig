@@ -976,36 +976,51 @@ pub const QuicEngine = struct {
     /// Called for both client and server sides since getSslCtx is called for both.
     fn customVerifyCallback(
         ssl_obj: ?*ssl.SSL,
-        _: [*c]u8,
+        out_alert: [*c]u8,
     ) callconv(.c) ssl.enum_ssl_verify_result_t {
         const s = ssl_obj orelse return ssl.ssl_verify_invalid;
 
         // Get the SSL_CTX from the SSL object
-        const ssl_ctx: *ssl.SSL_CTX = ssl.SSL_get_SSL_CTX(s) orelse return ssl.ssl_verify_invalid;
+        const ssl_ctx: *ssl.SSL_CTX = ssl.SSL_get_SSL_CTX(s) orelse {
+            log.warn("customVerifyCallback: SSL_get_SSL_CTX returned null", .{});
+            return ssl.ssl_verify_invalid;
+        };
 
         // Retrieve the CertVerifyCtx from SSL_CTX ex_data
-        const raw_ptr = ssl.SSL_CTX_get_ex_data(@ptrCast(ssl_ctx), g_ssl_ctx_ex_idx) orelse
+        const raw_ptr = ssl.SSL_CTX_get_ex_data(@ptrCast(ssl_ctx), g_ssl_ctx_ex_idx) orelse {
+            log.warn("customVerifyCallback: SSL_CTX_get_ex_data returned null (idx={})", .{g_ssl_ctx_ex_idx});
             return ssl.ssl_verify_invalid;
+        };
         const ctx: *CertVerifyCtx = @ptrCast(@alignCast(raw_ptr));
 
         // Get the peer certificate from the SSL connection
         const cert: *ssl.X509 = ssl.SSL_get_peer_certificate(s) orelse {
-            log.warn("customVerifyCallback: no peer certificate", .{});
+            log.warn("customVerifyCallback: no peer certificate — Lighthouse may not be sending a cert (mutual TLS not requested?)", .{});
+            // Signal bad certificate alert
+            if (out_alert) |a| a.* = ssl.SSL_AD_CERTIFICATE_UNKNOWN;
             return ssl.ssl_verify_invalid;
         };
         defer ssl.X509_free(cert);
 
+        log.debug("customVerifyCallback: verifying peer certificate", .{});
+
         // Verify the libp2p certificate extension and extract peer identity
         const info = tls.verifyAndExtractPeerInfo(ctx.allocator, cert) catch |err| {
             log.warn("customVerifyCallback: verifyAndExtractPeerInfo failed: {s}", .{@errorName(err)});
+            if (out_alert) |a| a.* = ssl.SSL_AD_BAD_CERTIFICATE;
             return ssl.ssl_verify_invalid;
         };
 
         if (!info.is_valid) {
-            log.warn("customVerifyCallback: cert signature verification failed", .{});
+            log.warn("customVerifyCallback: cert signature verification failed (extension sig mismatch)", .{});
             if (info.host_pubkey.data) |d| ctx.allocator.free(d);
+            if (out_alert) |a| a.* = ssl.SSL_AD_BAD_CERTIFICATE;
             return ssl.ssl_verify_invalid;
         }
+
+        log.debug("customVerifyCallback: peer verified, key_type={}, peer_id_bytes={d}", .{
+            info.host_pubkey.type, if (info.host_pubkey.data) |d| d.len else 0,
+        });
 
         // Store verified peer info for consumption by onNewConn/onHskDone
         ctx.storeVerified(.{

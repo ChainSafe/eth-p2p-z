@@ -159,11 +159,10 @@ pub fn buildCert(
 
     if (ssl.X509_set_pubkey(cert, subjectKey) <= 0) return error.CertPKeySetFailed;
 
+    // Use empty subject/issuer per libp2p TLS spec SHOULD requirement.
+    // rust-libp2p uses rcgen::DistinguishedName::new() (empty) for interop.
     const name = ssl.X509_NAME_new() orelse return error.CertNameCreationFailed;
     defer ssl.X509_NAME_free(name);
-    if (ssl.X509_NAME_add_entry_by_txt(name, "C", ssl.MBSTRING_ASC, "CN", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
-    if (ssl.X509_NAME_add_entry_by_txt(name, "O", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
-    if (ssl.X509_NAME_add_entry_by_txt(name, "CN", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
     if (ssl.X509_set_issuer_name(cert, name) <= 0) return error.CertIssuerSetFailed;
     if (ssl.X509_set_subject_name(cert, name) <= 0) return error.CertSubjectSetFailed;
 
@@ -181,6 +180,10 @@ pub fn buildCert(
     @memcpy(data_to_sign[0..CertificatePrefix.len], CertificatePrefix);
     @memcpy(data_to_sign[CertificatePrefix.len..], subject_pubkey_der);
 
+    std.log.debug("tls.buildCert: signing {d}+{d}={d} bytes (prefix+SPKI)", .{
+        CertificatePrefix.len, subject_pubkey_der.len, data_to_sign.len,
+    });
+
     const signature = host_sign_fn(host_sign_ctx, allocator, data_to_sign) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.SignDataFailed,
@@ -196,6 +199,14 @@ pub fn buildCert(
     var ext_value_der: [*c]u8 = null;
     const ext_value_der_len = try createExtension(host_pubkey_proto, signature, &ext_value_der);
     defer ssl.OPENSSL_free(ext_value_der);
+
+    // Debug: log extension bytes for cross-verification
+    {
+        const ext_bytes = ext_value_der[0..@intCast(ext_value_der_len)];
+        std.log.debug("tls.buildCert: extension DER ({d} bytes): host_pubkey_proto={d}B, signature={d}B", .{
+            ext_bytes.len, host_pubkey_proto.len, signature.len,
+        });
+    }
 
     try addExtension(cert, Libp2pExtensionOid, true, ext_value_der[0..@intCast(ext_value_der_len)]);
 
@@ -1125,4 +1136,39 @@ test "Verify certificate with RSA keys" {
     defer std.testing.allocator.free(expected_pubkey.data.?);
     const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
     try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
+}
+
+// Tests that we can parse the rust-libp2p test vector (critical extension, ECDSA cert, Ed25519 host)
+test "Parse rust-libp2p test vector: Ed25519 host key" {
+    // from rust-libp2p can_parse_certificate_with_ed25519_keypair
+    const cert_hex = "308201773082011ea003020102020900f5bd0debaa597f52300a06082a8648ce3d04030230003020170d3735303130313030303030305a180f34303936303130313030303030305a30003059301306072a8648ce3d020106082a8648ce3d030107034200046bf9871220d71dcb3483ecdfcbfcc7c103f8509d0974b3c18ab1f1be1302d643103a08f7a7722c1b247ba3876fe2c59e26526f479d7718a85202ddbe47562358a37f307d307b060a2b0601040183a25a01010101ff046a30680424080112207fda21856709c5ae12fd6e8450623f15f11955d384212b89f56e7e136d2e17280440aaa6bffabe91b6f30c35e3aa4f94b1188fed96b0ffdd393f4c58c1c047854120e674ce64c788406d1c2c4b116581fd7411b309881c3c7f20b46e54c7e6fe7f0f300a06082a8648ce3d040302034700304402207d1a1dbd2bda235ff2ec87daf006f9b04ba076a5a5530180cd9c2e8f6399e09d0220458527178c7e77024601dbb1b256593e9b96d961b96349d1f560114f61a87595";
+
+    var cert_der_buf: [1024]u8 = undefined;
+    var cert_der_len: usize = 0;
+    for (0..cert_hex.len / 2) |i| {
+        const hi = cert_hex[i * 2];
+        const lo = cert_hex[i * 2 + 1];
+        const byte: u8 = (@as(u8, if (hi >= '0' and hi <= '9') hi - '0' else hi - 'a' + 10) << 4) |
+            @as(u8, if (lo >= '0' and lo <= '9') lo - '0' else lo - 'a' + 10);
+        cert_der_buf[cert_der_len] = byte;
+        cert_der_len += 1;
+    }
+
+    var der_ptr: [*c]const u8 = cert_der_buf[0..cert_der_len].ptr;
+    const cert = ssl.d2i_X509(null, &der_ptr, @intCast(cert_der_len)) orelse {
+        return error.CertParseFailed;
+    };
+    defer ssl.X509_free(cert);
+
+    // This cert has critical=true extension and empty subject/issuer (like rust-libp2p generates)
+    const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
+    defer {
+        if (peer_info.host_pubkey.data) |d| std.testing.allocator.free(d);
+    }
+
+    // The public key type should be Ed25519
+    try std.testing.expectEqual(keys.KeyType.ED25519, peer_info.host_pubkey.type);
+    // The key data should be 32 bytes
+    const key_data = peer_info.host_pubkey.data orelse &[_]u8{};
+    try std.testing.expectEqual(@as(usize, 32), key_data.len);
 }
