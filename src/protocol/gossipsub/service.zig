@@ -163,9 +163,7 @@ pub const Service = struct {
 
         self.io = io;
 
-        // Use page_allocator as a workaround — the passed allocator causes
-        // SIGABRT in ArrayList.appendSlice for unknown reasons.
-        var decoder = FrameDecoder.init(std.heap.page_allocator);
+        var decoder = FrameDecoder.init(self.allocator);
         defer decoder.deinit();
 
         log.info("gossipsub inbound from peer ({d} bytes id)", .{peer_id.len});
