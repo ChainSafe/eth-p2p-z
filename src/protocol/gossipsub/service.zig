@@ -163,17 +163,35 @@ pub const Service = struct {
 
         self.io = io;
 
-        var decoder = FrameDecoder.init(self.allocator);
+        // Use page_allocator as a workaround — the passed allocator causes
+        // SIGABRT in ArrayList.appendSlice for unknown reasons.
+        var decoder = FrameDecoder.init(std.heap.page_allocator);
         defer decoder.deinit();
+
+        log.info("gossipsub inbound from peer ({d} bytes id)", .{peer_id.len});
 
         var buf: [4096]u8 = undefined;
         while (true) {
             const n = stream.read(io, &buf) catch break;
             if (n == 0) break;
-            decoder.feed(buf[0..n]) catch break;
+            log.debug("gossipsub: feeding {d} bytes to decoder (buf total: {d})", .{n, decoder.buf.items.len + n});
+            // Guard: if total buffered data exceeds max RPC size, skip
+            if (decoder.buf.items.len + n > codec_mod.max_rpc_size) {
+                log.warn("gossipsub: frame exceeds max RPC size, dropping", .{});
+                decoder.deinit();
+                decoder = FrameDecoder.init(self.allocator);
+                continue;
+            }
+            decoder.feed(buf[0..n]) catch |err| {
+                log.warn("gossipsub: feed error: {}", .{err});
+                break;
+            };
             while (decoder.next() catch null) |frame| {
                 defer self.allocator.free(frame);
-                self.router.handleRpc(peer_id, frame) catch {};
+                log.debug("gossipsub: decoded frame of {d} bytes", .{frame.len});
+                self.router.handleRpc(peer_id, frame) catch |err| {
+                    log.warn("gossipsub: handleRpc error: {}", .{err});
+                };
             }
         }
     }
