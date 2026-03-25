@@ -263,6 +263,24 @@ pub fn Switch(comptime config: SwitchConfig) type {
             }
         }
 
+        /// Open a negotiated outbound stream and return it to the caller.
+        ///
+        /// Unlike `newStream`/`newStreamWithPayload` which dispatch to `handleOutbound`,
+        /// this gives the caller direct ownership of the stream for request/response I/O.
+        /// The caller is responsible for writing the request, reading the response, and
+        /// closing the stream.
+        ///
+        /// `protocol_id` is the multistream protocol string, e.g.
+        /// `"/eth2/beacon_chain/req/status/1/ssz_snappy"`. It does NOT need to be
+        /// registered in the Switch's protocol list.
+        pub fn dialProtocol(self: *Self, io: Io, peer_id: []const u8, protocol_id: []const u8) !quic_mod.Stream {
+            const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+            const s_inner = try conn.openStream(io);
+            var s = quic_mod.Stream{ .inner = s_inner };
+            _ = try multistream.negotiateOutbound(io, &s, &.{protocol_id});
+            return s;
+        }
+
         /// Gracefully shut down the Switch.
         /// Cancels background fibers, stops engines, notifies handlers, cleans up.
         pub fn close(self: *Self, io: Io) void {
