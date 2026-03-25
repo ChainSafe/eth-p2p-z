@@ -943,6 +943,30 @@ pub const QuicEngine = struct {
         if (ctx) |raw| {
             const stream: *QuicStream = @ptrCast(@alignCast(raw));
             log.debug("onStreamClose: stream={*}", .{stream});
+
+            // Drain any remaining data before closing. lsquic may call
+            // onClose before delivering all buffered data via onRead.
+            if (ls) |s| {
+                var drain_buf: [4096]u8 = undefined;
+                while (true) {
+                    const n = lsquic.lsquic_stream_read(s, &drain_buf, drain_buf.len);
+                    if (n <= 0) break;
+                    const len: usize = @intCast(n);
+                    // Push drained data to the read queue
+                    if (stream.conn.engine.io) |io| {
+                        const owned = stream.allocator.alloc(u8, len) catch break;
+                        @memcpy(owned, drain_buf[0..len]);
+                        stream.read_queue.putOneUncancelable(io, .{
+                            .data = owned,
+                            .owned_buf = owned,
+                        }) catch {
+                            stream.allocator.free(owned);
+                            break;
+                        };
+                    }
+                }
+            }
+
             stream.lsquic_stream = null;
             stream.closed = true;
             if (stream.conn.engine.io) |io| {
