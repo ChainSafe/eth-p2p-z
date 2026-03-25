@@ -48,6 +48,8 @@ pub const QuicStream = struct {
     conn: *QuicConnection,
     read_queue_buf: [16]ReadEvent,
     read_queue: Io.Queue(ReadEvent),
+    has_received_data: bool,
+    spurious_read_count: u32,
     closed: bool,
     /// Leftover data from a previous ReadEvent when caller's buffer was too small.
     leftover_buf: ?[]u8 = null,
@@ -61,6 +63,8 @@ pub const QuicStream = struct {
             .conn = conn,
             .read_queue_buf = undefined,
             .read_queue = undefined,
+            .has_received_data = false,
+            .spurious_read_count = 0,
             .closed = false,
         };
         self.read_queue = Io.Queue(ReadEvent).init(&self.read_queue_buf);
@@ -87,6 +91,12 @@ pub const QuicStream = struct {
             return len;
         }
 
+        // Arm the lsquic read callback — tells lsquic to call onRead when
+        // data is available. Must be done lazily (not in onNewStream) to avoid
+        // false EOF when onRead fires before STREAM frames are processed.
+        if (self.lsquic_stream) |ls| {
+            _ = lsquic.lsquic_stream_wantread(ls, 1);
+        }
         const event = self.read_queue.getOne(io) catch |err| switch (err) {
             error.Closed => return 0, // EOF — peer closed the stream
             error.Canceled => return error.StreamClosed,
@@ -468,6 +478,12 @@ pub const QuicEngine = struct {
         settings.es_versions = (1 << lsquic.LSQVER_I001); // QUIC v1 (RFC 9000) only — avoids version negotiation with peers that don't support v2/drafts
         settings.es_cc_algo = 2; // BBR congestion control (faster ramp-up than default Cubic)
         settings.es_scid_iss_rate = 180; // Disable SCID issuance rate limiting
+        settings.es_rw_once = 1; // Dispatch onRead/onWrite once per process_conns tick — prevents tight callback loops on streams with no data yet
+
+        // Flow control for remote-initiated bidi streams. lsquic defaults to
+        // 0 for the client, which means the server can't send any data on
+        // streams it opens (Status, Ping, Metadata requests). Set to 1 MB.
+        settings.es_init_max_stream_data_bidi_remote = 1 * 1024 * 1024;
 
         // Build engine API
         var engine_api: lsquic.lsquic_engine_api = std.mem.zeroes(lsquic.lsquic_engine_api);
@@ -834,9 +850,6 @@ pub const QuicEngine = struct {
         // Create stream wrapper
         const stream = QuicStream.init(engine.allocator, s, conn) catch return null;
 
-        // Want to read from this stream
-        _ = lsquic.lsquic_stream_wantread(s, 1);
-
         // Route stream to the correct queue based on QUIC stream ID parity.
         // RFC 9000: client-initiated bidi = 4n+0, server-initiated bidi = 4n+1.
         // Locally-initiated streams go to outbound_stream_queue (for openStream),
@@ -849,6 +862,10 @@ pub const QuicEngine = struct {
             if (is_locally_initiated) {
                 conn.outbound_stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
             } else {
+                // Don't arm wantread here — onNewStream fires inside
+                // processEngine() before STREAM data frames are decoded.
+                // QuicStream.read() arms wantread lazily, after the caller
+                // (negotiateInbound) is ready and processEngine has returned.
                 conn.stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
             }
         }
@@ -861,10 +878,27 @@ pub const QuicEngine = struct {
         const stream: *QuicStream = @ptrCast(@alignCast(raw));
         const s = ls orelse return;
 
+        const stream_id = lsquic.lsquic_stream_id(s);
         var buf: [4096]u8 = undefined;
         const n = lsquic.lsquic_stream_read(s, &buf, buf.len);
-        if (n <= 0) {
-            // EOF or error - stop reading and close the read queue
+        if (n < 0) {
+            // Error — likely EWOULDBLOCK. Re-arm and wait.
+            log.debug("onRead: stream {d} EWOULDBLOCK (n={d})", .{stream_id, n});
+            return;
+        }
+        if (n == 0) {
+            if (!stream.has_received_data) {
+                // No data yet — STREAM frames not decoded in this tick.
+                // With es_rw_once=1, lsquic won't re-call us this tick.
+                // Leave wantread armed; next process_conns tick will retry.
+                stream.spurious_read_count += 1;
+                if (stream.spurious_read_count <= 3) {
+                    log.debug("onRead: stream {d} no data yet (tick {d})", .{stream_id, stream.spurious_read_count});
+                }
+                return;
+            }
+            // Genuine EOF — peer sent FIN after sending data.
+            log.debug("onRead: stream {d} EOF", .{stream_id});
             _ = lsquic.lsquic_stream_wantread(s, 0);
             if (stream.conn.engine.io) |io| {
                 stream.read_queue.close(io);
@@ -873,6 +907,8 @@ pub const QuicEngine = struct {
         }
 
         const len: usize = @intCast(n);
+        log.debug("onRead: stream {d} got {d} bytes", .{stream_id, len});
+        stream.has_received_data = true;
         // Allocate owned copy of the data
         const owned = stream.allocator.alloc(u8, len) catch {
             if (stream.conn.engine.io) |io| {

@@ -168,6 +168,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// registered by dial), accepts streams. Connection map cleanup is handled
         /// by close()/deinit() — NOT by this task's defers — to avoid races.
         fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection) void {
+                log.info("swarmConnectionTask: started for conn", .{});
             // Wait for TLS handshake to complete (server: immediate, client: suspends)
             var pid_buf: [128]u8 = undefined;
             const peer_id: ?[]const u8 = if (conn.waitHandshake(io)) |pid|
@@ -186,6 +187,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
                     }
                 }
 
+                log.info("swarmConnectionTask: peer_id resolved, entering stream accept loop", .{});
                 // Auto-trigger identify (like go-libp2p's IDService).
                 // Runs in background so it doesn't block stream acceptance.
                 self.background.async(io, Self.identifyPeer, .{ self, io, pid });
@@ -195,7 +197,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
             // Note: stream_group tasks are implicitly cleaned up when the parent
             // group (self.background) is canceled by close().
             while (true) {
-                const s_inner = conn.acceptStream(io) catch break;
+                log.info("swarmConnectionTask: waiting for stream...", .{});
+                    const s_inner = conn.acceptStream(io) catch |err| { log.warn("swarmConnectionTask: acceptStream error: {}", .{err}); break; };
                 self.background.async(io, Self.swarmStreamTask, .{
                     self, io, quic_mod.Stream{ .inner = s_inner }, SwarmStreamCtx{ .peer_id = peer_id },
                 });
@@ -228,6 +231,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
         /// Handles a single inbound stream: multistream-negotiate then dispatch.
         fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: SwarmStreamCtx) void {
+                log.info("swarmStreamTask: dispatching stream", .{});
             var mutable_stream = s;
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
@@ -237,6 +241,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// the protocol via multistream-select, and runs handleOutbound.
         /// peer_id is automatically passed as ctx.peer_id.
         pub fn newStream(self: *Self, io: Io, peer_id: []const u8, comptime P: type) !void {
+            return self.newStreamWithPayload(io, peer_id, P, null);
+        }
+
+        /// Like newStream but also passes an SSZ payload to handleOutbound.
+        /// Used for protocols that include a request body (e.g., Status).
+        pub fn newStreamWithPayload(self: *Self, io: Io, peer_id: []const u8, comptime P: type, ssz_payload: ?[]const u8) !void {
             comptime protocol_mod.assertProtocolInterface(P);
             const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
             const s_inner = try conn.openStream(io);
@@ -246,6 +256,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 if (Proto == P) {
                     try self.handlers[i].handleOutbound(io, &s, .{
                         .peer_id = @as(?[]const u8, peer_id),
+                        .ssz_payload = ssz_payload orelse &.{},
                     });
                     return;
                 }
@@ -278,7 +289,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// Negotiate protocol on an inbound stream and dispatch to handler.
         /// io flows directly through multistream and protocol handler -- no adapter.
         pub fn dispatchStream(self: *Self, io: Io, s: anytype, ctx: anytype) !void {
-            const proto_id = try multistream.negotiateInbound(io, s, &supported_protocol_ids);
+            log.info("dispatchStream: starting multistream negotiation", .{});
+                const proto_id = multistream.negotiateInbound(io, s, &supported_protocol_ids) catch |err| { log.warn("dispatchStream: multistream negotiation failed: {}", .{err}); return err; };
 
             inline for (config.protocols, 0..) |P, i| {
                 if (std.mem.eql(u8, proto_id, P.id)) {
