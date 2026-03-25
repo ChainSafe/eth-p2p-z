@@ -18,6 +18,7 @@ pub const swarm = @import("switch.zig");
 pub const Switch = swarm.Switch;
 
 pub const gossipsub = @import("protocol/gossipsub/gossipsub.zig");
+pub const identify = @import("protocol/identify.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const log = std.log.scoped(.identify);
 const identify_pb = @import("../proto/identify.proto.zig");
 const stream_util = @import("../util/stream.zig");
 
@@ -105,7 +106,21 @@ pub const Handler = struct {
 
         if (encoded.len > max_message_size) return Error.MessageTooLarge;
 
+        // Write varint length prefix followed by protobuf body.
+        var len_buf: [10]u8 = undefined;
+        var len_size: usize = 0;
+        {
+            var v = encoded.len;
+            while (v >= 0x80) : (len_size += 1) {
+                len_buf[len_size] = @intCast((v & 0x7f) | 0x80);
+                v >>= 7;
+            }
+            len_buf[len_size] = @intCast(v);
+            len_size += 1;
+        }
+        writeAll(io, stream, len_buf[0..len_size]) catch return Error.UnexpectedEof;
         writeAll(io, stream, encoded) catch return Error.UnexpectedEof;
+        log.info("identify: sent {d} byte response", .{encoded.len});
     }
 
     /// Handle outbound identify (initiator): read the remote's identity.
@@ -128,7 +143,28 @@ pub const Handler = struct {
 
         const owned = buf.toOwnedSlice(allocator) catch return Error.UnexpectedEof;
 
-        const reader = identify_pb.IdentifyReader.init(owned) catch {
+        // The identify response is varint-length-prefixed protobuf.
+        // Strip the length prefix before parsing.
+        var proto_bytes = owned;
+        {
+            var shift: u6 = 0;
+            var prefix_len: usize = 0;
+            for (owned) |b| {
+                prefix_len += 1;
+                if (b & 0x80 == 0) break;
+                shift +|= 7;
+            }
+            if (prefix_len > 0 and prefix_len <= owned.len) {
+                proto_bytes = owned[prefix_len..];
+            }
+        }
+
+        const reader = identify_pb.IdentifyReader.init(proto_bytes) catch {
+            log.warn("identify: failed to parse {d} byte response (prefix stripped to {d}, first bytes: {any})", .{
+                owned.len,
+                proto_bytes.len,
+                if (proto_bytes.len > 16) proto_bytes[0..16] else proto_bytes,
+            });
             allocator.free(owned);
             return Error.InvalidProtobuf;
         };
