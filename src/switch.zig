@@ -290,14 +290,24 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// io flows directly through multistream and protocol handler -- no adapter.
         pub fn dispatchStream(self: *Self, io: Io, s: anytype, ctx: anytype) !void {
             log.info("dispatchStream: starting multistream negotiation", .{});
-                const proto_id = multistream.negotiateInbound(io, s, &supported_protocol_ids) catch |err| { log.warn("dispatchStream: multistream negotiation failed: {}", .{err}); return err; };
+            const proto_id = multistream.negotiateInbound(io, s, &supported_protocol_ids) catch |err| {
+                log.warn("dispatchStream: multistream negotiation failed: {}", .{err});
+                return err;
+            };
+
+            log.info("dispatchStream: negotiated protocol: {s}", .{proto_id});
 
             inline for (config.protocols, 0..) |P, i| {
                 if (std.mem.eql(u8, proto_id, P.id)) {
-                    try self.handlers[i].handleInbound(io, s, ctx);
+                    log.info("dispatchStream: dispatching to handler {d} ({s})", .{ i, P.id });
+                    self.handlers[i].handleInbound(io, s, ctx) catch |err| {
+                        log.warn("dispatchStream: handler error for {s}: {}", .{ P.id, err });
+                        return err;
+                    };
                     return;
                 }
             }
+            log.warn("dispatchStream: no handler found for protocol: {s}", .{proto_id});
         }
 
         /// Get a mutable pointer to the handler instance for protocol P.
