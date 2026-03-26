@@ -839,6 +839,12 @@ pub const QuicEngine = struct {
         log.debug("onNewStream called, ls={?*}", .{ls});
         const engine: *QuicEngine = @ptrCast(@alignCast(stream_if_ctx));
         const s = ls orelse return null;
+        const sid = lsquic.lsquic_stream_id(s);
+        const is_server_stream = (sid % 4 == 1);
+        const is_local = (engine.is_server == is_server_stream);
+        log.info("onNewStream: id={d} local={} (engine.is_server={}, stream_server_init={})", .{
+            sid, is_local, engine.is_server, is_server_stream,
+        });
 
         // Find the connection this stream belongs to
         const lc = lsquic.lsquic_stream_conn(s);
