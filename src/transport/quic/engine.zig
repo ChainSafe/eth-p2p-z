@@ -120,7 +120,9 @@ pub const QuicStream = struct {
         const ls = self.lsquic_stream orelse return error.StreamClosed;
         const written = lsquic.lsquic_stream_write(ls, data.ptr, data.len);
         if (written < 0) return error.WriteFailed;
-        _ = lsquic.lsquic_stream_flush(ls);
+        if (written > 0) {
+            _ = lsquic.lsquic_stream_flush(ls);
+        }
         return @intCast(written);
     }
 
