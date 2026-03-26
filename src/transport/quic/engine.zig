@@ -76,6 +76,8 @@ pub const QuicStream = struct {
         // Serve from leftover data first — even if the stream is closed,
         // there may be buffered data to return.
         if (self.leftover_buf) |lb| {
+            const stream_id_for_log = if (self.lsquic_stream) |ls2| lsquic.lsquic_stream_id(ls2) else @as(u64, 999);
+            _ = stream_id_for_log;
             const remaining = lb.len - self.leftover_offset;
             const len = @min(buf.len, remaining);
             @memcpy(buf[0..len], lb[self.leftover_offset..][0..len]);
@@ -90,7 +92,12 @@ pub const QuicStream = struct {
             return len;
         }
 
-        if (self.closed) return error.StreamClosed;
+        if (self.closed) {
+            log.warn("read: stream closed, no leftover data (has_received={}, lsquic={?*})", .{
+                self.has_received_data, self.lsquic_stream,
+            });
+            return error.StreamClosed;
+        }
 
         // Arm the lsquic read callback — tells lsquic to call onRead when
         // data is available. Must be done lazily (not in onNewStream) to avoid
