@@ -73,9 +73,8 @@ pub const QuicStream = struct {
     }
 
     pub fn read(self: *QuicStream, io: Io, buf: []u8) anyerror!usize {
-        if (self.closed) return error.StreamClosed;
-
-        // Serve from leftover data first
+        // Serve from leftover data first — even if the stream is closed,
+        // there may be buffered data to return.
         if (self.leftover_buf) |lb| {
             const remaining = lb.len - self.leftover_offset;
             const len = @min(buf.len, remaining);
@@ -90,6 +89,8 @@ pub const QuicStream = struct {
             }
             return len;
         }
+
+        if (self.closed) return error.StreamClosed;
 
         // Arm the lsquic read callback — tells lsquic to call onRead when
         // data is available. Must be done lazily (not in onNewStream) to avoid
