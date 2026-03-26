@@ -868,10 +868,11 @@ pub const QuicEngine = struct {
             if (is_locally_initiated) {
                 conn.outbound_stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
             } else {
-                // Don't arm wantread here — onNewStream fires inside
-                // processEngine() before STREAM data frames are decoded.
-                // QuicStream.read() arms wantread lazily, after the caller
-                // (negotiateInbound) is ready and processEngine has returned.
+                // Arm wantread immediately for inbound streams so lsquic
+                // delivers data via onRead before the stream is closed.
+                // Without this, Lighthouse can send data + half-close before
+                // our reader calls read(), causing UnexpectedEof.
+                _ = lsquic.lsquic_stream_wantread(s, 1);
                 conn.stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
             }
         }
@@ -954,10 +955,12 @@ pub const QuicEngine = struct {
             // onClose before delivering all buffered data via onRead.
             if (ls) |s| {
                 var drain_buf: [4096]u8 = undefined;
+                var drain_total: usize = 0;
                 while (true) {
                     const n = lsquic.lsquic_stream_read(s, &drain_buf, drain_buf.len);
                     if (n <= 0) break;
                     const len: usize = @intCast(n);
+                    drain_total += len;
                     // Push drained data to the read queue
                     if (stream.conn.engine.io) |io| {
                         const owned = stream.allocator.alloc(u8, len) catch break;
@@ -970,6 +973,9 @@ pub const QuicEngine = struct {
                             break;
                         };
                     }
+                }
+                if (drain_total > 0) {
+                    log.info("onStreamClose: drained {d} bytes from stream", .{drain_total});
                 }
             }
 
