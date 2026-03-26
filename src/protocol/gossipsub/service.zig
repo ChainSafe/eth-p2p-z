@@ -163,6 +163,36 @@ pub const Service = struct {
 
         self.io = io;
 
+        // Register inbound peer and store stream for bidirectional gossip.
+        self.router.addPeer(peer_id) catch {};
+        {
+            const StreamT = @TypeOf(stream.*);
+            const heap_stream = self.allocator.create(StreamT) catch return;
+            heap_stream.* = stream.*;
+            const any = AnyStream.wrap(StreamT, heap_stream);
+            const owned = OwnedStream{
+                .stream = any,
+                .backing_ptr = @ptrCast(heap_stream),
+                .destroy_fn = struct {
+                    fn destroy(alloc: Allocator, ptr: *anyopaque) void {
+                        const p: *StreamT = @ptrCast(@alignCast(ptr));
+                        alloc.destroy(p);
+                    }
+                }.destroy,
+            };
+            if (self.outbound_streams.fetchRemove(peer_id)) |o| {
+                o.value.destroy_fn(self.allocator, o.value.backing_ptr);
+                self.allocator.free(o.key);
+            }
+            self.outbound_streams.put(
+                self.allocator.dupe(u8, peer_id) catch return,
+                owned,
+            ) catch {};
+        }
+        // Announce our topic subscriptions to this peer
+        self.sendSubscriptionAnnouncement(peer_id);
+        log.info("gossipsub: announced {d} subscriptions to inbound peer", .{self.tracked_subscriptions.count()});
+
         var decoder = FrameDecoder.init(self.allocator);
         defer decoder.deinit();
 

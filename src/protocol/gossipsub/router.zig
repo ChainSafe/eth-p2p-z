@@ -473,6 +473,11 @@ pub fn Router(comptime Handler: type) type {
         /// Execute one heartbeat tick. Should be called periodically.
         pub fn heartbeat(self: *Self) !void {
             self.heartbeat_ticks += 1;
+            if (self.heartbeat_ticks % 10 == 0) {
+                log.info("heartbeat {d}: mesh={d} subs={d} topic_peers={d}", .{
+                    self.heartbeat_ticks, self.mesh.count(), self.subscriptions.count(), self.topic_peers.count(),
+                });
+            }
 
             // Reset per-heartbeat rate limit counters
             self.peer_ihave_count.clearRetainingCapacity();
