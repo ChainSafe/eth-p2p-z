@@ -949,7 +949,7 @@ pub const QuicEngine = struct {
     fn onStreamClose(ls: ?*lsquic.lsquic_stream_t, ctx: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
         if (ctx) |raw| {
             const stream: *QuicStream = @ptrCast(@alignCast(raw));
-            log.debug("onStreamClose: stream={*}", .{stream});
+            log.debug("onStreamClose called", .{});
 
             // Drain any remaining data before closing. lsquic may call
             // onClose before delivering all buffered data via onRead.
@@ -986,12 +986,10 @@ pub const QuicEngine = struct {
             }
             // Clear context so lsquic won't call us again
             if (ls) |s| lsquic.lsquic_stream_set_ctx(s, null);
-            // Free leftover read buffer if any
-            if (stream.leftover_buf) |lb| {
-                stream.allocator.free(lb);
-                stream.leftover_buf = null;
-            }
-            stream.allocator.destroy(stream);
+            // Don't destroy stream here — the reader (swarmStreamTask /
+            // multistream negotiation) may still be using it. The stream
+            // will be cleaned up when the reader finishes and the QuicStream
+            // goes out of scope or is explicitly closed.
         }
     }
 
