@@ -475,7 +475,7 @@ pub fn Router(comptime Handler: type) type {
             self.heartbeat_ticks += 1;
             if (self.heartbeat_ticks % 10 == 0) {
                 log.info("heartbeat {d}: mesh={d} subs={d} topic_peers={d}", .{
-                    self.heartbeat_ticks, self.mesh.count(), self.subscriptions.count(), self.topic_peers.count(),
+                    self.heartbeat_ticks, self.mesh.count(), self.subscriptions.count(), self.topics.count(),
                 });
             }
 
