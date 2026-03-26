@@ -393,8 +393,13 @@ pub fn Router(comptime Handler: type) type {
             }
 
             // Handle published messages
+            var pub_count: u32 = 0;
             while (reader.publishNext()) |msg_reader| {
+                pub_count += 1;
                 try self.handleIncomingMessage(from_peer, &msg_reader);
+            }
+            if (pub_count > 0) {
+                log.info("handleRpc: {d} published messages from peer", .{pub_count});
             }
 
             // Handle control messages
