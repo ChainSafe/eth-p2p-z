@@ -383,7 +383,7 @@ test "QUIC engine client connect initiates handshake" {
 
 test "QUIC connection ownership in dial" {
     // Verify Connection.owned_engine works correctly
-    var conn = quic.Connection{ .inner = undefined, .owned_engine = null };
+    const conn = quic.Connection{ .inner = undefined, .owned_engine = null };
     try std.testing.expect(conn.owned_engine == null);
 
     // Server-side connections don't own an engine

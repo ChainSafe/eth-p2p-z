@@ -472,7 +472,18 @@ pub fn Router(comptime Handler: type) type {
 
         /// Drain accumulated events. Caller owns the returned slice.
         pub fn drainEvents(self: *Self) ![]Event {
-            return self.events.toOwnedSlice(self.allocator);
+            const result = try self.events.toOwnedSlice(self.allocator);
+            if (result.len > 0) {
+                var msg_count: u32 = 0;
+                for (result) |e| {
+                    switch (e) {
+                        .message => msg_count += 1,
+                        else => {},
+                    }
+                }
+                log.info("drainEvents: {d} events ({d} messages)", .{ result.len, msg_count });
+            }
+            return result;
         }
 
         /// Execute one heartbeat tick. Should be called periodically.
@@ -602,6 +613,17 @@ pub fn Router(comptime Handler: type) type {
 
         fn handleIncomingMessage(self: *Self, from_peer: []const u8, msg_reader: *const rpc.MessageReader) !void {
             const topic = msg_reader.getTopic();
+            const data_early = optionalBytes(msg_reader.getData());
+            const data_len_early: usize = if (data_early) |d| d.len else 0;
+            const from = optionalBytes(msg_reader.getFrom());
+            const seqno = optionalBytes(msg_reader.getSeqno());
+            const is_sub = self.subscriptions.contains(topic);
+            log.info("handleIncomingMessage: topic_len={d} data_len={d} from={d} seqno={d} subscribed={}", .{
+                topic.len, data_len_early,
+                if (from) |f| f.len else @as(usize, 0),
+                if (seqno) |s| s.len else @as(usize, 0),
+                is_sub,
+            });
             if (topic.len == 0) return;
 
             // Build a Message for ID computation and caching
@@ -619,7 +641,11 @@ pub fn Router(comptime Handler: type) type {
             defer self.allocator.free(mid);
 
             // Dedup check
-            if (self.seen.contains(mid)) return;
+            if (self.seen.contains(mid)) {
+                log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
+                return;
+            }
+            log.info("handleIncomingMessage: DEDUP MISS (new msg) mid_len={d}", .{mid.len});
 
             const mid_owned = try self.allocator.dupe(u8, mid);
             try self.seen.put(mid_owned, {});
@@ -638,7 +664,11 @@ pub fn Router(comptime Handler: type) type {
             }
 
             // Emit event if we are subscribed to this topic
+            log.info("handleIncomingMessage: topic='{s}' data_len={d} subscribed={}", .{
+                topic, data_len, self.subscriptions.contains(topic),
+            });
             if (self.subscriptions.contains(topic)) {
+                log.info("handleIncomingMessage: APPENDING message event for topic='{s}'", .{topic});
                 try self.events.append(self.allocator, .{ .message = .{
                     .topic = topic,
                     .data = msg.data orelse "",

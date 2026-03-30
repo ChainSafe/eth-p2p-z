@@ -161,7 +161,7 @@ const RedisClient = struct {
     }
 
     fn connectAddr(io: Io, addr: net.IpAddress) !RedisClient {
-        const stream = try net.IpAddress.connect(addr, io, .{ .mode = .stream });
+        const stream = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
         var client = RedisClient{
             .stream = stream,
             .reader = undefined,
