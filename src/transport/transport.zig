@@ -56,7 +56,7 @@ fn assertErrorUnionPayload(comptime owner: type, comptime name: []const u8, comp
 /// Asserts at comptime that type T satisfies the Transport interface.
 /// A Transport must provide:
 ///   - Connection type with: openStream, acceptStream, close, remotePeerId
-///   - Stream type with: read, write, close
+///   - Stream type with: read, write, closeRead, closeWrite, close
 ///   - Listener type with: accept, close, localAddr
 ///   - fn dial(self: *Self, io: std.Io, addr: Multiaddr) DialError!Connection
 ///   - fn listen(self: *Self, io: std.Io, addr: Multiaddr) ListenError!Listener
@@ -125,10 +125,20 @@ pub fn assertTransportInterface(comptime T: type) void {
     if (!@hasDecl(Stream, "close")) {
         @compileError("Stream type of '" ++ @typeName(T) ++ "' missing 'close'");
     }
+    if (!@hasDecl(Stream, "closeRead")) {
+        @compileError("Stream type of '" ++ @typeName(T) ++ "' missing 'closeRead'");
+    }
+    if (!@hasDecl(Stream, "closeWrite")) {
+        @compileError("Stream type of '" ++ @typeName(T) ++ "' missing 'closeWrite'");
+    }
     assertFnParamTypes(Stream, "read", &.{ *Stream, Io, []u8 });
     assertErrorUnionPayload(Stream, "read", usize);
     assertFnParamTypes(Stream, "write", &.{ *Stream, Io, []const u8 });
     assertErrorUnionPayload(Stream, "write", usize);
+    assertFnParamTypes(Stream, "closeRead", &.{ *Stream, Io });
+    assertReturnType(Stream, "closeRead", void);
+    assertFnParamTypes(Stream, "closeWrite", &.{ *Stream, Io });
+    assertReturnType(Stream, "closeWrite", void);
     assertFnParamTypes(Stream, "close", &.{ *Stream, Io });
     assertReturnType(Stream, "close", void);
 
@@ -161,11 +171,17 @@ pub fn assertTransportInterface(comptime T: type) void {
 pub fn assertStreamInterface(comptime S: type) void {
     if (!@hasDecl(S, "read")) @compileError("Stream '" ++ @typeName(S) ++ "' missing 'read'");
     if (!@hasDecl(S, "write")) @compileError("Stream '" ++ @typeName(S) ++ "' missing 'write'");
+    if (!@hasDecl(S, "closeRead")) @compileError("Stream '" ++ @typeName(S) ++ "' missing 'closeRead'");
+    if (!@hasDecl(S, "closeWrite")) @compileError("Stream '" ++ @typeName(S) ++ "' missing 'closeWrite'");
     if (!@hasDecl(S, "close")) @compileError("Stream '" ++ @typeName(S) ++ "' missing 'close'");
     assertFnParamTypes(S, "read", &.{ *S, Io, []u8 });
     assertErrorUnionPayload(S, "read", usize);
     assertFnParamTypes(S, "write", &.{ *S, Io, []const u8 });
     assertErrorUnionPayload(S, "write", usize);
+    assertFnParamTypes(S, "closeRead", &.{ *S, Io });
+    assertReturnType(S, "closeRead", void);
+    assertFnParamTypes(S, "closeWrite", &.{ *S, Io });
+    assertReturnType(S, "closeWrite", void);
     assertFnParamTypes(S, "close", &.{ *S, Io });
     assertReturnType(S, "close", void);
 }
@@ -179,6 +195,8 @@ pub const AnyStream = struct {
     pub const VTable = struct {
         readFn: *const fn (ptr: *anyopaque, io: Io, buf: []u8) anyerror!usize,
         writeFn: *const fn (ptr: *anyopaque, io: Io, data: []const u8) anyerror!usize,
+        closeReadFn: *const fn (ptr: *anyopaque, io: Io) void,
+        closeWriteFn: *const fn (ptr: *anyopaque, io: Io) void,
         closeFn: *const fn (ptr: *anyopaque, io: Io) void,
     };
 
@@ -188,6 +206,14 @@ pub const AnyStream = struct {
 
     pub fn write(self: AnyStream, io: Io, data: []const u8) anyerror!usize {
         return self.vtable.writeFn(self.ptr, io, data);
+    }
+
+    pub fn closeRead(self: AnyStream, io: Io) void {
+        self.vtable.closeReadFn(self.ptr, io);
+    }
+
+    pub fn closeWrite(self: AnyStream, io: Io) void {
+        self.vtable.closeWriteFn(self.ptr, io);
     }
 
     pub fn close(self: AnyStream, io: Io) void {
@@ -204,6 +230,14 @@ pub const AnyStream = struct {
                 const s: *StreamT = @ptrCast(@alignCast(ptr));
                 return s.write(io, data);
             }
+            fn closeReadFn(ptr: *anyopaque, io: Io) void {
+                const s: *StreamT = @ptrCast(@alignCast(ptr));
+                s.closeRead(io);
+            }
+            fn closeWriteFn(ptr: *anyopaque, io: Io) void {
+                const s: *StreamT = @ptrCast(@alignCast(ptr));
+                s.closeWrite(io);
+            }
             fn closeFn(ptr: *anyopaque, io: Io) void {
                 const s: *StreamT = @ptrCast(@alignCast(ptr));
                 s.close(io);
@@ -211,6 +245,8 @@ pub const AnyStream = struct {
             const vtable_instance = VTable{
                 .readFn = readFn,
                 .writeFn = writeFn,
+                .closeReadFn = closeReadFn,
+                .closeWriteFn = closeWriteFn,
                 .closeFn = closeFn,
             };
         };
@@ -232,17 +268,35 @@ test "assertTransportInterface catches missing types" {
 
 test "AnyStream wrap creates valid vtable" {
     const MockStream = struct {
+        read_closed: bool = false,
+        write_closed: bool = false,
+        closed: bool = false,
+
         pub fn read(_: *@This(), _: Io, _: []u8) anyerror!usize {
             return 1;
         }
         pub fn write(_: *@This(), _: Io, _: []const u8) anyerror!usize {
             return 5;
         }
-        pub fn close(_: *@This(), _: Io) void {}
+        pub fn closeRead(self: *@This(), _: Io) void {
+            self.read_closed = true;
+        }
+        pub fn closeWrite(self: *@This(), _: Io) void {
+            self.write_closed = true;
+        }
+        pub fn close(self: *@This(), _: Io) void {
+            self.closed = true;
+        }
     };
 
     var mock = MockStream{};
     const any = AnyStream.wrap(MockStream, &mock);
     // Verify ptr was set correctly
     try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&mock)), any.ptr);
+    any.closeRead(undefined);
+    any.closeWrite(undefined);
+    any.close(undefined);
+    try std.testing.expect(mock.read_closed);
+    try std.testing.expect(mock.write_closed);
+    try std.testing.expect(mock.closed);
 }

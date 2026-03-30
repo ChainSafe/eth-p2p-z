@@ -121,6 +121,7 @@ pub const Handler = struct {
         }
         writeAll(io, stream, len_buf[0..len_size]) catch return Error.UnexpectedEof;
         writeAll(io, stream, encoded) catch return Error.UnexpectedEof;
+        stream.closeWrite(io);
         log.info("identify: sent {d} byte response", .{encoded.len});
     }
 
@@ -128,6 +129,8 @@ pub const Handler = struct {
     /// Stores result in peer_results if ctx.peer_id is provided (via Switch.newStream).
     pub fn handleOutbound(self: *Handler, io: Io, stream: anytype, ctx: anytype) Error!void {
         const allocator = self.allocator;
+
+        stream.closeWrite(io);
 
         const message_len = readLengthPrefixedSize(io, stream) catch return Error.UnexpectedEof;
         if (message_len > max_message_size) return Error.MessageTooLarge;
@@ -248,6 +251,7 @@ test "handleInbound encodes and writes identify message" {
     };
     defer handler.deinit();
     try handler.handleInbound(undefined, &stream, .{});
+    try std.testing.expect(stream.write_closed);
 
     // Decode what was written
     var framed_stream = MockStream.init(allocator, stream.write_buf.items);
@@ -287,6 +291,7 @@ test "handleOutbound reads and decodes identify message" {
 
     const peer_id = "test-peer-id";
     try handler.handleOutbound(undefined, &stream, .{ .peer_id = @as(?[]const u8, peer_id) });
+    try std.testing.expect(stream.write_closed);
 
     // Result should be stored
     const result = handler.getPeerResult(peer_id) orelse return error.TestUnexpectedNull;

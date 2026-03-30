@@ -386,6 +386,8 @@ test "Switch comptime validation accepts valid config" {
                 pub fn write(_: *@This(), _: Io, _: []const u8) anyerror!usize {
                     return 0;
                 }
+                pub fn closeRead(_: *@This(), _: Io) void {}
+                pub fn closeWrite(_: *@This(), _: Io) void {}
                 pub fn close(_: *@This(), _: Io) void {}
             };
             pub fn openStream(_: *@This(), _: Io) !StreamType {

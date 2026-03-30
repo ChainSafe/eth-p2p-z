@@ -28,6 +28,7 @@ pub const Handler = struct {
         var buf: [payload_length]u8 = undefined;
         readExact(io, stream, &buf) catch return Error.UnexpectedEof;
         writeAll(io, stream, &buf) catch return Error.UnexpectedEof;
+        stream.closeWrite(io);
     }
 
     /// Handle an outbound ping: generate random payload, send it, wait for echo,
@@ -38,6 +39,7 @@ pub const Handler = struct {
 
         const start_ns = timestampNs();
         writeAll(io, stream, &payload) catch return Error.UnexpectedEof;
+        stream.closeWrite(io);
 
         var response: [payload_length]u8 = undefined;
         readExact(io, stream, &response) catch return Error.UnexpectedEof;
@@ -91,6 +93,7 @@ test "handleInbound echoes payload" {
     try handler.handleInbound(undefined, &stream, .{});
     try std.testing.expectEqual(payload_length, stream.write_buf.items.len);
     try std.testing.expectEqualSlices(u8, &payload, stream.write_buf.items);
+    try std.testing.expect(stream.write_closed);
 }
 
 test "handleInbound returns error on short read" {
@@ -118,12 +121,16 @@ test "handleOutbound succeeds with echo (self-contained)" {
     // RTT should be measured (non-zero on real clock)
     // Payload was 32 bytes written
     try std.testing.expectEqual(payload_length, stream.write_buf.items.len);
+    try std.testing.expect(stream.write_closed);
 }
 
 /// Mock stream that echoes back whatever is written (for outbound ping tests).
 const EchoMockStream = struct {
     write_buf: std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    read_closed: bool = false,
+    write_closed: bool = false,
+    closed: bool = false,
 
     fn init(allocator: std.mem.Allocator) EchoMockStream {
         return .{ .write_buf = .empty, .allocator = allocator };
@@ -133,7 +140,8 @@ const EchoMockStream = struct {
         self.write_buf.deinit(self.allocator);
     }
 
-    pub fn read(_: *EchoMockStream, _: Io, buf: []u8) anyerror!usize {
+    pub fn read(self: *EchoMockStream, _: Io, buf: []u8) anyerror!usize {
+        if (self.closed or self.read_closed) return error.StreamClosed;
         // Echo: return the last written payload.
         // handleOutbound writes first, then reads — g_echo_buf holds the data.
         @memcpy(buf, g_echo_buf[0..buf.len]);
@@ -141,13 +149,26 @@ const EchoMockStream = struct {
     }
 
     pub fn write(self: *EchoMockStream, _: Io, data: []const u8) anyerror!usize {
+        if (self.closed or self.write_closed) return error.StreamClosed;
         self.write_buf.appendSlice(self.allocator, data) catch return error.OutOfMemory;
         // Store for echo read
         @memcpy(g_echo_buf[0..data.len], data);
         return data.len;
     }
 
-    pub fn close(_: *EchoMockStream, _: Io) void {}
+    pub fn closeRead(self: *EchoMockStream, _: Io) void {
+        self.read_closed = true;
+    }
+
+    pub fn closeWrite(self: *EchoMockStream, _: Io) void {
+        self.write_closed = true;
+    }
+
+    pub fn close(self: *EchoMockStream, io: Io) void {
+        self.closeRead(io);
+        self.closeWrite(io);
+        self.closed = true;
+    }
 
     threadlocal var g_echo_buf: [payload_length]u8 = undefined;
 };

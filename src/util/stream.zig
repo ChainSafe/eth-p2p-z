@@ -30,6 +30,9 @@ pub const MockStream = struct {
     read_pos: usize = 0,
     write_buf: std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    read_closed: bool = false,
+    write_closed: bool = false,
+    closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, read_data: []const u8) MockStream {
         return .{
@@ -44,7 +47,8 @@ pub const MockStream = struct {
         self.* = undefined;
     }
 
-    pub fn read(self: *MockStream, _: Io, buf: []u8) error{}!usize {
+    pub fn read(self: *MockStream, _: Io, buf: []u8) error{StreamClosed}!usize {
+        if (self.closed or self.read_closed) return error.StreamClosed;
         if (self.read_pos >= self.read_buf.len) return 0;
         const available = self.read_buf.len - self.read_pos;
         const to_read = @min(buf.len, available);
@@ -53,9 +57,24 @@ pub const MockStream = struct {
         return to_read;
     }
 
-    pub fn write(self: *MockStream, _: Io, data: []const u8) error{OutOfMemory}!usize {
+    pub fn write(self: *MockStream, _: Io, data: []const u8) error{ OutOfMemory, StreamClosed }!usize {
+        if (self.closed or self.write_closed) return error.StreamClosed;
         self.write_buf.appendSlice(self.allocator, data) catch return error.OutOfMemory;
         return data.len;
+    }
+
+    pub fn closeRead(self: *MockStream, _: Io) void {
+        self.read_closed = true;
+    }
+
+    pub fn closeWrite(self: *MockStream, _: Io) void {
+        self.write_closed = true;
+    }
+
+    pub fn close(self: *MockStream, io: Io) void {
+        self.closeRead(io);
+        self.closeWrite(io);
+        self.closed = true;
     }
 };
 
@@ -97,4 +116,21 @@ test "MockStream read returns 0 at end" {
 
     const n2 = try stream.read(undefined, &buf);
     try std.testing.expectEqual(@as(usize, 0), n2);
+}
+
+test "MockStream half-close tracks read and write state independently" {
+    var stream = MockStream.init(std.testing.allocator, "ab");
+    defer stream.deinit();
+
+    stream.closeWrite(undefined);
+    try std.testing.expect(stream.write_closed);
+    try std.testing.expectError(error.StreamClosed, stream.write(undefined, "x"));
+
+    var buf: [2]u8 = undefined;
+    const n = try stream.read(undefined, &buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    stream.closeRead(undefined);
+    try std.testing.expect(stream.read_closed);
+    try std.testing.expectError(error.StreamClosed, stream.read(undefined, &buf));
 }

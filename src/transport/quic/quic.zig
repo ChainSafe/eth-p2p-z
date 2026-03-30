@@ -34,6 +34,14 @@ pub const Stream = struct {
         return self.inner.write(io, data);
     }
 
+    pub fn closeRead(self: *Stream, io: Io) void {
+        self.inner.closeRead(io);
+    }
+
+    pub fn closeWrite(self: *Stream, io: Io) void {
+        self.inner.closeWrite(io);
+    }
+
     pub fn close(self: *Stream, io: Io) void {
         self.inner.close(io);
     }
@@ -682,6 +690,53 @@ test "QUIC stream read/write round-trip" {
     client_eng.deinit();
     server_conn.deinit();
     client_conn.deinit();
+}
+
+test "QUIC stream supports half-close request-response" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ctx = TestContext.initPair(allocator, io) catch |err| {
+        std.log.warn("TestContext init failed: {}", .{err});
+        return;
+    };
+    defer ctx.deinit(io);
+
+    var client_stream = ctx.client_conn.openStream(io) catch |err| {
+        std.log.warn("openStream failed: {}", .{err});
+        return;
+    };
+    defer client_stream.deinit();
+
+    const request = "request-body";
+    try std.testing.expectEqual(request.len, try client_stream.write(io, request));
+    client_stream.closeWrite(io);
+    try std.testing.expectError(error.StreamClosed, client_stream.write(io, "x"));
+
+    var server_stream = ctx.server_conn.acceptStream(io) catch |err| {
+        std.log.warn("acceptStream failed: {}", .{err});
+        return;
+    };
+    defer server_stream.deinit();
+
+    var request_buf: [64]u8 = undefined;
+    const request_n = try server_stream.read(io, &request_buf);
+    try std.testing.expectEqualSlices(u8, request, request_buf[0..request_n]);
+
+    var eof_buf: [1]u8 = undefined;
+    const eof_n = try server_stream.read(io, &eof_buf);
+    try std.testing.expectEqual(@as(usize, 0), eof_n);
+
+    const response = "response-body";
+    try std.testing.expectEqual(response.len, try server_stream.write(io, response));
+    server_stream.closeWrite(io);
+
+    var response_buf: [64]u8 = undefined;
+    const response_n = try client_stream.read(io, &response_buf);
+    try std.testing.expectEqualSlices(u8, response, response_buf[0..response_n]);
+
+    const response_eof_n = try client_stream.read(io, &eof_buf);
+    try std.testing.expectEqual(@as(usize, 0), response_eof_n);
 }
 
 // ── Test Helpers ──────────────────────────────────────────────────────

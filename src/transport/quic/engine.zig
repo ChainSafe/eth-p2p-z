@@ -51,6 +51,8 @@ pub const QuicStream = struct {
     has_received_data: bool,
     spurious_read_count: u32,
     closed: bool,
+    read_closed: bool,
+    write_closed: bool,
     /// Leftover data from a previous ReadEvent when caller's buffer was too small.
     leftover_buf: ?[]u8 = null,
     leftover_offset: usize = 0,
@@ -66,6 +68,8 @@ pub const QuicStream = struct {
             .has_received_data = false,
             .spurious_read_count = 0,
             .closed = false,
+            .read_closed = false,
+            .write_closed = false,
         };
         self.read_queue = Io.Queue(ReadEvent).init(&self.read_queue_buf);
         lsquic.lsquic_stream_set_ctx(ls, @ptrCast(self));
@@ -91,6 +95,8 @@ pub const QuicStream = struct {
             }
             return len;
         }
+
+        if (self.read_closed) return error.StreamClosed;
 
         if (self.closed) {
             log.warn("read: stream closed, no leftover data (has_received={}, lsquic={?*})", .{
@@ -123,7 +129,7 @@ pub const QuicStream = struct {
     }
 
     pub fn write(self: *QuicStream, _: Io, data: []const u8) anyerror!usize {
-        if (self.closed) return error.StreamClosed;
+        if (self.closed or self.write_closed) return error.StreamClosed;
         const ls = self.lsquic_stream orelse return error.StreamClosed;
         const written = lsquic.lsquic_stream_write(ls, data.ptr, data.len);
         if (written < 0) return error.WriteFailed;
@@ -133,7 +139,31 @@ pub const QuicStream = struct {
         return @intCast(written);
     }
 
+    pub fn closeRead(self: *QuicStream, _: Io) void {
+        if (self.read_closed) return;
+        self.read_closed = true;
+        if (self.lsquic_stream) |ls| {
+            if (!self.conn.closed) {
+                _ = lsquic.lsquic_stream_shutdown(ls, 0);
+                _ = lsquic.lsquic_stream_wantread(ls, 0);
+            }
+        }
+        self.read_queue.close(self.conn.engine.io);
+    }
+
+    pub fn closeWrite(self: *QuicStream, _: Io) void {
+        if (self.write_closed) return;
+        self.write_closed = true;
+        if (self.lsquic_stream) |ls| {
+            if (!self.conn.closed) {
+                _ = lsquic.lsquic_stream_shutdown(ls, 1);
+            }
+        }
+    }
+
     pub fn close(self: *QuicStream, _: Io) void {
+        self.read_closed = true;
+        self.write_closed = true;
         if (self.lsquic_stream) |ls| {
             // Tell lsquic to close the stream. Ownership remains with the caller,
             // which must later call deinit() once it is done with the wrapper.
