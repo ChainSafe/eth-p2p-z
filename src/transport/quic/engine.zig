@@ -135,8 +135,8 @@ pub const QuicStream = struct {
 
     pub fn close(self: *QuicStream, _: Io) void {
         if (self.lsquic_stream) |ls| {
-            // Tell lsquic to close the stream. This will trigger onStreamClose
-            // which handles cleanup (closing read_queue, freeing leftover, destroying self).
+            // Tell lsquic to close the stream. Ownership remains with the caller,
+            // which must later call deinit() once it is done with the wrapper.
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_close(ls);
             }
@@ -331,7 +331,7 @@ pub const QuicEngine = struct {
     conn_queue_buf: [16]ConnEvent,
     conn_queue: Io.Queue(ConnEvent),
     socket: ?net.Socket,
-    io: ?Io,
+    io: Io,
     is_server: bool,
     running: bool,
     has_unsent: bool,
@@ -361,7 +361,7 @@ pub const QuicEngine = struct {
         host_key: ?*ssl.EVP_PKEY = null,
     };
 
-    pub fn init(allocator: Allocator, config: Config) !*QuicEngine {
+    pub fn init(allocator: Allocator, io: Io, config: Config) !*QuicEngine {
         // Initialize lsquic global state (safe to call multiple times)
         if (lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER) != 0) {
             return error.LsquicGlobalInitFailed;
@@ -388,7 +388,7 @@ pub const QuicEngine = struct {
         self.cert_verify_ctx = CertVerifyCtx.init(allocator);
         self.conn_queue_buf = undefined;
         self.socket = null;
-        self.io = null;
+        self.io = io;
         self.is_server = config.is_server;
         self.running = false;
         self.has_unsent = false;
@@ -518,12 +518,6 @@ pub const QuicEngine = struct {
         return self;
     }
 
-    /// Set the Io context. Must be called before using the engine with
-    /// lsquic callbacks that need to push into Io.Queues.
-    pub fn setIo(self: *QuicEngine, io: Io) void {
-        self.io = io;
-    }
-
     pub fn deinit(self: *QuicEngine) void {
         lsquic.lsquic_engine_destroy(self.engine);
         ssl.SSL_CTX_free(self.ssl_ctx);
@@ -590,7 +584,7 @@ pub const QuicEngine = struct {
     }
 
     /// Start the background receive and timer loops.
-    /// Must be called after setIo() and bindSocket().
+    /// Must be called after bindSocket().
     pub fn startBackgroundLoops(self: *QuicEngine, io: Io) void {
         self.running = true;
         self.background.async(io, QuicEngine.runReceiveLoop, .{ self, io });
@@ -698,12 +692,10 @@ pub const QuicEngine = struct {
         // Must happen AFTER process_conns returns to avoid re-entrancy.
         if (self.pending_server_conn) |conn| {
             self.pending_server_conn = null;
-            if (self.io) |io| {
-                log.debug("processEngine: pushing pending server conn to accept queue", .{});
-                self.conn_queue.putOneUncancelable(io, .{ .conn = conn }) catch |err| {
-                    log.err("processEngine: failed to push server conn: {}", .{err});
-                };
-            }
+            log.debug("processEngine: pushing pending server conn to accept queue", .{});
+            self.conn_queue.putOneUncancelable(self.io, .{ .conn = conn }) catch |err| {
+                log.err("processEngine: failed to push server conn: {}", .{err});
+            };
         }
     }
 
@@ -758,9 +750,7 @@ pub const QuicEngine = struct {
                 const conn_ctx = lsquic.lsquic_conn_get_ctx(c);
                 if (conn_ctx) |ctx| {
                     const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
-                    if (conn.engine.io) |io| {
-                        conn.hsk_queue.putOneUncancelable(io, .failed) catch {};
-                    }
+                    conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {};
                 }
                 lsquic.lsquic_conn_close(c);
             }
@@ -779,17 +769,13 @@ pub const QuicEngine = struct {
                 log.debug("onHskDone: peer_id extracted from custom verify", .{});
             } else {
                 log.warn("onHskDone: no verified peer info from custom verify callback", .{});
-                if (conn.engine.io) |io| {
-                    conn.hsk_queue.putOneUncancelable(io, .failed) catch {};
-                }
+                conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {};
                 if (lc) |c| lsquic.lsquic_conn_close(c);
                 return;
             }
 
             // Signal success to waitHandshake
-            if (conn.engine.io) |io| {
-                conn.hsk_queue.putOneUncancelable(io, .ok) catch {};
-            }
+            conn.hsk_queue.putOneUncancelable(conn.engine.io, .ok) catch {};
 
             // Note: on_hsk_done is CLIENT-ONLY in lsquic.
             // The client already has its QuicConnection from connect(), so we
@@ -837,11 +823,9 @@ pub const QuicEngine = struct {
             // Clear conn context so lsquic doesn't assert on engine destroy
             if (lc) |c| lsquic.lsquic_conn_set_ctx(c, null);
             // Close both queues using engine's stored io
-            if (conn.engine.io) |io| {
-                conn.stream_queue.close(io);
-                conn.outbound_stream_queue.close(io);
-                conn.hsk_queue.close(io);
-            }
+            conn.stream_queue.close(conn.engine.io);
+            conn.outbound_stream_queue.close(conn.engine.io);
+            conn.hsk_queue.close(conn.engine.io);
         }
     }
 
@@ -870,21 +854,19 @@ pub const QuicEngine = struct {
         // RFC 9000: client-initiated bidi = 4n+0, server-initiated bidi = 4n+1.
         // Locally-initiated streams go to outbound_stream_queue (for openStream),
         // remotely-initiated streams go to stream_queue (for acceptStream).
-        if (engine.io) |io| {
-            const stream_id = lsquic.lsquic_stream_id(s);
-            const is_server_initiated = (stream_id % 4 == 1);
-            const is_locally_initiated = (engine.is_server == is_server_initiated);
+        const stream_id = lsquic.lsquic_stream_id(s);
+        const is_server_initiated = (stream_id % 4 == 1);
+        const is_locally_initiated = (engine.is_server == is_server_initiated);
 
-            if (is_locally_initiated) {
-                conn.outbound_stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
-            } else {
-                // Arm wantread immediately for inbound streams so lsquic
-                // delivers data via onRead before the stream is closed.
-                // Without this, Lighthouse can send data + half-close before
-                // our reader calls read(), causing UnexpectedEof.
-                _ = lsquic.lsquic_stream_wantread(s, 1);
-                conn.stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
-            }
+        if (is_locally_initiated) {
+            conn.outbound_stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch {};
+        } else {
+            // Arm wantread immediately for inbound streams so lsquic
+            // delivers data via onRead before the stream is closed.
+            // Without this, Lighthouse can send data + half-close before
+            // our reader calls read(), causing UnexpectedEof.
+            _ = lsquic.lsquic_stream_wantread(s, 1);
+            conn.stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch {};
         }
 
         return @ptrCast(stream);
@@ -900,7 +882,7 @@ pub const QuicEngine = struct {
         const n = lsquic.lsquic_stream_read(s, &buf, buf.len);
         if (n < 0) {
             // Error — likely EWOULDBLOCK. Re-arm and wait.
-            log.debug("onRead: stream {d} EWOULDBLOCK (n={d})", .{stream_id, n});
+            log.debug("onRead: stream {d} EWOULDBLOCK (n={d})", .{ stream_id, n });
             return;
         }
         if (n == 0) {
@@ -910,42 +892,34 @@ pub const QuicEngine = struct {
                 // Leave wantread armed; next process_conns tick will retry.
                 stream.spurious_read_count += 1;
                 if (stream.spurious_read_count <= 3) {
-                    log.debug("onRead: stream {d} no data yet (tick {d})", .{stream_id, stream.spurious_read_count});
+                    log.debug("onRead: stream {d} no data yet (tick {d})", .{ stream_id, stream.spurious_read_count });
                 }
                 return;
             }
             // Genuine EOF — peer sent FIN after sending data.
             log.debug("onRead: stream {d} EOF", .{stream_id});
             _ = lsquic.lsquic_stream_wantread(s, 0);
-            if (stream.conn.engine.io) |io| {
-                stream.read_queue.close(io);
-            }
+            stream.read_queue.close(stream.conn.engine.io);
             return;
         }
 
         const len: usize = @intCast(n);
-        log.debug("onRead: stream {d} got {d} bytes", .{stream_id, len});
+        log.debug("onRead: stream {d} got {d} bytes", .{ stream_id, len });
         stream.has_received_data = true;
         // Allocate owned copy of the data
         const owned = stream.allocator.alloc(u8, len) catch {
-            if (stream.conn.engine.io) |io| {
-                stream.read_queue.close(io);
-            }
+            stream.read_queue.close(stream.conn.engine.io);
             return;
         };
         @memcpy(owned, buf[0..len]);
 
         // Push read event
-        if (stream.conn.engine.io) |io| {
-            stream.read_queue.putOneUncancelable(io, .{
-                .data = owned,
-                .owned_buf = owned,
-            }) catch {
-                stream.allocator.free(owned);
-            };
-        } else {
+        stream.read_queue.putOneUncancelable(stream.conn.engine.io, .{
+            .data = owned,
+            .owned_buf = owned,
+        }) catch {
             stream.allocator.free(owned);
-        }
+        };
     }
 
     fn onWrite(ls: ?*lsquic.lsquic_stream_t, _: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
@@ -972,17 +946,15 @@ pub const QuicEngine = struct {
                     const len: usize = @intCast(n);
                     drain_total += len;
                     // Push drained data to the read queue
-                    if (stream.conn.engine.io) |io| {
-                        const owned = stream.allocator.alloc(u8, len) catch break;
-                        @memcpy(owned, drain_buf[0..len]);
-                        stream.read_queue.putOneUncancelable(io, .{
-                            .data = owned,
-                            .owned_buf = owned,
-                        }) catch {
-                            stream.allocator.free(owned);
-                            break;
-                        };
-                    }
+                    const owned = stream.allocator.alloc(u8, len) catch break;
+                    @memcpy(owned, drain_buf[0..len]);
+                    stream.read_queue.putOneUncancelable(stream.conn.engine.io, .{
+                        .data = owned,
+                        .owned_buf = owned,
+                    }) catch {
+                        stream.allocator.free(owned);
+                        break;
+                    };
                 }
                 if (drain_total > 0) {
                     log.info("onStreamClose: drained {d} bytes from stream", .{drain_total});
@@ -991,9 +963,7 @@ pub const QuicEngine = struct {
 
             stream.lsquic_stream = null;
             stream.closed = true;
-            if (stream.conn.engine.io) |io| {
-                stream.read_queue.close(io);
-            }
+            stream.read_queue.close(stream.conn.engine.io);
             // Clear context so lsquic won't call us again
             if (ls) |s| lsquic.lsquic_stream_set_ctx(s, null);
             // Don't destroy stream here — the reader (swarmStreamTask /
@@ -1192,7 +1162,7 @@ test "CertVerifyCtx returns null when empty" {
 
 test "QuicEngine init and deinit" {
     const allocator = std.testing.allocator;
-    const engine = QuicEngine.init(allocator, .{}) catch |err| {
+    const engine = QuicEngine.init(allocator, std.testing.io, .{}) catch |err| {
         // If lsquic init fails (e.g., missing SSL setup), skip
         std.log.warn("QuicEngine init failed (expected in unit test): {}", .{err});
         return;
@@ -1201,7 +1171,6 @@ test "QuicEngine init and deinit" {
 
     try std.testing.expect(!engine.is_server);
     try std.testing.expect(!engine.running);
-    try std.testing.expect(engine.io == null);
 }
 
 test "ipAddressToSockaddr converts IPv4 correctly" {

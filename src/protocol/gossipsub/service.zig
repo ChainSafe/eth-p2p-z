@@ -169,6 +169,9 @@ pub const Service = struct {
             const StreamT = @TypeOf(stream.*);
             const heap_stream = self.allocator.create(StreamT) catch return;
             heap_stream.* = stream.*;
+            if (@hasDecl(StreamT, "transferOwnership")) {
+                stream.transferOwnership();
+            }
             const any = AnyStream.wrap(StreamT, heap_stream);
             const owned = OwnedStream{
                 .stream = any,
@@ -176,6 +179,9 @@ pub const Service = struct {
                 .destroy_fn = struct {
                     fn destroy(alloc: Allocator, ptr: *anyopaque) void {
                         const p: *StreamT = @ptrCast(@alignCast(ptr));
+                        if (@hasDecl(StreamT, "deinit")) {
+                            p.deinit();
+                        }
                         alloc.destroy(p);
                     }
                 }.destroy,
@@ -202,7 +208,7 @@ pub const Service = struct {
         while (true) {
             const n = stream.read(io, &buf) catch break;
             if (n == 0) break;
-            log.debug("gossipsub: feeding {d} bytes to decoder (buf total: {d})", .{n, decoder.buf.items.len + n});
+            log.debug("gossipsub: feeding {d} bytes to decoder (buf total: {d})", .{ n, decoder.buf.items.len + n });
             // Guard: if total buffered data exceeds max RPC size, skip
             if (decoder.buf.items.len + n > codec_mod.max_rpc_size) {
                 log.warn("gossipsub: frame exceeds max RPC size, dropping", .{});
@@ -242,6 +248,9 @@ pub const Service = struct {
         const StreamT = @TypeOf(stream.*);
         const heap_stream = try self.allocator.create(StreamT);
         heap_stream.* = stream.*;
+        if (@hasDecl(StreamT, "transferOwnership")) {
+            stream.transferOwnership();
+        }
         const any = AnyStream.wrap(StreamT, heap_stream);
 
         const owned = OwnedStream{
@@ -250,6 +259,9 @@ pub const Service = struct {
             .destroy_fn = struct {
                 fn destroy(alloc: Allocator, ptr: *anyopaque) void {
                     const p: *StreamT = @ptrCast(@alignCast(ptr));
+                    if (@hasDecl(StreamT, "deinit")) {
+                        p.deinit();
+                    }
                     alloc.destroy(p);
                 }
             }.destroy,
@@ -266,6 +278,9 @@ pub const Service = struct {
         self.outbound_streams.put(peer_copy, owned) catch {
             self.allocator.free(peer_copy);
             heap_stream.close(io);
+            if (@hasDecl(StreamT, "deinit")) {
+                heap_stream.deinit();
+            }
             self.allocator.destroy(heap_stream);
             return;
         };
@@ -351,10 +366,7 @@ pub const Service = struct {
 
     /// Check if a peer is currently connected.
     pub fn isPeerConnected(self: *Self, peer: []const u8) bool {
-        _ = self;
-        _ = peer;
-        // TODO: track connected peers via addPeer/removePeer
-        return true;
+        return self.outbound_streams.contains(peer);
     }
 
     // ---------------------------------------------------------------

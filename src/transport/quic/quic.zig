@@ -24,6 +24,7 @@ const transport_mod = @import("../transport.zig");
 /// Transport-level QUIC stream satisfying the Stream interface.
 pub const Stream = struct {
     inner: *QuicStreamInner,
+    owns_inner: bool = true,
 
     pub fn read(self: *Stream, io: Io, buf: []u8) anyerror!usize {
         return self.inner.read(io, buf);
@@ -36,6 +37,16 @@ pub const Stream = struct {
     pub fn close(self: *Stream, io: Io) void {
         self.inner.close(io);
     }
+
+    pub fn deinit(self: *Stream) void {
+        if (!self.owns_inner) return;
+        self.inner.deinit();
+        self.owns_inner = false;
+    }
+
+    pub fn transferOwnership(self: *Stream) void {
+        self.owns_inner = false;
+    }
 };
 
 // ── QuicConnection ────────────────────────────────────────────────────
@@ -45,6 +56,7 @@ pub const Connection = struct {
     inner: *QuicConnectionInner,
     /// Engine owned by this connection (client-side dial). null for server-side connections.
     owned_engine: ?*QuicEngine = null,
+    owns_inner: bool = true,
 
     pub fn openStream(self: *Connection, io: Io) !Stream {
         const s = try self.inner.openStream(io);
@@ -58,9 +70,20 @@ pub const Connection = struct {
 
     pub fn close(self: *Connection, io: Io) void {
         self.inner.close(io);
-        // If this connection owns the engine (client-side), stop and clean up
+        // If this connection owns the engine (client-side), stop its runtime.
+        // Memory is released in deinit().
         if (self.owned_engine) |eng| {
             eng.stop(io);
+        }
+    }
+
+    pub fn deinit(self: *Connection, io: Io) void {
+        self.close(io);
+        if (self.owns_inner) {
+            self.inner.deinit();
+            self.owns_inner = false;
+        }
+        if (self.owned_engine) |eng| {
             eng.deinit();
             self.owned_engine = null;
         }
@@ -83,6 +106,7 @@ pub const Connection = struct {
 pub const Listener = struct {
     engine: *QuicEngine,
     local_address: ?net.IpAddress,
+    owns_engine: bool = true,
 
     pub fn accept(self: *Listener, io: Io) !Connection {
         const conn = try self.engine.accept(io);
@@ -90,8 +114,17 @@ pub const Listener = struct {
     }
 
     pub fn close(self: *Listener, io: Io) void {
+        // Stop accepting and shut down the shared transport runtime.
+        // Memory is released in deinit().
         self.engine.stop(io);
-        self.engine.deinit();
+    }
+
+    pub fn deinit(self: *Listener, io: Io) void {
+        self.close(io);
+        if (self.owns_engine) {
+            self.engine.deinit();
+            self.owns_engine = false;
+        }
     }
 
     pub fn localAddr(self: *const Listener) ?net.IpAddress {
@@ -126,10 +159,8 @@ pub const QuicTransport = struct {
         // Create a client engine
         var client_config = self.config;
         client_config.is_server = false;
-        const eng = try QuicEngine.init(self.allocator, client_config);
+        const eng = try QuicEngine.init(self.allocator, io, client_config);
         errdefer eng.deinit();
-
-        eng.setIo(io);
 
         // Bind to ephemeral port (0)
         const local = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
@@ -154,10 +185,8 @@ pub const QuicTransport = struct {
         // Create a server engine
         var server_config = self.config;
         server_config.is_server = true;
-        const eng = try QuicEngine.init(self.allocator, server_config);
+        const eng = try QuicEngine.init(self.allocator, io, server_config);
         errdefer eng.deinit();
-
-        eng.setIo(io);
 
         // Bind to the requested address
         try eng.bindSocket(io, &parsed.ip);
@@ -284,13 +313,11 @@ test "QUIC engine socket binding" {
     const io = std.testing.io;
 
     // Create server engine
-    const eng = QuicEngine.init(allocator, .{ .is_server = true }) catch |err| {
+    const eng = QuicEngine.init(allocator, io, .{ .is_server = true }) catch |err| {
         std.log.warn("QuicEngine init failed (expected if lsquic unavailable): {}", .{err});
         return;
     };
     defer eng.deinit();
-
-    eng.setIo(io);
 
     // Bind to loopback ephemeral port
     const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
@@ -312,12 +339,10 @@ test "QUIC engine background loops start and stop" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const eng = QuicEngine.init(allocator, .{ .is_server = true }) catch |err| {
+    const eng = QuicEngine.init(allocator, io, .{ .is_server = true }) catch |err| {
         std.log.warn("QuicEngine init failed: {}", .{err});
         return;
     };
-
-    eng.setIo(io);
 
     const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     eng.bindSocket(io, &addr) catch |err| {
@@ -342,12 +367,10 @@ test "QUIC engine client connect initiates handshake" {
     const io = std.testing.io;
 
     // Create client engine
-    const eng = QuicEngine.init(allocator, .{ .is_server = false }) catch |err| {
+    const eng = QuicEngine.init(allocator, io, .{ .is_server = false }) catch |err| {
         std.log.warn("QuicEngine init failed: {}", .{err});
         return;
     };
-
-    eng.setIo(io);
 
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
     eng.bindSocket(io, &addr) catch |err| {
@@ -416,16 +439,13 @@ test "QUIC full handshake between server and client" {
     defer ssl.EVP_PKEY_free(client_host_key);
 
     // Create server engine with TLS cert
-    const server_eng = QuicEngine.init(allocator, .{
+    const server_eng = QuicEngine.init(allocator, io, .{
         .is_server = true,
         .host_key = server_host_key,
     }) catch |err| {
         std.log.warn("Server engine init failed: {}", .{err});
         return;
     };
-
-    server_eng.setIo(io);
-
     // Bind server to loopback ephemeral port
     const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     server_eng.bindSocket(io, &server_addr) catch |err| {
@@ -448,7 +468,7 @@ test "QUIC full handshake between server and client" {
     server_eng.startBackgroundLoops(io);
 
     // Create client engine with TLS cert
-    const client_eng = QuicEngine.init(allocator, .{
+    const client_eng = QuicEngine.init(allocator, io, .{
         .is_server = false,
         .host_key = client_host_key,
     }) catch |err| {
@@ -457,9 +477,6 @@ test "QUIC full handshake between server and client" {
         server_eng.deinit();
         return;
     };
-
-    client_eng.setIo(io);
-
     // Bind client to ephemeral port
     const client_addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
     client_eng.bindSocket(io, &client_addr) catch |err| {
@@ -532,11 +549,10 @@ test "QUIC stream read/write round-trip" {
     defer ssl.EVP_PKEY_free(client_host_key);
 
     // Create and bind server engine
-    const server_eng = QuicEngine.init(allocator, .{
+    const server_eng = QuicEngine.init(allocator, io, .{
         .is_server = true,
         .host_key = server_host_key,
     }) catch return;
-    server_eng.setIo(io);
     const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     server_eng.bindSocket(io, &server_addr) catch {
         server_eng.deinit();
@@ -552,7 +568,7 @@ test "QUIC stream read/write round-trip" {
     server_eng.startBackgroundLoops(io);
 
     // Create, bind, and connect client engine
-    const client_eng = QuicEngine.init(allocator, .{
+    const client_eng = QuicEngine.init(allocator, io, .{
         .is_server = false,
         .host_key = client_host_key,
     }) catch {
@@ -560,7 +576,6 @@ test "QUIC stream read/write round-trip" {
         server_eng.deinit();
         return;
     };
-    client_eng.setIo(io);
     client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
         client_eng.deinit();
         server_eng.stop(io);
@@ -601,7 +616,7 @@ test "QUIC stream read/write round-trip" {
     // QUIC streams are lazy — the server only sees the stream when the
     // client sends a STREAM frame, so we must write before the server
     // can accept.
-    const client_stream = client_conn.openStream(io) catch |err| {
+    var client_stream = client_conn.openStream(io) catch |err| {
         std.log.warn("openStream failed: {}", .{err});
         server_conn.close(io);
         client_conn.close(io);
@@ -613,6 +628,7 @@ test "QUIC stream read/write round-trip" {
         client_eng.deinit();
         return;
     };
+    defer client_stream.deinit();
 
     // Client writes data (this sends a STREAM frame to the server)
     const msg = "hello from client";
@@ -620,7 +636,7 @@ test "QUIC stream read/write round-trip" {
     try std.testing.expectEqual(msg.len, written);
 
     // Server accepts the stream (unblocks when STREAM frame arrives)
-    const server_stream = server_conn.acceptStream(io) catch |err| {
+    var server_stream = server_conn.acceptStream(io) catch |err| {
         std.log.warn("acceptStream failed: {}", .{err});
         client_stream.close(io);
         server_conn.close(io);
@@ -633,6 +649,7 @@ test "QUIC stream read/write round-trip" {
         client_eng.deinit();
         return;
     };
+    defer server_stream.deinit();
 
     // Server reads data
     var buf: [64]u8 = undefined;
@@ -650,7 +667,7 @@ test "QUIC stream read/write round-trip" {
     try std.testing.expectEqualSlices(u8, echo_msg, echo_buf[0..echo_n]);
 
     // Clean up: order matters!
-    // 1. Close streams (marks them for close in lsquic, onStreamClose frees QuicStream)
+    // 1. Close streams
     // 2. Close connections (marks them for close in lsquic)
     // 3. Stop background loops
     // 4. Destroy engines (force-closes remaining conns, triggers callbacks)
@@ -663,7 +680,6 @@ test "QUIC stream read/write round-trip" {
     client_eng.stop(io);
     server_eng.deinit();
     client_eng.deinit();
-    // QuicStream objects freed by onStreamClose callback
     server_conn.deinit();
     client_conn.deinit();
 }
@@ -685,12 +701,11 @@ const TestContext = struct {
         const client_host_key = try tls.generateKeyPair(.ECDSA);
         errdefer ssl.EVP_PKEY_free(client_host_key);
 
-        const server_eng = try QuicEngine.init(allocator, .{
+        const server_eng = try QuicEngine.init(allocator, io, .{
             .is_server = true,
             .host_key = server_host_key,
         });
         errdefer server_eng.deinit();
-        server_eng.setIo(io);
         const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
         try server_eng.bindSocket(io, &server_addr);
         server_eng.startBackgroundLoops(io);
@@ -700,7 +715,7 @@ const TestContext = struct {
             .ip6 => |a| a.port,
         };
 
-        const client_eng = try QuicEngine.init(allocator, .{
+        const client_eng = try QuicEngine.init(allocator, io, .{
             .is_server = false,
             .host_key = client_host_key,
         });
@@ -708,7 +723,6 @@ const TestContext = struct {
             client_eng.deinit();
             server_eng.stop(io);
         }
-        client_eng.setIo(io);
         try client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
 
         const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
@@ -765,6 +779,7 @@ test "QUIC multiple concurrent streams" {
             std.log.warn("openStream {} failed: {}", .{ i, err });
             for (0..i) |j| {
                 client_streams[j].close(io);
+                client_streams[j].deinit();
             }
             return;
         };
@@ -780,9 +795,11 @@ test "QUIC multiple concurrent streams" {
             std.log.warn("acceptStream {} failed: {}", .{ i, err });
             for (0..stream_count) |j| {
                 client_streams[j].close(io);
+                client_streams[j].deinit();
             }
             for (0..i) |j| {
                 server_streams[j].close(io);
+                server_streams[j].deinit();
             }
             return;
         };
@@ -792,10 +809,12 @@ test "QUIC multiple concurrent streams" {
         try std.testing.expectEqualSlices(u8, "stream-", buf[0..7]);
     }
 
-    // Clean up streams — onStreamClose frees QuicStream objects
+    // Clean up streams
     for (0..stream_count) |i| {
         client_streams[i].close(io);
+        client_streams[i].deinit();
         server_streams[i].close(io);
+        server_streams[i].deinit();
     }
 }
 
@@ -893,10 +912,11 @@ test "QUIC large message spanning multiple reads" {
     defer ctx.deinit(io);
 
     // Client opens stream and sends 16KB message
-    const client_stream = ctx.client_conn.openStream(io) catch |err| {
+    var client_stream = ctx.client_conn.openStream(io) catch |err| {
         std.log.warn("openStream failed: {}", .{err});
         return;
     };
+    defer client_stream.deinit();
 
     const msg_size = 16 * 1024; // 16KB
     const send_buf = try allocator.alloc(u8, msg_size);
@@ -914,11 +934,12 @@ test "QUIC large message spanning multiple reads" {
     try std.testing.expectEqual(msg_size, written);
 
     // Server accepts and reads in a loop
-    const server_stream = ctx.server_conn.acceptStream(io) catch |err| {
+    var server_stream = ctx.server_conn.acceptStream(io) catch |err| {
         std.log.warn("acceptStream failed: {}", .{err});
         client_stream.close(io);
         return;
     };
+    defer server_stream.deinit();
 
     const recv_buf = try allocator.alloc(u8, msg_size);
     defer allocator.free(recv_buf);
@@ -969,7 +990,7 @@ test "QuicTransport dial and listen via multiaddr" {
 
     // Get the actual bound port
     const bound_addr = listener.localAddr() orelse {
-        listener.close(io);
+        listener.deinit(io);
         return;
     };
     const bound_port = switch (bound_addr) {
@@ -993,16 +1014,15 @@ test "QuicTransport dial and listen via multiaddr" {
 
     var client_conn = client_transport.dial(io, dial_addr) catch |err| {
         std.log.warn("dial failed: {}", .{err});
-        listener.close(io);
+        listener.deinit(io);
         return;
     };
 
     // Accept connection on server
     var server_conn = listener.accept(io) catch |err| {
         std.log.warn("accept failed: {}", .{err});
-        client_conn.close(io);
-        client_conn.inner.deinit();
-        listener.close(io);
+        client_conn.deinit(io);
+        listener.deinit(io);
         return;
     };
 
@@ -1013,13 +1033,12 @@ test "QuicTransport dial and listen via multiaddr" {
     // Open stream via transport Connection API and exchange data
     var client_stream = client_conn.openStream(io) catch |err| {
         std.log.warn("openStream failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        listener.close(io);
-        server_conn.inner.deinit();
-        client_conn.inner.deinit();
+        server_conn.deinit(io);
+        client_conn.deinit(io);
+        listener.deinit(io);
         return;
     };
+    defer client_stream.deinit();
 
     const msg = "transport-level test";
     const w = client_stream.write(io, msg) catch 0;
@@ -1028,24 +1047,21 @@ test "QuicTransport dial and listen via multiaddr" {
     var server_stream = server_conn.acceptStream(io) catch |err| {
         std.log.warn("acceptStream failed: {}", .{err});
         client_stream.close(io);
-        server_conn.close(io);
-        client_conn.close(io);
-        listener.close(io);
-        client_conn.inner.deinit();
+        server_conn.deinit(io);
+        client_conn.deinit(io);
+        listener.deinit(io);
         return;
     };
+    defer server_stream.deinit();
 
     var buf: [64]u8 = undefined;
     const n = server_stream.read(io, &buf) catch 0;
     try std.testing.expectEqualSlices(u8, msg, buf[0..n]);
 
-    // Clean up: close I/O resources first, then free inner allocations.
-    // Streams are freed by onStreamClose callback.
+    // Clean up: close I/O resources first, then free wrapper ownership.
     client_stream.close(io);
     server_stream.close(io);
-    server_conn.close(io);
-    client_conn.close(io);
-    listener.close(io);
-    server_conn.inner.deinit();
-    client_conn.inner.deinit();
+    server_conn.deinit(io);
+    client_conn.deinit(io);
+    listener.deinit(io);
 }

@@ -12,6 +12,7 @@ const QuicEngine = engine_mod.QuicEngine;
 const quic_mod = @import("transport/quic/quic.zig");
 const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
+const PeerId = @import("peer_id").PeerId;
 const ssl = @import("ssl");
 const net = Io.net;
 
@@ -93,12 +94,13 @@ pub fn Switch(comptime config: SwitchConfig) type {
             const parsed = try quic_mod.parseQuicMultiaddr(addr);
 
             if (self.server_engine == null) {
-                const eng = try QuicEngine.init(self.allocator, .{
+                const eng = try QuicEngine.init(self.allocator, io, .{
                     .is_server = true,
                     .host_key = self.engine_config.host_key,
                 });
-                eng.setIo(io);
                 self.server_engine = eng;
+            } else {
+                return error.AlreadyListening;
             }
 
             const eng = self.server_engine.?;
@@ -122,11 +124,10 @@ pub fn Switch(comptime config: SwitchConfig) type {
             const parsed = try quic_mod.parseQuicMultiaddr(addr);
 
             if (self.client_engine == null) {
-                const eng = try QuicEngine.init(self.allocator, .{
+                const eng = try QuicEngine.init(self.allocator, io, .{
                     .is_server = false,
                     .host_key = self.engine_config.host_key,
                 });
-                eng.setIo(io);
                 try eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
                 eng.startBackgroundLoops(io);
                 self.client_engine = eng;
@@ -137,6 +138,10 @@ pub fn Switch(comptime config: SwitchConfig) type {
             const local_bound = (eng.socket orelse return error.NoSocket).address;
             var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
             const conn = try eng.connect(io, @ptrCast(@alignCast(&remote_sa)), @ptrCast(@alignCast(&local_sa)));
+            errdefer {
+                conn.close(io);
+                conn.deinit();
+            }
 
             // Wait for TLS handshake — suspends until onHskDone fires
             const peer_id = conn.waitHandshake(io) catch return error.HandshakeFailed;
@@ -168,7 +173,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// registered by dial), accepts streams. Connection map cleanup is handled
         /// by close()/deinit() — NOT by this task's defers — to avoid races.
         fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection) void {
-                log.info("swarmConnectionTask: started for conn", .{});
+            log.info("swarmConnectionTask: started for conn", .{});
             // Wait for TLS handshake to complete (server: immediate, client: suspends)
             var pid_buf: [128]u8 = undefined;
             const peer_id: ?[]const u8 = if (conn.waitHandshake(io)) |pid|
@@ -198,11 +203,25 @@ pub fn Switch(comptime config: SwitchConfig) type {
             // group (self.background) is canceled by close().
             while (true) {
                 log.info("swarmConnectionTask: waiting for stream...", .{});
-                    const s_inner = conn.acceptStream(io) catch |err| { log.warn("swarmConnectionTask: acceptStream error: {}", .{err}); break; };
+                const s_inner = conn.acceptStream(io) catch |err| {
+                    log.warn("swarmConnectionTask: acceptStream error: {}", .{err});
+                    break;
+                };
                 self.background.async(io, Self.swarmStreamTask, .{
                     self, io, quic_mod.Stream{ .inner = s_inner }, SwarmStreamCtx{ .peer_id = peer_id },
                 });
             }
+
+            if (peer_id) |pid| {
+                if (self.connections.fetchRemove(pid)) |kv| {
+                    self.notifyPeerDisconnected(kv.key);
+                    self.allocator.free(kv.key);
+                    kv.value.deinit();
+                    return;
+                }
+            }
+
+            conn.deinit();
         }
 
         /// Concrete context type for swarm stream tasks (Io.Group.async requires
@@ -231,8 +250,9 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
         /// Handles a single inbound stream: multistream-negotiate then dispatch.
         fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: SwarmStreamCtx) void {
-                log.info("swarmStreamTask: dispatching stream", .{});
+            log.info("swarmStreamTask: dispatching stream", .{});
             var mutable_stream = s;
+            defer mutable_stream.deinit();
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
 
@@ -251,6 +271,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
             const s_inner = try conn.openStream(io);
             var s = quic_mod.Stream{ .inner = s_inner };
+            defer s.deinit();
             _ = try multistream.negotiateOutbound(io, &s, &.{P.id});
             inline for (config.protocols, 0..) |Proto, i| {
                 if (Proto == P) {
@@ -277,6 +298,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
             const s_inner = try conn.openStream(io);
             var s = quic_mod.Stream{ .inner = s_inner };
+            errdefer s.deinit();
             _ = try multistream.negotiateOutbound(io, &s, &.{protocol_id});
             return s;
         }
@@ -373,6 +395,9 @@ test "Switch comptime validation accepts valid config" {
                 return .{};
             }
             pub fn close(_: *@This(), _: Io) void {}
+            pub fn remotePeerId(_: *const @This()) ?PeerId {
+                return null;
+            }
         };
         pub const Stream = Connection.StreamType;
         pub const Listener = struct {
@@ -380,14 +405,17 @@ test "Switch comptime validation accepts valid config" {
                 return .{};
             }
             pub fn close(_: *@This(), _: Io) void {}
+            pub fn localAddr(_: *const @This()) ?net.IpAddress {
+                return null;
+            }
         };
-        pub fn dial(_: *@This(), _: Io, _: anytype) !Connection {
+        pub fn dial(_: *@This(), _: Io, _: Multiaddr) !Connection {
             return .{};
         }
-        pub fn listen(_: *@This(), _: Io, _: anytype) !Listener {
+        pub fn listen(_: *@This(), _: Io, _: Multiaddr) !Listener {
             return .{};
         }
-        pub fn matchesMultiaddr(_: anytype) bool {
+        pub fn matchesMultiaddr(_: Multiaddr) bool {
             return false;
         }
     };
@@ -548,4 +576,106 @@ test "Swarm gossipsub subscription over QUIC" {
 
     client.close(io);
     server.close(io);
+}
+
+test "Switch rejects repeated listen on the same node" {
+    const tls_mod = @import("security/tls.zig");
+    const ma = multiaddr;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const key = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key);
+
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{},
+    });
+
+    var node = Node.init(allocator, .{ .host_key = key }, .{});
+    defer node.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr.deinit();
+
+    try node.listen(io, listen_addr);
+    try std.testing.expectError(error.AlreadyListening, node.listen(io, listen_addr));
+}
+
+test "Switch removes disconnected peers from the connection map" {
+    const ping_mod = @import("protocol/ping.zig");
+    const tls_mod = @import("security/tls.zig");
+    const ma = multiaddr;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key1);
+    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key2);
+
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{ping_mod.Handler},
+    });
+
+    var server = Node.init(allocator, .{ .host_key = key1 }, .{ping_mod.Handler{}});
+    defer server.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr.deinit();
+    try server.listen(io, listen_addr);
+
+    var client = Node.init(allocator, .{ .host_key = key2 }, .{ping_mod.Handler{}});
+    defer client.deinit(io);
+
+    const bound = server.listenAddrs() orelse return;
+    const port = switch (bound) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr.deinit();
+
+    const peer_id = try client.dial(io, dial_addr);
+
+    const settle_timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(100),
+        .clock = .awake,
+    } };
+    try settle_timeout.sleep(io);
+
+    try std.testing.expectEqual(@as(usize, 1), server.connections.count());
+
+    if (client.connections.fetchRemove(peer_id)) |kv| {
+        kv.value.close(io);
+        client.allocator.free(kv.key);
+    } else {
+        return error.TestUnexpectedNull;
+    }
+
+    var removed = false;
+    for (0..10) |_| {
+        try settle_timeout.sleep(io);
+        if (server.connections.count() == 0) {
+            removed = true;
+            break;
+        }
+    }
+    try std.testing.expect(removed);
+    try std.testing.expectEqual(@as(usize, 0), server.connections.count());
 }

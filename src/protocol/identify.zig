@@ -29,6 +29,7 @@ pub const Config = struct {
 
 const max_listen_addrs: u32 = 64;
 const max_protocols: u32 = 128;
+const max_varint_bytes: u32 = 10;
 
 /// Identify protocol handler.
 /// Identify is stateful — stores per-peer results.
@@ -128,44 +129,18 @@ pub const Handler = struct {
     pub fn handleOutbound(self: *Handler, io: Io, stream: anytype, ctx: anytype) Error!void {
         const allocator = self.allocator;
 
-        var buf = std.ArrayList(u8).empty;
-        errdefer buf.deinit(allocator);
+        const message_len = readLengthPrefixedSize(io, stream) catch return Error.UnexpectedEof;
+        if (message_len > max_message_size) return Error.MessageTooLarge;
 
-        var tmp: [4096]u8 = undefined;
-        while (buf.items.len < max_message_size) {
-            const n = stream.read(io, &tmp) catch return Error.UnexpectedEof;
-            if (n == 0) break;
-            buf.appendSlice(allocator, tmp[0..n]) catch return Error.UnexpectedEof;
-        }
+        const owned = allocator.alloc(u8, message_len) catch return Error.UnexpectedEof;
+        errdefer allocator.free(owned);
+        stream_util.readExact(io, stream, owned) catch return Error.UnexpectedEof;
 
-        if (buf.items.len == 0) return Error.UnexpectedEof;
-        if (buf.items.len > max_message_size) return Error.MessageTooLarge;
-
-        const owned = buf.toOwnedSlice(allocator) catch return Error.UnexpectedEof;
-
-        // The identify response is varint-length-prefixed protobuf.
-        // Strip the length prefix before parsing.
-        var proto_bytes = owned;
-        {
-            var shift: u6 = 0;
-            var prefix_len: usize = 0;
-            for (owned) |b| {
-                prefix_len += 1;
-                if (b & 0x80 == 0) break;
-                shift +|= 7;
-            }
-            if (prefix_len > 0 and prefix_len <= owned.len) {
-                proto_bytes = owned[prefix_len..];
-            }
-        }
-
-        const reader = identify_pb.IdentifyReader.init(proto_bytes) catch {
-            log.warn("identify: failed to parse {d} byte response (prefix stripped to {d}, first bytes: {any})", .{
+        const reader = identify_pb.IdentifyReader.init(owned) catch {
+            log.warn("identify: failed to parse {d} byte response (first bytes: {any})", .{
                 owned.len,
-                proto_bytes.len,
-                if (proto_bytes.len > 16) proto_bytes[0..16] else proto_bytes,
+                if (owned.len > 16) owned[0..16] else owned,
             });
-            allocator.free(owned);
             return Error.InvalidProtobuf;
         };
 
@@ -198,6 +173,32 @@ pub const Handler = struct {
         }
     }
 };
+
+fn readLengthPrefixedSize(io: Io, stream: anytype) Error!usize {
+    var value: usize = 0;
+    var shift: u6 = 0;
+    var bytes_read: usize = 0;
+    while (bytes_read < max_varint_bytes) : (bytes_read += 1) {
+        var buf: [1]u8 = undefined;
+        const n = stream.read(io, &buf) catch return Error.UnexpectedEof;
+        if (n == 0) return Error.UnexpectedEof;
+        value |= @as(usize, buf[0] & 0x7f) << shift;
+        if (buf[0] & 0x80 == 0) return value;
+        shift += 7;
+    }
+    return Error.InvalidProtobuf;
+}
+
+fn writeLengthPrefix(buf: *[10]u8, len: usize) usize {
+    var v = len;
+    var size: usize = 0;
+    while (v >= 0x80) : (size += 1) {
+        buf[size] = @intCast((v & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    buf[size] = @intCast(v);
+    return size + 1;
+}
 
 /// Result from an outbound identify handshake.
 /// Caller must call `deinit()` to free the backing buffer.
@@ -249,7 +250,11 @@ test "handleInbound encodes and writes identify message" {
     try handler.handleInbound(undefined, &stream, .{});
 
     // Decode what was written
-    var reader = try identify_pb.IdentifyReader.init(stream.write_buf.items);
+    var framed_stream = MockStream.init(allocator, stream.write_buf.items);
+    defer framed_stream.deinit();
+    const body_len = try readLengthPrefixedSize(undefined, &framed_stream);
+    try std.testing.expectEqual(body_len, stream.write_buf.items.len - framed_stream.read_pos);
+    var reader = try identify_pb.IdentifyReader.init(stream.write_buf.items[framed_stream.read_pos..]);
     try std.testing.expectEqualStrings("test/1.0.0", reader.getProtocolVersion());
     try std.testing.expectEqualStrings("zig-libp2p/0.1.0", reader.getAgentVersion());
 }
@@ -265,7 +270,12 @@ test "handleOutbound reads and decodes identify message" {
     const encoded = try msg.encode(allocator);
     defer allocator.free(encoded);
 
-    var stream = MockStream.init(allocator, encoded);
+    var len_buf: [10]u8 = undefined;
+    const len_size = writeLengthPrefix(&len_buf, encoded.len);
+    const framed = try std.mem.concat(allocator, u8, &.{ len_buf[0..len_size], encoded });
+    defer allocator.free(framed);
+
+    var stream = MockStream.init(allocator, framed);
     defer stream.deinit();
 
     var handler: Handler = .{
