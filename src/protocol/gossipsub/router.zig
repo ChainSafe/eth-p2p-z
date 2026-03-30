@@ -316,13 +316,16 @@ pub fn Router(comptime Handler: type) type {
         /// Publish a message to a topic.
         /// Returns the number of peers the message was sent to.
         pub fn publish(self: *Self, topic: []const u8, data: []const u8) !u32 {
-            const msg = rpc.Message{
-                .from = null,
-                .data = data,
-                .seqno = null,
-                .topic = topic,
-                .signature = null,
-                .key = null,
+            const msg = switch (self.config.publish_policy) {
+                .anonymous => rpc.Message{
+                    .from = null,
+                    .data = data,
+                    .seqno = null,
+                    .topic = topic,
+                    .signature = null,
+                    .key = null,
+                },
+                .signing => return error.UnsupportedPublishPolicy,
             };
 
             const mid = try self.config.msg_id_fn(self.allocator, &msg);
@@ -619,12 +622,12 @@ pub fn Router(comptime Handler: type) type {
             const seqno = optionalBytes(msg_reader.getSeqno());
             const is_sub = self.subscriptions.contains(topic);
             log.info("handleIncomingMessage: topic_len={d} data_len={d} from={d} seqno={d} subscribed={}", .{
-                topic.len, data_len_early,
-                if (from) |f| f.len else @as(usize, 0),
-                if (seqno) |s| s.len else @as(usize, 0),
+                topic.len,                              data_len_early,
+                if (from) |f| f.len else @as(usize, 0), if (seqno) |s| s.len else @as(usize, 0),
                 is_sub,
             });
             if (topic.len == 0) return;
+            if (!self.validateIncomingMessagePolicy(from_peer, topic, msg_reader)) return;
 
             // Build a Message for ID computation and caching
             const msg = rpc.Message{
@@ -679,6 +682,38 @@ pub fn Router(comptime Handler: type) type {
 
             // Forward to mesh peers (excluding source)
             self.forwardMessage(from_peer, topic, mid, &msg);
+        }
+
+        fn validateIncomingMessagePolicy(
+            self: *Self,
+            from_peer: []const u8,
+            topic: []const u8,
+            msg_reader: *const rpc.MessageReader,
+        ) bool {
+            switch (self.config.signature_policy) {
+                .strict_no_sign => {
+                    const has_from = msg_reader._from != null;
+                    const has_seqno = msg_reader._seqno != null;
+                    const has_signature = msg_reader._signature != null;
+                    const has_key = msg_reader._key != null;
+                    if (has_from or has_seqno or has_signature or has_key) {
+                        log.warn(
+                            "dropping message that violates StrictNoSign: from={} seqno={} signature={} key={}",
+                            .{ has_from, has_seqno, has_signature, has_key },
+                        );
+                        self.recordInvalidMessage(from_peer, topic);
+                        self.addBehaviourPenalty(from_peer, 1);
+                        return false;
+                    }
+                    return true;
+                },
+                .strict_sign => {
+                    log.warn("dropping published message: StrictSign verification is not implemented", .{});
+                    self.recordInvalidMessage(from_peer, topic);
+                    self.addBehaviourPenalty(from_peer, 1);
+                    return false;
+                },
+            }
         }
 
         fn forwardMessage(self: *Self, from_peer: []const u8, topic: []const u8, mid: []const u8, msg: *const rpc.Message) void {
@@ -1703,6 +1738,16 @@ const TestHandler = struct {
 
 const TestRouter = Router(TestHandler);
 
+fn noSignMsgId(allocator: std.mem.Allocator, msg: *const rpc.Message) anyerror![]const u8 {
+    return std.mem.concat(allocator, u8, &.{ msg.topic orelse "", msg.data orelse "" });
+}
+
+const strict_no_sign_test_config = Config{
+    .signature_policy = .strict_no_sign,
+    .publish_policy = .anonymous,
+    .msg_id_fn = noSignMsgId,
+};
+
 fn addPeerSubscription(router: *TestRouter, peer: []const u8, topic: []const u8) !void {
     var subs = [_]?rpc.RPC.SubOpts{
         .{ .subscribe = true, .topicid = topic },
@@ -1897,6 +1942,84 @@ test "Router memory management" {
         try router.unsubscribe("topic-1");
         router.removePeer("peer-a");
     }
+}
+
+test "Router StrictNoSign publish omits origin and signature fields" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, strict_no_sign_test_config, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    try handler.markConnected("peer-1");
+    try addPeerSubscription(&router, "peer-1", "topic-a");
+    try router.heartbeat();
+    handler.clearSent();
+
+    const sent_count = try router.publish("topic-a", "hello");
+    try std.testing.expect(sent_count > 0);
+    try std.testing.expect(handler.sent.items.len > 0);
+
+    var decoder = codec.FrameDecoder.init(allocator);
+    defer decoder.deinit();
+    try decoder.feed(handler.sent.items[0].data);
+    const frame = (try decoder.next()) orelse return error.TestUnexpectedNull;
+    defer allocator.free(frame);
+
+    var rpc_reader = try rpc.RPCReader.init(frame);
+    const msg_reader = rpc_reader.publishNext() orelse return error.TestUnexpectedNull;
+    try std.testing.expect(msg_reader._from == null);
+    try std.testing.expect(msg_reader._seqno == null);
+    try std.testing.expect(msg_reader._signature == null);
+    try std.testing.expect(msg_reader._key == null);
+}
+
+test "Router StrictNoSign rejects origin-stamped and signed incoming messages" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, strict_no_sign_test_config, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    try router.addPeer("peer-1");
+
+    const msg = rpc.Message{
+        .from = "author-peer",
+        .data = "hello",
+        .seqno = "seq-1",
+        .topic = "topic-a",
+        .signature = "sig",
+        .key = "pubkey",
+    };
+    var pub_msgs = [_]?rpc.Message{msg};
+    var rpc_msg = rpc.RPC{ .publish = &pub_msgs };
+    const encoded = try rpc_msg.encode(allocator);
+    defer allocator.free(encoded);
+
+    try router.handleRpc("peer-1", encoded);
+
+    try std.testing.expectEqual(@as(usize, 0), router.seen.count());
+    try std.testing.expectEqual(@as(usize, 0), handler.sent.items.len);
+    const events = try router.drainEvents();
+    defer allocator.free(events);
+    try std.testing.expectEqual(@as(usize, 0), events.len);
+}
+
+test "Router publish rejects unsupported signing mode" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, .{
+        .publish_policy = .signing,
+    }, &handler);
+    defer router.deinit();
+
+    try std.testing.expectError(error.UnsupportedPublishPolicy, router.publish("topic-a", "hello"));
 }
 
 test "Router v1.1 PRUNE with backoff on wire" {

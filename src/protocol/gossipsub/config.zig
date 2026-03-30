@@ -28,6 +28,7 @@ pub const SignaturePolicy = enum {
 /// Publish message signing policy.
 pub const PublishPolicy = enum {
     /// Sign outgoing messages with the node's key.
+    /// Not implemented in this library yet.
     signing,
     /// Publish without signing.
     anonymous,

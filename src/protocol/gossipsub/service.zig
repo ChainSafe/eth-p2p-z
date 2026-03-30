@@ -25,7 +25,11 @@ const log = std.log.scoped(.gossipsub_service);
 /// ## Usage
 ///
 /// ```zig
-/// const svc = try Service.init(allocator, .{});
+/// const svc = try Service.init(allocator, .{
+///     .signature_policy = .strict_no_sign,
+///     .publish_policy = .anonymous,
+///     .msg_id_fn = myNoSignMsgId,
+/// });
 /// defer svc.deinit();
 ///
 /// svc.subscribe("my-topic");
