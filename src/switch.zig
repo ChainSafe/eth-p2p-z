@@ -27,6 +27,10 @@ pub const SwitchConfig = struct {
 /// Runtime configuration for the Switch's QUIC engine infrastructure.
 pub const EngineConfig = struct {
     host_identity: ?*const identity.KeyPair = null,
+    /// Hard cap across inbound and outbound live connection tasks.
+    max_connections: usize = 256,
+    /// Maximum concurrent inbound connections allowed from a single IP.
+    max_inbound_connections_per_ip: usize = 16,
 };
 
 /// Comptime-composed libp2p Switch.
@@ -45,6 +49,13 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
     return struct {
         const Self = @This();
+        const IpLimitKey = struct {
+            family: enum(u8) { ip4, ip6 },
+            bytes: [16]u8,
+        };
+        const ConnectionTaskCtx = struct {
+            inbound_ip_key: ?IpLimitKey = null,
+        };
 
         /// Comptime-generated tuple type holding one instance per registered protocol handler.
         const HandlerTuple = std.meta.Tuple(config.protocols);
@@ -54,6 +65,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
         server_engine: ?*QuicEngine = null,
         client_engine: ?*QuicEngine = null,
         connections: std.StringHashMap(*engine_mod.QuicConnection),
+        inbound_ip_counts: std.AutoHashMap(IpLimitKey, usize),
+        active_connection_count: usize,
         background: Io.Group,
         engine_config: EngineConfig,
 
@@ -65,6 +78,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 .allocator = allocator,
                 .handlers = handlers,
                 .connections = std.StringHashMap(*engine_mod.QuicConnection).init(allocator),
+                .inbound_ip_counts = std.AutoHashMap(IpLimitKey, usize).init(allocator),
+                .active_connection_count = 0,
                 .background = .init,
                 .engine_config = engine_config,
             };
@@ -76,6 +91,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             // Stop background fibers and engines if close() wasn't called
             self.close(io);
             self.connections.deinit();
+            self.inbound_ip_counts.deinit();
             if (self.server_engine) |eng| {
                 eng.deinit();
                 self.server_engine = null;
@@ -125,6 +141,9 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// (owned by the connections map — valid until peer disconnects).
         pub fn dial(self: *Self, io: Io, addr: Multiaddr) ![]const u8 {
             const parsed = try quic_mod.parseQuicMultiaddr(addr);
+            if (self.active_connection_count >= self.engine_config.max_connections) {
+                return error.ConnectionLimitReached;
+            }
 
             if (self.client_engine == null) {
                 const eng = try QuicEngine.init(self.allocator, io, .{
@@ -156,7 +175,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
             try self.connections.put(owned_pid, conn);
 
             // Spawn connection handler in background
-            self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn });
+            self.active_connection_count += 1;
+            self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn, .{} });
 
             return owned_pid;
         }
@@ -166,16 +186,50 @@ pub fn Switch(comptime config: SwitchConfig) type {
             const eng = self.server_engine orelse return;
             while (true) {
                 const conn = eng.accept(io) catch return;
-                self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn });
+                const inbound_ip_key = if (conn.remoteIpAddress()) |remote_addr|
+                    ipLimitKey(remote_addr)
+                else
+                    null;
+                if (self.active_connection_count >= self.engine_config.max_connections) {
+                    log.info("acceptLoop: rejecting connection because max_connections={d} is reached", .{
+                        self.engine_config.max_connections,
+                    });
+                    conn.close(io);
+                    conn.deinit();
+                    continue;
+                }
+                if (inbound_ip_key) |key| {
+                    if (!self.tryAcquireInboundIpSlot(key)) {
+                        log.info("acceptLoop: rejecting inbound connection because per-IP limit={d} is reached", .{
+                            self.engine_config.max_inbound_connections_per_ip,
+                        });
+                        conn.close(io);
+                        conn.deinit();
+                        continue;
+                    }
+                }
+                self.active_connection_count += 1;
+                self.background.async(io, Self.swarmConnectionTask, .{
+                    self,
+                    io,
+                    conn,
+                    .{ .inbound_ip_key = inbound_ip_key },
+                });
             }
         }
 
         /// Manages a single QUIC connection's lifecycle.
         /// Extracts peer_id from TLS, registers in connections map (if not already
-        /// registered by dial), accepts streams. Connection map cleanup is handled
-        /// by close()/deinit() — NOT by this task's defers — to avoid races.
-        fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection) void {
+        /// registered by dial), accepts streams, and removes the map entry if
+        /// this task still owns it when the connection ends.
+        fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection, task_ctx: ConnectionTaskCtx) void {
             log.info("swarmConnectionTask: started for conn", .{});
+            defer if (self.active_connection_count > 0) {
+                self.active_connection_count -= 1;
+            };
+            defer if (task_ctx.inbound_ip_key) |key| {
+                self.releaseInboundIpSlot(key);
+            };
             // Wait for TLS handshake to complete (server: immediate, client: suspends)
             var pid_buf: [128]u8 = undefined;
             const peer_id: ?[]const u8 = if (conn.waitHandshake(io)) |pid|
@@ -205,8 +259,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
             // group (self.background) is canceled by close().
             while (true) {
                 log.info("swarmConnectionTask: waiting for stream...", .{});
-                const s_inner = conn.acceptStream(io) catch |err| {
-                    log.warn("swarmConnectionTask: acceptStream error: {}", .{err});
+                const s_inner = conn.acceptStream(io) catch {
+                    log.debug("swarmConnectionTask: connection closed", .{});
                     break;
                 };
                 self.background.async(io, Self.swarmStreamTask, .{
@@ -215,39 +269,19 @@ pub fn Switch(comptime config: SwitchConfig) type {
             }
 
             if (peer_id) |pid| {
-                if (self.connections.fetchRemove(pid)) |kv| {
-                    self.notifyPeerDisconnected(kv.key);
-                    self.allocator.free(kv.key);
-                    kv.value.deinit();
-                    return;
+                if (self.connections.get(pid) == conn) {
+                    if (self.connections.fetchRemove(pid)) |kv| {
+                        self.notifyPeerDisconnected(kv.key);
+                        self.allocator.free(kv.key);
+                        kv.value.deinit();
+                        return;
+                    }
+                } else {
+                    log.info("swarmConnectionTask: connection closed but map points to a different conn for peer", .{});
                 }
             }
 
             conn.deinit();
-        }
-
-        /// Concrete context type for swarm stream tasks (Io.Group.async requires
-        /// concrete types — anytype cannot be used with ArgsTuple).
-        const SwarmStreamCtx = struct {
-            peer_id: ?[]const u8 = null,
-        };
-
-        /// Whether identify is registered as a protocol (comptime check).
-        const has_identify = blk: {
-            for (config.protocols) |P| {
-                if (P == identify_mod.Handler) break :blk true;
-            }
-            break :blk false;
-        };
-
-        /// Auto-trigger identify on a newly connected peer.
-        /// No-op if identify is not registered in this Switch's protocols.
-        fn identifyPeer(self: *Self, io: Io, peer_id: []const u8) void {
-            if (has_identify) {
-                self.newStream(io, peer_id, identify_mod.Handler) catch |err| {
-                    log.warn("auto-identify failed for peer: {}", .{err});
-                };
-            }
         }
 
         /// Handles a single inbound stream: multistream-negotiate then dispatch.
@@ -303,6 +337,29 @@ pub fn Switch(comptime config: SwitchConfig) type {
             errdefer s.deinit();
             _ = try multistream.negotiateOutbound(io, &s, &.{protocol_id});
             return s;
+        }
+        /// Concrete context type for swarm stream tasks (Io.Group.async requires
+        /// concrete types — anytype cannot be used with ArgsTuple).
+        const SwarmStreamCtx = struct {
+            peer_id: ?[]const u8 = null,
+        };
+
+        /// Whether identify is registered as a protocol (comptime check).
+        const has_identify = blk: {
+            for (config.protocols) |P| {
+                if (P == identify_mod.Handler) break :blk true;
+            }
+            break :blk false;
+        };
+
+        /// Auto-trigger identify on a newly connected peer.
+        /// No-op if identify is not registered in this Switch's protocols.
+        fn identifyPeer(self: *Self, io: Io, peer_id: []const u8) void {
+            if (has_identify) {
+                self.newStream(io, peer_id, identify_mod.Handler) catch |err| {
+                    log.warn("auto-identify failed for peer: {}", .{err});
+                };
+            }
         }
 
         /// Gracefully shut down the Switch.
@@ -385,6 +442,38 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 .ip6 => .{ .ip6 = net.Ip6Address.unspecified(0) },
             };
             return eng.bindSocket(io, &bind_addr);
+        }
+
+        fn ipLimitKey(addr: net.IpAddress) IpLimitKey {
+            return switch (addr) {
+                .ip4 => |a| blk: {
+                    var bytes = std.mem.zeroes([16]u8);
+                    @memcpy(bytes[0..4], a.bytes[0..]);
+                    break :blk .{ .family = .ip4, .bytes = bytes };
+                },
+                .ip6 => |a| .{ .family = .ip6, .bytes = a.bytes },
+            };
+        }
+
+        fn tryAcquireInboundIpSlot(self: *Self, key: IpLimitKey) bool {
+            if (self.engine_config.max_inbound_connections_per_ip == 0) return false;
+            const gop = self.inbound_ip_counts.getOrPut(key) catch return false;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            if (gop.value_ptr.* >= self.engine_config.max_inbound_connections_per_ip) {
+                return false;
+            }
+            gop.value_ptr.* += 1;
+            return true;
+        }
+
+        fn releaseInboundIpSlot(self: *Self, key: IpLimitKey) void {
+            if (self.inbound_ip_counts.getPtr(key)) |count| {
+                if (count.* <= 1) {
+                    _ = self.inbound_ip_counts.remove(key);
+                } else {
+                    count.* -= 1;
+                }
+            }
         }
     };
 }
@@ -514,6 +603,122 @@ test "Swarm ping over QUIC" {
     server.close(io);
 }
 
+test "Switch dial enforces max_connections" {
+    const ma = multiaddr;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server_key = identity.KeyPair.generate(.ECDSA) catch return;
+    defer server_key.deinit();
+    var client_key = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client_key.deinit();
+
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{},
+    });
+
+    var server = Node.init(allocator, .{ .host_identity = &server_key }, .{});
+    defer server.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr.deinit();
+    try server.listen(io, listen_addr);
+
+    var client = Node.init(allocator, .{
+        .host_identity = &client_key,
+        .max_connections = 1,
+    }, .{});
+    defer client.deinit(io);
+
+    const bound = server.listenAddrs();
+    if (bound.len == 0) return error.TestUnexpectedResult;
+    const port = switch (bound[0]) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr.deinit();
+
+    _ = try client.dial(io, dial_addr);
+    try std.testing.expectError(error.ConnectionLimitReached, client.dial(io, dial_addr));
+}
+
+test "Switch enforces max_inbound_connections_per_ip" {
+    const ma = multiaddr;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server_key = identity.KeyPair.generate(.ECDSA) catch return;
+    defer server_key.deinit();
+    var client_key1 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client_key1.deinit();
+    var client_key2 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client_key2.deinit();
+
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{},
+    });
+
+    var server = Node.init(allocator, .{
+        .host_identity = &server_key,
+        .max_inbound_connections_per_ip = 1,
+    }, .{});
+    defer server.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr.deinit();
+    try server.listen(io, listen_addr);
+
+    var client1 = Node.init(allocator, .{ .host_identity = &client_key1 }, .{});
+    defer client1.deinit(io);
+    var client2 = Node.init(allocator, .{ .host_identity = &client_key2 }, .{});
+    defer client2.deinit(io);
+
+    const bound = server.listenAddrs();
+    if (bound.len == 0) return error.TestUnexpectedResult;
+    const port = switch (bound[0]) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr.deinit();
+
+    _ = try client1.dial(io, dial_addr);
+
+    const settle_timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(100),
+        .clock = .awake,
+    } };
+    settle_timeout.sleep(io) catch {};
+
+    _ = client2.dial(io, dial_addr) catch {};
+    settle_timeout.sleep(io) catch {};
+
+    try std.testing.expectEqual(@as(usize, 1), server.active_connection_count);
+    try std.testing.expectEqual(@as(usize, 1), server.inbound_ip_counts.count());
+    try std.testing.expectEqual(@as(usize, 1), server.connections.count());
+}
+
 test "Swarm gossipsub subscription over QUIC" {
     const gossipsub_service = @import("protocol/gossipsub/service.zig");
     const ma = multiaddr;
@@ -580,7 +785,12 @@ test "Swarm gossipsub subscription over QUIC" {
 
     // Verify subscription event on server
     const events = svc1.drainEvents() catch return;
-    defer allocator.free(events);
+    defer {
+        for (events) |*event| {
+            event.deinit(allocator);
+        }
+        allocator.free(events);
+    }
     var found = false;
     for (events) |event| {
         switch (event) {

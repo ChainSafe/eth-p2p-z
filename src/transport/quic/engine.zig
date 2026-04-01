@@ -274,6 +274,28 @@ pub const QuicConnection = struct {
         return self.peer_id;
     }
 
+    pub fn remoteIpAddress(self: *const QuicConnection) ?net.IpAddress {
+        const lc = self.lsquic_conn orelse return null;
+        var local_sa: ?*const std.c.sockaddr = null;
+        var peer_sa: ?*const std.c.sockaddr = null;
+        if (lsquic.lsquic_conn_get_sockaddr(lc, @ptrCast(&local_sa), @ptrCast(&peer_sa)) != 0) {
+            return null;
+        }
+        const sa = peer_sa orelse return null;
+        return sockaddrToIpAddress(sa);
+    }
+
+    pub fn localIpAddress(self: *const QuicConnection) ?net.IpAddress {
+        const lc = self.lsquic_conn orelse return null;
+        var local_sa: ?*const std.c.sockaddr = null;
+        var peer_sa: ?*const std.c.sockaddr = null;
+        if (lsquic.lsquic_conn_get_sockaddr(lc, @ptrCast(&local_sa), @ptrCast(&peer_sa)) != 0) {
+            return null;
+        }
+        const sa = local_sa orelse return null;
+        return sockaddrToIpAddress(sa);
+    }
+
     /// Suspend until the TLS handshake completes (or fails).
     /// Returns the verified remote peer ID on success.
     pub fn waitHandshake(self: *QuicConnection, io: Io) !PeerId {
@@ -303,12 +325,13 @@ pub const QuicConnection = struct {
 // ── CertVerifyCtx ──────────────────────────────────────────────────────
 
 /// Replaces the threadlocal g_peer_cert hack. Stores verified peer info
-/// keyed by connection pointer, passed via ea_verify_ctx.
-/// Since lsquic callbacks are single-threaded, `last_verified` holds the most
-/// recent successful verification result. `onHskDone` consumes it.
+/// keyed by the concrete lsquic connection pointer associated with the TLS
+/// session being verified.
 pub const CertVerifyCtx = struct {
     allocator: Allocator,
-    last_verified: ?VerifiedPeer,
+    verified_by_conn: std.AutoHashMap(usize, VerifiedPeer),
+    pending_server_verified: std.ArrayList(VerifiedPeer),
+    pending_server_head: usize,
 
     pub const VerifiedPeer = struct {
         peer_id: PeerId,
@@ -318,27 +341,78 @@ pub const CertVerifyCtx = struct {
     pub fn init(allocator: Allocator) CertVerifyCtx {
         return .{
             .allocator = allocator,
-            .last_verified = null,
+            .verified_by_conn = std.AutoHashMap(usize, VerifiedPeer).init(allocator),
+            .pending_server_verified = .empty,
+            .pending_server_head = 0,
         };
     }
 
     pub fn deinit(self: *CertVerifyCtx) void {
-        if (self.last_verified) |vp| {
+        var iter = self.verified_by_conn.valueIterator();
+        while (iter.next()) |vp| {
             if (vp.host_pubkey.data) |d| self.allocator.free(d);
         }
-    }
-
-    pub fn storeVerified(self: *CertVerifyCtx, peer: VerifiedPeer) void {
-        // Free any unconsumed previous result
-        if (self.last_verified) |old| {
-            if (old.host_pubkey.data) |d| self.allocator.free(d);
+        self.verified_by_conn.deinit();
+        while (self.pending_server_head < self.pending_server_verified.items.len) : (self.pending_server_head += 1) {
+            const vp = self.pending_server_verified.items[self.pending_server_head];
+            if (vp.host_pubkey.data) |d| self.allocator.free(d);
         }
-        self.last_verified = peer;
+        self.pending_server_verified.deinit(self.allocator);
     }
 
-    pub fn takeVerified(self: *CertVerifyCtx) ?VerifiedPeer {
-        const result = self.last_verified;
-        self.last_verified = null;
+    fn connKey(lc: *lsquic.lsquic_conn_t) usize {
+        return @intFromPtr(lc);
+    }
+
+    fn compactPendingServer(self: *CertVerifyCtx) void {
+        if (self.pending_server_head == 0) return;
+        if (self.pending_server_head == self.pending_server_verified.items.len) {
+            self.pending_server_verified.clearRetainingCapacity();
+            self.pending_server_head = 0;
+            return;
+        }
+        var compacted: std.ArrayList(VerifiedPeer) = .empty;
+        compacted.appendSlice(self.allocator, self.pending_server_verified.items[self.pending_server_head..]) catch return;
+        self.pending_server_verified.deinit(self.allocator);
+        self.pending_server_verified = compacted;
+        self.pending_server_head = 0;
+    }
+
+    pub fn storeVerified(
+        self: *CertVerifyCtx,
+        lc: *lsquic.lsquic_conn_t,
+        is_server: bool,
+        peer: VerifiedPeer,
+    ) !void {
+        if (is_server) {
+            try self.pending_server_verified.append(self.allocator, peer);
+            return;
+        }
+        const gop = try self.verified_by_conn.getOrPut(connKey(lc));
+        if (gop.found_existing) {
+            if (gop.value_ptr.host_pubkey.data) |d| self.allocator.free(d);
+        }
+        gop.value_ptr.* = peer;
+    }
+
+    pub fn takeVerified(self: *CertVerifyCtx, lc: *lsquic.lsquic_conn_t) ?VerifiedPeer {
+        return if (self.verified_by_conn.fetchRemove(connKey(lc))) |entry|
+            entry.value
+        else
+            null;
+    }
+
+    pub fn discardVerified(self: *CertVerifyCtx, lc: *lsquic.lsquic_conn_t) void {
+        if (self.verified_by_conn.fetchRemove(connKey(lc))) |entry| {
+            if (entry.value.host_pubkey.data) |d| self.allocator.free(d);
+        }
+    }
+
+    pub fn takeNextServerVerified(self: *CertVerifyCtx) ?VerifiedPeer {
+        if (self.pending_server_head >= self.pending_server_verified.items.len) return null;
+        const result = self.pending_server_verified.items[self.pending_server_head];
+        self.pending_server_head += 1;
+        self.compactPendingServer();
         return result;
     }
 };
@@ -765,6 +839,8 @@ pub const QuicEngine = struct {
             log.debug("processEngine: pushing pending server conn to accept queue", .{});
             self.conn_queue.putOneUncancelable(self.io, .{ .conn = conn }) catch |err| {
                 log.err("processEngine: failed to push server conn: {}", .{err});
+                conn.close(self.io);
+                conn.deinit();
             };
         }
     }
@@ -793,8 +869,9 @@ pub const QuicEngine = struct {
         conn.hsk_completed = true;
         log.debug("onNewConn: server-side conn created, conn={*}", .{conn});
 
-        // Extract peer identity stored by customVerifyCallback via SSL_CTX ex_data
-        if (engine.cert_verify_ctx.takeVerified()) |verified| {
+        // Extract peer identity stored by customVerifyCallback for this
+        // concrete lsquic connection.
+        if (engine.cert_verify_ctx.takeNextServerVerified()) |verified| {
             conn.peer_id = verified.peer_id;
             if (verified.host_pubkey.data) |d| conn.allocator.free(d);
             log.debug("onNewConn: server peer_id extracted from custom verify", .{});
@@ -820,7 +897,9 @@ pub const QuicEngine = struct {
                 const conn_ctx = lsquic.lsquic_conn_get_ctx(c);
                 if (conn_ctx) |ctx| {
                     const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
-                    conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {};
+                    conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {
+                        lsquic.lsquic_conn_close(c);
+                    };
                 }
                 lsquic.lsquic_conn_close(c);
             }
@@ -832,20 +911,25 @@ pub const QuicEngine = struct {
             const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
             conn.hsk_completed = true;
 
-            // Extract peer identity stored by customVerifyCallback via SSL_CTX ex_data
-            if (conn.engine.cert_verify_ctx.takeVerified()) |verified| {
+            // Extract peer identity stored by customVerifyCallback for this
+            // concrete lsquic connection.
+            if (conn.engine.cert_verify_ctx.takeVerified(lc.?)) |verified| {
                 conn.peer_id = verified.peer_id;
                 if (verified.host_pubkey.data) |d| conn.allocator.free(d);
                 log.debug("onHskDone: peer_id extracted from custom verify", .{});
             } else {
                 log.warn("onHskDone: no verified peer info from custom verify callback", .{});
-                conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {};
+                conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {
+                    if (lc) |c| lsquic.lsquic_conn_close(c);
+                };
                 if (lc) |c| lsquic.lsquic_conn_close(c);
                 return;
             }
 
             // Signal success to waitHandshake
-            conn.hsk_queue.putOneUncancelable(conn.engine.io, .ok) catch {};
+            conn.hsk_queue.putOneUncancelable(conn.engine.io, .ok) catch {
+                if (lc) |c| lsquic.lsquic_conn_close(c);
+            };
 
             // Note: on_hsk_done is CLIENT-ONLY in lsquic.
             // The client already has its QuicConnection from connect(), so we
@@ -867,9 +951,13 @@ pub const QuicEngine = struct {
             r[0..@as(usize, @intCast(reason_len))]
         else
             "(none)";
-        log.warn("CONNECTION_CLOSE received: app_error={d}, code=0x{x}, reason=\"{s}\"", .{
-            app_error, error_code, reason_str,
-        });
+        if (app_error == 0 and error_code == 0 and reason_len == 0) {
+            log.debug("CONNECTION_CLOSE received: graceful close", .{});
+        } else {
+            log.warn("CONNECTION_CLOSE received: app_error={d}, code=0x{x}, reason=\"{s}\"", .{
+                app_error, error_code, reason_str,
+            });
+        }
     }
 
     fn onConnClosed(lc: ?*lsquic.lsquic_conn_t) callconv(.c) void {
@@ -881,7 +969,22 @@ pub const QuicEngine = struct {
                 const span = std.mem.sliceTo(&errbuf, 0);
                 break :blk if (span.len > 0) span else "(none)";
             };
-            log.warn("onConnClosed: status={d}, errmsg={s}, lc={?*}", .{ @as(c_int, @intCast(status)), err_msg, lc });
+            switch (status) {
+                lsquic.LSCONN_ST_CLOSED,
+                lsquic.LSCONN_ST_GOING_AWAY,
+                lsquic.LSCONN_ST_PEER_GOING_AWAY,
+                lsquic.LSCONN_ST_USER_ABORTED,
+                => log.debug("onConnClosed: status={d}, errmsg={s}, lc={?*}", .{
+                    @as(c_int, @intCast(status)),
+                    err_msg,
+                    lc,
+                }),
+                else => log.warn("onConnClosed: status={d}, errmsg={s}, lc={?*}", .{
+                    @as(c_int, @intCast(status)),
+                    err_msg,
+                    lc,
+                }),
+            }
         } else {
             log.debug("onConnClosed called, lc=null", .{});
         }
@@ -890,6 +993,7 @@ pub const QuicEngine = struct {
             const conn: *QuicConnection = @ptrCast(@alignCast(raw));
             conn.closed = true;
             conn.lsquic_conn = null;
+            if (lc) |c| conn.engine.cert_verify_ctx.discardVerified(c);
             // Clear conn context so lsquic doesn't assert on engine destroy
             if (lc) |c| lsquic.lsquic_conn_set_ctx(c, null);
             // Close both queues using engine's stored io
@@ -929,14 +1033,24 @@ pub const QuicEngine = struct {
         const is_locally_initiated = (engine.is_server == is_server_initiated);
 
         if (is_locally_initiated) {
-            conn.outbound_stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch {};
+            conn.outbound_stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch |err| {
+                log.warn("onNewStream: dropping local stream due to queue overflow: {}", .{err});
+                stream.close(engine.io);
+                stream.deinit();
+                return null;
+            };
         } else {
             // Arm wantread immediately for inbound streams so lsquic
             // delivers data via onRead before the stream is closed.
             // Without this, Lighthouse can send data + half-close before
             // our reader calls read(), causing UnexpectedEof.
             _ = lsquic.lsquic_stream_wantread(s, 1);
-            conn.stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch {};
+            conn.stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch |err| {
+                log.warn("onNewStream: dropping inbound stream due to queue overflow: {}", .{err});
+                stream.close(engine.io);
+                stream.deinit();
+                return null;
+            };
         }
 
         return @ptrCast(stream);
@@ -989,6 +1103,9 @@ pub const QuicEngine = struct {
             .owned_buf = owned,
         }) catch {
             stream.allocator.free(owned);
+            log.warn("onRead: read queue overflow, closing stream", .{});
+            stream.close(stream.conn.engine.io);
+            stream.read_queue.close(stream.conn.engine.io);
         };
     }
 
@@ -1128,6 +1245,12 @@ pub const QuicEngine = struct {
             return ssl.ssl_verify_invalid;
         };
         const ctx: *CertVerifyCtx = @ptrCast(@alignCast(raw_ptr));
+        const lsquic_ssl: *const lsquic.struct_ssl_st = @ptrCast(s);
+        const lc = lsquic.lsquic_ssl_to_conn(lsquic_ssl) orelse {
+            log.warn("customVerifyCallback: lsquic_ssl_to_conn returned null", .{});
+            if (out_alert) |a| a.* = ssl.SSL_AD_INTERNAL_ERROR;
+            return ssl.ssl_verify_invalid;
+        };
 
         // Get the peer certificate from the SSL connection
         const cert: *ssl.X509 = ssl.SSL_get_peer_certificate(s) orelse {
@@ -1159,10 +1282,15 @@ pub const QuicEngine = struct {
         });
 
         // Store verified peer info for consumption by onNewConn/onHskDone
-        ctx.storeVerified(.{
+        ctx.storeVerified(lc, ssl.SSL_is_server(s) == 1, .{
             .peer_id = info.peer_id,
             .host_pubkey = info.host_pubkey,
-        });
+        }) catch |err| {
+            log.warn("customVerifyCallback: failed to store verified peer info: {s}", .{@errorName(err)});
+            if (info.host_pubkey.data) |d| ctx.allocator.free(d);
+            if (out_alert) |a| a.* = ssl.SSL_AD_INTERNAL_ERROR;
+            return ssl.ssl_verify_invalid;
+        };
 
         log.debug("customVerifyCallback: peer verified successfully", .{});
         return ssl.ssl_verify_ok;
@@ -1275,10 +1403,11 @@ fn sameFamilyAndPort(a: net.IpAddress, b: net.IpAddress) bool {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-test "CertVerifyCtx store and retrieve" {
+test "CertVerifyCtx stores and retrieves by connection pointer" {
     const allocator = std.testing.allocator;
     var ctx = CertVerifyCtx.init(allocator);
     defer ctx.deinit();
+    const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
 
     // Create a test VerifiedPeer with dummy data
     const test_key_data = try allocator.dupe(u8, &[_]u8{ 1, 2, 3, 4 });
@@ -1287,8 +1416,8 @@ test "CertVerifyCtx store and retrieve" {
         .host_pubkey = keys.PublicKey{ .type = .ED25519, .data = test_key_data },
     };
 
-    ctx.storeVerified(test_peer);
-    const peer = ctx.takeVerified();
+    try ctx.storeVerified(conn_a, false, test_peer);
+    const peer = ctx.takeVerified(conn_a);
     try std.testing.expect(peer != null);
     // Caller owns the taken peer's host_pubkey data
     allocator.free(peer.?.host_pubkey.data.?);
@@ -1298,9 +1427,74 @@ test "CertVerifyCtx returns null when empty" {
     const allocator = std.testing.allocator;
     var ctx = CertVerifyCtx.init(allocator);
     defer ctx.deinit();
+    const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
 
-    const peer = ctx.takeVerified();
+    const peer = ctx.takeVerified(conn_a);
     try std.testing.expect(peer == null);
+}
+
+test "CertVerifyCtx keeps peer identities isolated per connection" {
+    const allocator = std.testing.allocator;
+    var ctx = CertVerifyCtx.init(allocator);
+    defer ctx.deinit();
+    const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
+    const conn_b: *lsquic.lsquic_conn_t = @ptrFromInt(0x2000);
+
+    try ctx.storeVerified(conn_a, false, .{
+        .peer_id = std.mem.zeroes(PeerId),
+        .host_pubkey = .{
+            .type = .ED25519,
+            .data = try allocator.dupe(u8, &[_]u8{1}),
+        },
+    });
+    try ctx.storeVerified(conn_b, false, .{
+        .peer_id = std.mem.zeroes(PeerId),
+        .host_pubkey = .{
+            .type = .ED25519,
+            .data = try allocator.dupe(u8, &[_]u8{2}),
+        },
+    });
+
+    const peer_b = ctx.takeVerified(conn_b) orelse return error.TestUnexpectedNull;
+    defer allocator.free(peer_b.host_pubkey.data.?);
+    try std.testing.expectEqual(@as(usize, 1), peer_b.host_pubkey.data.?.len);
+    try std.testing.expectEqual(@as(u8, 2), peer_b.host_pubkey.data.?[0]);
+
+    const peer_a = ctx.takeVerified(conn_a) orelse return error.TestUnexpectedNull;
+    defer allocator.free(peer_a.host_pubkey.data.?);
+    try std.testing.expectEqual(@as(usize, 1), peer_a.host_pubkey.data.?.len);
+    try std.testing.expectEqual(@as(u8, 1), peer_a.host_pubkey.data.?[0]);
+}
+
+test "CertVerifyCtx preserves server-side verification order" {
+    const allocator = std.testing.allocator;
+    var ctx = CertVerifyCtx.init(allocator);
+    defer ctx.deinit();
+    const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
+    const conn_b: *lsquic.lsquic_conn_t = @ptrFromInt(0x2000);
+
+    try ctx.storeVerified(conn_a, true, .{
+        .peer_id = std.mem.zeroes(PeerId),
+        .host_pubkey = .{
+            .type = .ED25519,
+            .data = try allocator.dupe(u8, &[_]u8{1}),
+        },
+    });
+    try ctx.storeVerified(conn_b, true, .{
+        .peer_id = std.mem.zeroes(PeerId),
+        .host_pubkey = .{
+            .type = .ED25519,
+            .data = try allocator.dupe(u8, &[_]u8{2}),
+        },
+    });
+
+    const peer_a = ctx.takeNextServerVerified() orelse return error.TestUnexpectedNull;
+    defer allocator.free(peer_a.host_pubkey.data.?);
+    try std.testing.expectEqual(@as(u8, 1), peer_a.host_pubkey.data.?[0]);
+
+    const peer_b = ctx.takeNextServerVerified() orelse return error.TestUnexpectedNull;
+    defer allocator.free(peer_b.host_pubkey.data.?);
+    try std.testing.expectEqual(@as(u8, 2), peer_b.host_pubkey.data.?[0]);
 }
 
 test "QuicEngine init and deinit" {

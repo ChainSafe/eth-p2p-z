@@ -25,6 +25,8 @@ pub const Config = struct {
     listen_addrs: ?[]const []const u8 = null,
     observed_addr: ?[]const u8 = null,
     supported_protocols: ?[]const []const u8 = null,
+    /// Maximum number of peer identify results retained in memory.
+    max_peer_results: usize = 1024,
 };
 
 const max_listen_addrs: u32 = 64;
@@ -38,7 +40,7 @@ pub const Handler = struct {
     allocator: std.mem.Allocator,
     config: Config,
     /// Per-peer identify results. Keys are owned copies of peer_id bytes.
-    peer_results: std.StringHashMap(IdentifyResult),
+    peer_results: std.StringArrayHashMap(IdentifyResult),
 
     /// Protocol identifier for libp2p identify.
     pub const id = "/ipfs/id/1.0.0";
@@ -48,18 +50,17 @@ pub const Handler = struct {
 
     /// Clean up all stored peer results.
     pub fn deinit(self: *Handler) void {
-        var it = self.peer_results.iterator();
-        while (it.next()) |entry| {
-            var result = entry.value_ptr.*;
+        for (self.peer_results.keys(), self.peer_results.values()) |key, *value| {
+            var result = value.*;
             result.deinit(self.allocator);
-            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(key);
         }
         self.peer_results.deinit();
     }
 
     /// Called by Switch when a peer disconnects. Frees stored identify result.
     pub fn onPeerDisconnected(self: *Handler, peer_id: []const u8) void {
-        if (self.peer_results.fetchRemove(peer_id)) |kv| {
+        if (self.peer_results.fetchOrderedRemove(peer_id)) |kv| {
             var result = kv.value;
             result.deinit(self.allocator);
             self.allocator.free(kv.key);
@@ -156,10 +157,21 @@ pub const Handler = struct {
         const peer_id: ?[]const u8 = if (@hasField(@TypeOf(ctx), "peer_id")) ctx.peer_id else null;
         if (peer_id) |pid| {
             // Remove old result if any
-            if (self.peer_results.fetchRemove(pid)) |kv| {
+            if (self.peer_results.fetchOrderedRemove(pid)) |kv| {
                 var old = kv.value;
                 old.deinit(allocator);
                 allocator.free(kv.key);
+            }
+            if (self.config.max_peer_results == 0) {
+                result.deinit(allocator);
+                return;
+            }
+            if (self.peer_results.count() >= self.config.max_peer_results) {
+                const oldest_key = self.peer_results.keys()[0];
+                var oldest_result = self.peer_results.values()[0];
+                oldest_result.deinit(allocator);
+                allocator.free(oldest_key);
+                self.peer_results.orderedRemoveAt(0);
             }
             const key = allocator.dupe(u8, pid) catch {
                 result.deinit(allocator);
@@ -247,7 +259,7 @@ test "handleInbound encodes and writes identify message" {
             .protocol_version = "test/1.0.0",
             .agent_version = "zig-libp2p/0.1.0",
         },
-        .peer_results = std.StringHashMap(IdentifyResult).init(allocator),
+        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
     };
     defer handler.deinit();
     try handler.handleInbound(undefined, &stream, .{});
@@ -285,7 +297,7 @@ test "handleOutbound reads and decodes identify message" {
     var handler: Handler = .{
         .allocator = allocator,
         .config = .{},
-        .peer_results = std.StringHashMap(IdentifyResult).init(allocator),
+        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
     };
     defer handler.deinit();
 
@@ -309,9 +321,48 @@ test "handleOutbound rejects empty stream" {
     var handler: Handler = .{
         .allocator = allocator,
         .config = .{},
-        .peer_results = std.StringHashMap(IdentifyResult).init(allocator),
+        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
     };
     defer handler.deinit();
     const result = handler.handleOutbound(undefined, &stream, .{});
     try std.testing.expectError(Error.UnexpectedEof, result);
+}
+
+test "handleOutbound evicts oldest peer result when cache is full" {
+    const allocator = std.testing.allocator;
+
+    var msg = identify_pb.Identify{
+        .protocol_version = "ipfs/0.1.0",
+        .agent_version = "go-libp2p/0.35.0",
+        .public_key = "test-key",
+    };
+    const encoded = try msg.encode(allocator);
+    defer allocator.free(encoded);
+
+    var len_buf: [10]u8 = undefined;
+    const len_size = writeLengthPrefix(&len_buf, encoded.len);
+    const framed = try std.mem.concat(allocator, u8, &.{ len_buf[0..len_size], encoded });
+    defer allocator.free(framed);
+
+    var handler: Handler = .{
+        .allocator = allocator,
+        .config = .{ .max_peer_results = 1 },
+        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
+    };
+    defer handler.deinit();
+
+    {
+        var stream = MockStream.init(allocator, framed);
+        defer stream.deinit();
+        try handler.handleOutbound(undefined, &stream, .{ .peer_id = @as(?[]const u8, "peer-1") });
+    }
+    {
+        var stream = MockStream.init(allocator, framed);
+        defer stream.deinit();
+        try handler.handleOutbound(undefined, &stream, .{ .peer_id = @as(?[]const u8, "peer-2") });
+    }
+
+    try std.testing.expect(handler.getPeerResult("peer-1") == null);
+    try std.testing.expect(handler.getPeerResult("peer-2") != null);
+    try std.testing.expectEqual(@as(usize, 1), handler.peer_results.count());
 }

@@ -71,6 +71,8 @@ pub const Config = struct {
 
     /// Message-seen cache TTL in seconds.
     seen_ttl_seconds: u32 = 120,
+    /// Hard cap on the dedup cache to bound memory under message flood.
+    max_seen_entries: usize = 65_536,
 
     /// Minimum message size to trigger IDontWant.
     idontwant_min_message_size: u32 = 1024,
@@ -88,6 +90,12 @@ pub const Config = struct {
 
     /// v1.3: Extensions we support (sent on first stream message).
     extensions: Extensions = .{},
+    /// Maximum number of outbound RPCs buffered for later draining.
+    max_pending_sends: usize = 1_024,
+    /// Maximum total buffered outbound RPC bytes across pending sends.
+    max_pending_send_bytes: usize = 8 * 1024 * 1024,
+    /// Maximum number of undrained events buffered in memory.
+    max_event_queue: usize = 1_024,
 };
 
 /// v1.3: Extension capabilities declared on stream open.
@@ -187,6 +195,36 @@ pub const Event = union(enum) {
     score_below_threshold: ScoreEvent,
     /// v1.3: A peer declared its supported extensions.
     peer_extensions: PeerExtensionsEvent,
+
+    pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .message => |*event| {
+                allocator.free(event.topic);
+                allocator.free(event.data);
+                if (event.from) |from| allocator.free(from);
+                if (event.seqno) |seqno| allocator.free(seqno);
+            },
+            .subscription_changed => |*event| {
+                allocator.free(event.peer_id);
+                allocator.free(event.topic);
+            },
+            .graft => |*event| {
+                allocator.free(event.peer_id);
+                allocator.free(event.topic);
+            },
+            .prune => |*event| {
+                allocator.free(event.peer_id);
+                allocator.free(event.topic);
+            },
+            .score_below_threshold => |*event| {
+                allocator.free(event.peer_id);
+            },
+            .peer_extensions => |*event| {
+                allocator.free(event.peer_id);
+            },
+        }
+        self.* = undefined;
+    }
 };
 
 pub const MessageEvent = struct {
@@ -238,6 +276,10 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(u64, 60_000), cfg.fanout_ttl_ms);
     try std.testing.expect(cfg.flood_publish);
     try std.testing.expect(!cfg.emit_self);
+    try std.testing.expectEqual(@as(usize, 65_536), cfg.max_seen_entries);
+    try std.testing.expectEqual(@as(usize, 1_024), cfg.max_pending_sends);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), cfg.max_pending_send_bytes);
+    try std.testing.expectEqual(@as(usize, 1_024), cfg.max_event_queue);
     try std.testing.expectEqual(SignaturePolicy.strict_sign, cfg.signature_policy);
     try std.testing.expectEqual(PublishPolicy.signing, cfg.publish_policy);
 }

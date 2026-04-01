@@ -7,6 +7,7 @@ const message_suffix = "\n";
 const na_response = "na";
 const max_message_length: u32 = 1024;
 const max_varint_bytes: u32 = 9;
+const max_inbound_protocol_proposals: u32 = 16;
 
 pub const Error = error{
     ProtocolIdTooLong,
@@ -16,6 +17,7 @@ pub const Error = error{
     NoSupportedProtocols,
     UnexpectedEof,
     InvalidLength,
+    TooManyProtocolProposals,
 };
 
 /// Write a multistream-select message: length-prefixed, newline-terminated.
@@ -99,6 +101,7 @@ pub fn negotiateInbound(
     supported_protocols: []const []const u8,
 ) Error![]const u8 {
     var buf: [max_message_length]u8 = undefined;
+    var proposals_seen: u32 = 0;
 
     const header = try readMessage(io, stream, &buf);
     if (!std.mem.eql(u8, header, protocol_id)) {
@@ -108,7 +111,11 @@ pub fn negotiateInbound(
     try writeMessage(io, stream, protocol_id);
 
     while (true) {
+        if (proposals_seen >= max_inbound_protocol_proposals) {
+            return Error.TooManyProtocolProposals;
+        }
         const proposal = try readMessage(io, stream, &buf);
+        proposals_seen += 1;
 
         for (supported_protocols) |supported| {
             if (std.mem.eql(u8, proposal, supported)) {
@@ -250,4 +257,34 @@ test "readMessage rejects overlong varint" {
     var buf: [max_message_length]u8 = undefined;
     const result = readMessage(undefined, &stream, &buf);
     try std.testing.expectError(Error.InvalidLength, result);
+}
+
+test "negotiateInbound rejects excessive unsupported proposals" {
+    const allocator = std.testing.allocator;
+
+    const header_msg = try encodeMessage(allocator, protocol_id);
+    defer allocator.free(header_msg);
+
+    var frames = std.ArrayList([]const u8).empty;
+    defer frames.deinit(allocator);
+    try frames.append(allocator, header_msg);
+    for (0..max_inbound_protocol_proposals + 1) |i| {
+        const proto = try std.fmt.allocPrint(allocator, "/unsupported/{d}", .{i});
+        defer allocator.free(proto);
+        const encoded = try encodeMessage(allocator, proto);
+        try frames.append(allocator, encoded);
+    }
+    defer {
+        for (frames.items[1..]) |frame| allocator.free(frame);
+    }
+
+    const read_data = try std.mem.concat(allocator, u8, frames.items);
+    defer allocator.free(read_data);
+
+    var stream = MockStream.init(allocator, read_data);
+    defer stream.deinit();
+
+    const supported = [_][]const u8{"/ipfs/ping/1.0.0"};
+    const result = negotiateInbound(undefined, &stream, &supported);
+    try std.testing.expectError(Error.TooManyProtocolProposals, result);
 }

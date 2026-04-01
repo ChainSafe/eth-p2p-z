@@ -53,6 +53,7 @@ pub const Service = struct {
     /// Pending outbound RPC data per peer.
     /// Populated by the Router via sendRpc; drained by the integration layer.
     pending_sends: std.ArrayList(PendingRpc),
+    pending_send_bytes: usize,
     /// PRNG state for randomU64 (xorshift64).
     rng_state: u64,
     /// Current time in milliseconds, set externally via setTime.
@@ -107,6 +108,7 @@ pub const Service = struct {
             .allocator = allocator,
             .router = undefined,
             .pending_sends = .empty,
+            .pending_send_bytes = 0,
             .rng_state = 12345,
             .time_ms = 0,
             .io = null,
@@ -342,6 +344,15 @@ pub const Service = struct {
             self.allocator.free(peer_copy);
             return false;
         };
+        const queued_bytes = peer_copy.len + data_copy.len;
+        if (self.pending_sends.items.len >= self.router.config.max_pending_sends or
+            self.pending_send_bytes + queued_bytes > self.router.config.max_pending_send_bytes)
+        {
+            self.allocator.free(peer_copy);
+            self.allocator.free(data_copy);
+            log.warn("gossipsub: dropping outbound RPC because pending queue limits were reached", .{});
+            return false;
+        }
         self.pending_sends.append(self.allocator, .{
             .peer = peer_copy,
             .data = data_copy,
@@ -350,6 +361,7 @@ pub const Service = struct {
             self.allocator.free(data_copy);
             return false;
         };
+        self.pending_send_bytes += queued_bytes;
         return true;
     }
 
@@ -426,7 +438,8 @@ pub const Service = struct {
     }
 
     /// Drain accumulated events from the Router.
-    /// Caller owns the returned slice and must free it.
+    /// Caller owns the returned slice and must call `deinit()` on each event,
+    /// then free the slice itself.
     pub fn drainEvents(self: *Self) ![]Event {
         return try self.router.drainEvents();
     }
@@ -440,7 +453,9 @@ pub const Service = struct {
     /// Drain all pending outbound RPCs. Caller owns the returned slice
     /// and must free each entry's `peer` and `data` slices, plus the slice itself.
     pub fn drainPendingSends(self: *Self) []PendingRpc {
-        return self.pending_sends.toOwnedSlice(self.allocator) catch return &.{};
+        const drained = self.pending_sends.toOwnedSlice(self.allocator) catch return &.{};
+        self.pending_send_bytes = 0;
+        return drained;
     }
 
     /// Set the current time (for testing or external time source).
@@ -543,6 +558,29 @@ test "Service drainPendingSends returns empty when nothing pending" {
     const sends = svc.drainPendingSends();
     try std.testing.expectEqual(@as(usize, 0), sends.len);
     svc.allocator.free(sends);
+}
+
+test "Service sendRpc enforces pending queue limits" {
+    const svc = try Service.init(std.testing.allocator, .{
+        .max_pending_sends = 1,
+        .max_pending_send_bytes = 16,
+    });
+    defer svc.deinit();
+
+    try std.testing.expect(svc.sendRpc("peer-1", "1234"));
+    try std.testing.expect(!svc.sendRpc("peer-2", "5678"));
+    try std.testing.expectEqual(@as(usize, 1), svc.pending_sends.items.len);
+
+    const sends = svc.drainPendingSends();
+    defer {
+        for (sends) |s| {
+            svc.allocator.free(s.peer);
+            svc.allocator.free(s.data);
+        }
+        svc.allocator.free(sends);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sends.len);
+    try std.testing.expectEqual(@as(usize, 0), svc.pending_send_bytes);
 }
 
 test "Service setTime and setSeed" {

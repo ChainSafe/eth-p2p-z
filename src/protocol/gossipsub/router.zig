@@ -44,6 +44,10 @@ pub fn Router(comptime Handler: type) type {
 
     return struct {
         const Self = @This();
+        const SeenEntry = struct {
+            mid: []const u8,
+            expires_at_ms: u64,
+        };
 
         allocator: std.mem.Allocator,
         config: Config,
@@ -63,8 +67,10 @@ pub fn Router(comptime Handler: type) type {
 
         // Message cache
         mcache: MessageCache,
-        // Dedup seen cache: message_id -> void
-        seen: std.StringHashMap(void),
+        // Dedup seen cache: message_id -> expires_at_ms
+        seen: std.StringHashMap(u64),
+        seen_fifo: std.ArrayList(SeenEntry),
+        seen_fifo_head: usize,
 
         // Per-heartbeat rate limiting
         peer_ihave_count: std.StringHashMap(u32),
@@ -228,7 +234,9 @@ pub fn Router(comptime Handler: type) type {
                 .fanout = std.StringHashMap(PeerSet).init(allocator),
                 .fanout_last_pub = std.StringHashMap(u64).init(allocator),
                 .mcache = mc,
-                .seen = std.StringHashMap(void).init(allocator),
+                .seen = std.StringHashMap(u64).init(allocator),
+                .seen_fifo = .empty,
+                .seen_fifo_head = 0,
                 .peer_ihave_count = std.StringHashMap(u32).init(allocator),
                 .peer_iasked = std.StringHashMap(u32).init(allocator),
                 .backoff = std.StringHashMap(u64).init(allocator),
@@ -246,6 +254,9 @@ pub fn Router(comptime Handler: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            for (self.events.items) |*event| {
+                event.deinit(self.allocator);
+            }
             self.events.deinit(self.allocator);
 
             // Peer scoring
@@ -282,7 +293,8 @@ pub fn Router(comptime Handler: type) type {
             self.peer_iasked.deinit();
             self.peer_ihave_count.deinit();
 
-            deinitKeyedMap(&self.seen, self.allocator);
+            self.seen_fifo.deinit(self.allocator);
+            deinitKeyedMap2(&self.seen, self.allocator);
 
             self.mcache.deinit();
 
@@ -332,10 +344,8 @@ pub fn Router(comptime Handler: type) type {
             defer self.allocator.free(mid);
 
             // Dedup
-            if (self.seen.contains(mid)) return 0;
-
-            const mid_owned = try self.allocator.dupe(u8, mid);
-            try self.seen.put(mid_owned, {});
+            if (self.hasSeen(mid)) return 0;
+            try self.rememberSeen(mid);
 
             // Store in mcache, ignore duplicate or missing topic
             self.mcache.put(&msg) catch {};
@@ -365,7 +375,7 @@ pub fn Router(comptime Handler: type) type {
 
             // Self delivery
             if (self.config.emit_self and self.subscriptions.contains(topic)) {
-                try self.events.append(self.allocator, .{ .message = .{
+                try self.appendOwnedEvent(.{ .message = .{
                     .topic = topic,
                     .data = data,
                     .from = null,
@@ -489,6 +499,132 @@ pub fn Router(comptime Handler: type) type {
             return result;
         }
 
+        fn dupeOptionalBytes(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+            return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
+        }
+
+        fn makeOwnedEvent(self: *Self, event: Event) !Event {
+            return switch (event) {
+                .message => |msg| .{ .message = .{
+                    .topic = try self.allocator.dupe(u8, msg.topic),
+                    .data = try self.allocator.dupe(u8, msg.data),
+                    .from = try dupeOptionalBytes(self.allocator, msg.from),
+                    .seqno = try dupeOptionalBytes(self.allocator, msg.seqno),
+                } },
+                .subscription_changed => |sub| .{ .subscription_changed = .{
+                    .peer_id = try self.allocator.dupe(u8, sub.peer_id),
+                    .topic = try self.allocator.dupe(u8, sub.topic),
+                    .action = sub.action,
+                } },
+                .graft => |graft| .{ .graft = .{
+                    .peer_id = try self.allocator.dupe(u8, graft.peer_id),
+                    .topic = try self.allocator.dupe(u8, graft.topic),
+                } },
+                .prune => |prune| .{ .prune = .{
+                    .peer_id = try self.allocator.dupe(u8, prune.peer_id),
+                    .topic = try self.allocator.dupe(u8, prune.topic),
+                } },
+                .score_below_threshold => |score| .{ .score_below_threshold = .{
+                    .peer_id = try self.allocator.dupe(u8, score.peer_id),
+                    .score = score.score,
+                } },
+                .peer_extensions => |ext| .{ .peer_extensions = .{
+                    .peer_id = try self.allocator.dupe(u8, ext.peer_id),
+                    .partial_messages = ext.partial_messages,
+                } },
+            };
+        }
+
+        fn appendOwnedEvent(self: *Self, event: Event) !void {
+            if (self.config.max_event_queue == 0) return;
+            if (self.events.items.len >= self.config.max_event_queue) {
+                var dropped = self.events.orderedRemove(0);
+                dropped.deinit(self.allocator);
+            }
+            var owned = try self.makeOwnedEvent(event);
+            errdefer owned.deinit(self.allocator);
+            try self.events.append(self.allocator, owned);
+        }
+
+        fn compactSeenFifo(self: *Self) void {
+            if (self.seen_fifo_head == 0) return;
+            if (self.seen_fifo_head == self.seen_fifo.items.len) {
+                self.seen_fifo.clearRetainingCapacity();
+                self.seen_fifo_head = 0;
+                return;
+            }
+            if (self.seen_fifo_head < 1024 and self.seen_fifo_head * 2 < self.seen_fifo.items.len) return;
+
+            var compacted: std.ArrayList(SeenEntry) = .empty;
+            compacted.appendSlice(self.allocator, self.seen_fifo.items[self.seen_fifo_head..]) catch return;
+            self.seen_fifo.deinit(self.allocator);
+            self.seen_fifo = compacted;
+            self.seen_fifo_head = 0;
+        }
+
+        fn expireSeen(self: *Self) void {
+            if (self.config.seen_ttl_seconds == 0) return;
+            const now = self.handler.currentTimeMs();
+            while (self.seen_fifo_head < self.seen_fifo.items.len) {
+                const entry = self.seen_fifo.items[self.seen_fifo_head];
+                const expires_at = self.seen.get(entry.mid) orelse {
+                    self.seen_fifo_head += 1;
+                    continue;
+                };
+                if (expires_at > now) break;
+                self.seen_fifo_head += 1;
+                if (self.seen.fetchRemove(entry.mid)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+            }
+            self.compactSeenFifo();
+        }
+
+        fn evictSeenOldest(self: *Self) void {
+            while (self.seen_fifo_head < self.seen_fifo.items.len) {
+                const entry = self.seen_fifo.items[self.seen_fifo_head];
+                self.seen_fifo_head += 1;
+                if (self.seen.fetchRemove(entry.mid)) |kv| {
+                    self.allocator.free(kv.key);
+                    break;
+                }
+            }
+            self.compactSeenFifo();
+        }
+
+        fn hasSeen(self: *Self, mid: []const u8) bool {
+            if (self.config.max_seen_entries == 0 or self.config.seen_ttl_seconds == 0) {
+                return false;
+            }
+            self.expireSeen();
+            return self.seen.contains(mid);
+        }
+
+        fn rememberSeen(self: *Self, mid: []const u8) !void {
+            if (self.config.max_seen_entries == 0 or self.config.seen_ttl_seconds == 0) {
+                return;
+            }
+            self.expireSeen();
+            if (self.seen.contains(mid)) return;
+
+            while (self.seen.count() >= self.config.max_seen_entries) {
+                self.evictSeenOldest();
+            }
+
+            const mid_owned = try self.allocator.dupe(u8, mid);
+            errdefer self.allocator.free(mid_owned);
+
+            const expires_at = self.handler.currentTimeMs() + @as(u64, self.config.seen_ttl_seconds) * 1000;
+            try self.seen.put(mid_owned, expires_at);
+            errdefer {
+                _ = self.seen.fetchRemove(mid_owned);
+            }
+            try self.seen_fifo.append(self.allocator, .{
+                .mid = mid_owned,
+                .expires_at_ms = expires_at,
+            });
+        }
+
         /// Execute one heartbeat tick. Should be called periodically.
         pub fn heartbeat(self: *Self) !void {
             self.heartbeat_ticks += 1;
@@ -571,6 +707,9 @@ pub fn Router(comptime Handler: type) type {
             // v1.1: Expire backoff entries
             self.expireBackoffs();
 
+            // Expire dedup cache entries before the next gossip window.
+            self.expireSeen();
+
             // v1.1: Decay peer scores
             self.decayScores();
 
@@ -605,7 +744,7 @@ pub fn Router(comptime Handler: type) type {
                 }
             }
 
-            try self.events.append(self.allocator, .{ .subscription_changed = .{
+            try self.appendOwnedEvent(.{ .subscription_changed = .{
                 .peer_id = peer_id,
                 .topic = topic,
                 .action = if (is_subscribe) .subscribe else .unsubscribe,
@@ -644,14 +783,12 @@ pub fn Router(comptime Handler: type) type {
             defer self.allocator.free(mid);
 
             // Dedup check
-            if (self.seen.contains(mid)) {
+            if (self.hasSeen(mid)) {
                 log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
                 return;
             }
             log.info("handleIncomingMessage: DEDUP MISS (new msg) mid_len={d}", .{mid.len});
-
-            const mid_owned = try self.allocator.dupe(u8, mid);
-            try self.seen.put(mid_owned, {});
+            try self.rememberSeen(mid);
 
             // Cache the message
             self.mcache.put(&msg) catch {};
@@ -672,7 +809,7 @@ pub fn Router(comptime Handler: type) type {
             });
             if (self.subscriptions.contains(topic)) {
                 log.info("handleIncomingMessage: APPENDING message event for topic='{s}'", .{topic});
-                try self.events.append(self.allocator, .{ .message = .{
+                try self.appendOwnedEvent(.{ .message = .{
                     .topic = topic,
                     .data = msg.data orelse "",
                     .from = msg.from,
@@ -790,7 +927,7 @@ pub fn Router(comptime Handler: type) type {
 
             var ihave_var = ihave.*;
             while (ihave_var.messageIDsNext()) |mid| {
-                if (!self.seen.contains(mid)) {
+                if (!self.hasSeen(mid)) {
                     try iwant_ids.append(self.allocator, mid);
                 }
             }
@@ -890,7 +1027,7 @@ pub fn Router(comptime Handler: type) type {
             // v1.1: Update scoring
             self.scoreGraft(from_peer, topic);
 
-            try self.events.append(self.allocator, .{ .graft = .{
+            try self.appendOwnedEvent(.{ .graft = .{
                 .peer_id = from_peer,
                 .topic = topic,
             } });
@@ -913,7 +1050,7 @@ pub fn Router(comptime Handler: type) type {
             const effective_backoff = if (backoff_duration > 0) backoff_duration * 1000 else default_prune_backoff_ms;
             try self.backoff.put(from_peer, self.handler.currentTimeMs() + effective_backoff);
 
-            try self.events.append(self.allocator, .{ .prune = .{
+            try self.appendOwnedEvent(.{ .prune = .{
                 .peer_id = from_peer,
                 .topic = topic,
             } });
@@ -947,7 +1084,7 @@ pub fn Router(comptime Handler: type) type {
             };
             try self.peer_extensions.put(from_peer, extensions);
 
-            try self.events.append(self.allocator, .{ .peer_extensions = .{
+            try self.appendOwnedEvent(.{ .peer_extensions = .{
                 .peer_id = from_peer,
                 .partial_messages = extensions.partial_messages,
             } });
@@ -1758,6 +1895,13 @@ fn addPeerSubscription(router: *TestRouter, peer: []const u8, topic: []const u8)
     try router.handleRpc(peer, encoded);
 }
 
+fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
+    for (events) |*event| {
+        event.deinit(allocator);
+    }
+    allocator.free(events);
+}
+
 test "Router init and deinit" {
     const allocator = std.testing.allocator;
     var handler = TestHandler.init(allocator);
@@ -1812,7 +1956,7 @@ test "Router handleRpc processes subscriptions" {
     try std.testing.expect(peer_set.contains("peer-1"));
 
     const events = try router.drainEvents();
-    defer allocator.free(events);
+    defer freeEvents(allocator, events);
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expect(events[0] == .subscription_changed);
 }
@@ -1872,7 +2016,7 @@ test "Router v1.1 PRUNE backoff is respected" {
 
     handler.clearSent();
     const events = try router.drainEvents();
-    defer allocator.free(events);
+    defer freeEvents(allocator, events);
 
     // Heartbeat should NOT graft peer-1 while in backoff
     try router.heartbeat();
@@ -1937,7 +2081,7 @@ test "Router memory management" {
         try router.heartbeat();
 
         const events = try router.drainEvents();
-        allocator.free(events);
+        freeEvents(allocator, events);
 
         try router.unsubscribe("topic-1");
         router.removePeer("peer-a");
@@ -2005,8 +2149,50 @@ test "Router StrictNoSign rejects origin-stamped and signed incoming messages" {
     try std.testing.expectEqual(@as(usize, 0), router.seen.count());
     try std.testing.expectEqual(@as(usize, 0), handler.sent.items.len);
     const events = try router.drainEvents();
-    defer allocator.free(events);
+    defer freeEvents(allocator, events);
     try std.testing.expectEqual(@as(usize, 0), events.len);
+}
+
+test "Router seen cache expires entries by TTL" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, .{
+        .seen_ttl_seconds = 1,
+        .max_seen_entries = 8,
+    }, &handler);
+    defer router.deinit();
+
+    try router.rememberSeen("msg-1");
+    try std.testing.expect(router.hasSeen("msg-1"));
+
+    handler.time_ms += 1_500;
+    router.expireSeen();
+    try std.testing.expect(!router.hasSeen("msg-1"));
+}
+
+test "Router seen cache evicts oldest entries at capacity" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, .{
+        .seen_ttl_seconds = 60,
+        .max_seen_entries = 2,
+    }, &handler);
+    defer router.deinit();
+
+    try router.rememberSeen("msg-1");
+    handler.time_ms += 1;
+    try router.rememberSeen("msg-2");
+    handler.time_ms += 1;
+    try router.rememberSeen("msg-3");
+
+    try std.testing.expect(!router.hasSeen("msg-1"));
+    try std.testing.expect(router.hasSeen("msg-2"));
+    try std.testing.expect(router.hasSeen("msg-3"));
+    try std.testing.expectEqual(@as(usize, 2), router.seen.count());
 }
 
 test "Router publish rejects unsupported signing mode" {
@@ -2191,7 +2377,7 @@ test "Router v1.3 extensions tracking" {
 
     // Event should have been emitted
     const events = try router.drainEvents();
-    defer allocator.free(events);
+    defer freeEvents(allocator, events);
     try std.testing.expect(events.len > 0);
     try std.testing.expect(events[0] == .peer_extensions);
 }
@@ -2323,7 +2509,7 @@ test "Router memory management with v1.2/v1.3 features" {
         try router.heartbeat();
 
         const events = try router.drainEvents();
-        allocator.free(events);
+        freeEvents(allocator, events);
 
         router.removePeer("peer-a");
         router.removePeer("peer-b");
