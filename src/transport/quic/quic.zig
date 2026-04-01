@@ -8,8 +8,7 @@ const Ip4Addr = multiaddr.Ip4Addr;
 const Ip6Addr = multiaddr.Ip6Addr;
 
 const PeerId = @import("peer_id").PeerId;
-const ssl = @import("ssl");
-const tls = @import("../../security/tls.zig");
+const identity = @import("../../identity.zig");
 
 const quic = @This();
 
@@ -461,22 +460,22 @@ test "QUIC full handshake between server and client" {
     const io = std.testing.io;
 
     // Generate host identity keys for server and client
-    const server_host_key = tls.generateKeyPair(.ECDSA) catch |err| {
-        std.log.warn("generateKeyPair failed: {}", .{err});
+    var server_host_identity = identity.KeyPair.generate(.ECDSA) catch |err| {
+        std.log.warn("KeyPair.generate failed: {}", .{err});
         return;
     };
-    defer ssl.EVP_PKEY_free(server_host_key);
+    defer server_host_identity.deinit();
 
-    const client_host_key = tls.generateKeyPair(.ECDSA) catch |err| {
-        std.log.warn("generateKeyPair failed: {}", .{err});
+    var client_host_identity = identity.KeyPair.generate(.ECDSA) catch |err| {
+        std.log.warn("KeyPair.generate failed: {}", .{err});
         return;
     };
-    defer ssl.EVP_PKEY_free(client_host_key);
+    defer client_host_identity.deinit();
 
     // Create server engine with TLS cert
     const server_eng = QuicEngine.init(allocator, io, .{
         .is_server = true,
-        .host_key = server_host_key,
+        .host_identity = &server_host_identity,
     }) catch |err| {
         std.log.warn("Server engine init failed: {}", .{err});
         return;
@@ -505,7 +504,7 @@ test "QUIC full handshake between server and client" {
     // Create client engine with TLS cert
     const client_eng = QuicEngine.init(allocator, io, .{
         .is_server = false,
-        .host_key = client_host_key,
+        .host_identity = &client_host_identity,
     }) catch |err| {
         std.log.warn("Client engine init failed: {}", .{err});
         server_eng.stop(io);
@@ -578,15 +577,15 @@ test "QUIC stream read/write round-trip" {
     const io = std.testing.io;
 
     // Generate host identity keys
-    const server_host_key = tls.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(server_host_key);
-    const client_host_key = tls.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(client_host_key);
+    var server_host_identity = identity.KeyPair.generate(.ECDSA) catch return;
+    defer server_host_identity.deinit();
+    var client_host_identity = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client_host_identity.deinit();
 
     // Create and bind server engine
     const server_eng = QuicEngine.init(allocator, io, .{
         .is_server = true,
-        .host_key = server_host_key,
+        .host_identity = &server_host_identity,
     }) catch return;
     const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     _ = server_eng.bindSocket(io, &server_addr) catch {
@@ -605,7 +604,7 @@ test "QUIC stream read/write round-trip" {
     // Create, bind, and connect client engine
     const client_eng = QuicEngine.init(allocator, io, .{
         .is_server = false,
-        .host_key = client_host_key,
+        .host_identity = &client_host_identity,
     }) catch {
         server_eng.stop(io);
         server_eng.deinit();
@@ -773,19 +772,19 @@ const TestContext = struct {
     client_eng: *QuicEngine,
     server_conn: *engine_mod.QuicConnection,
     client_conn: *engine_mod.QuicConnection,
-    server_host_key: *ssl.EVP_PKEY,
-    client_host_key: *ssl.EVP_PKEY,
+    server_host_identity: identity.KeyPair,
+    client_host_identity: identity.KeyPair,
     allocator: Allocator,
 
     fn initPair(allocator: Allocator, io: Io) !TestContext {
-        const server_host_key = try tls.generateKeyPair(.ECDSA);
-        errdefer ssl.EVP_PKEY_free(server_host_key);
-        const client_host_key = try tls.generateKeyPair(.ECDSA);
-        errdefer ssl.EVP_PKEY_free(client_host_key);
+        var server_host_identity = try identity.KeyPair.generate(.ECDSA);
+        errdefer server_host_identity.deinit();
+        var client_host_identity = try identity.KeyPair.generate(.ECDSA);
+        errdefer client_host_identity.deinit();
 
         const server_eng = try QuicEngine.init(allocator, io, .{
             .is_server = true,
-            .host_key = server_host_key,
+            .host_identity = &server_host_identity,
         });
         errdefer server_eng.deinit();
         const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
@@ -799,7 +798,7 @@ const TestContext = struct {
 
         const client_eng = try QuicEngine.init(allocator, io, .{
             .is_server = false,
-            .host_key = client_host_key,
+            .host_identity = &client_host_identity,
         });
         errdefer {
             client_eng.deinit();
@@ -821,8 +820,8 @@ const TestContext = struct {
             .client_eng = client_eng,
             .server_conn = server_conn,
             .client_conn = client_conn,
-            .server_host_key = server_host_key,
-            .client_host_key = client_host_key,
+            .server_host_identity = server_host_identity,
+            .client_host_identity = client_host_identity,
             .allocator = allocator,
         };
     }
@@ -836,8 +835,8 @@ const TestContext = struct {
         self.client_eng.deinit();
         self.server_conn.deinit();
         self.client_conn.deinit();
-        ssl.EVP_PKEY_free(self.server_host_key);
-        ssl.EVP_PKEY_free(self.client_host_key);
+        self.server_host_identity.deinit();
+        self.client_host_identity.deinit();
     }
 };
 
@@ -915,23 +914,13 @@ test "QUIC bidirectional peer ID verification" {
     try std.testing.expect(ctx.client_conn.peer_id != null);
 
     // Derive expected PeerId from the host keys
-    var server_pubkey = tls.createProtobufEncodedPublicKey(allocator, ctx.server_host_key) catch |err| {
-        std.log.warn("createProtobufEncodedPublicKey failed: {}", .{err});
-        return;
-    };
-    defer allocator.free(server_pubkey.data.?);
-    const expected_server_pid = PeerId.fromPublicKey(allocator, &server_pubkey) catch |err| {
-        std.log.warn("PeerId.fromPublicKey failed: {}", .{err});
+    const expected_server_pid = ctx.server_host_identity.peerId(allocator) catch |err| {
+        std.log.warn("peerId failed: {}", .{err});
         return;
     };
 
-    var client_pubkey = tls.createProtobufEncodedPublicKey(allocator, ctx.client_host_key) catch |err| {
-        std.log.warn("createProtobufEncodedPublicKey failed: {}", .{err});
-        return;
-    };
-    defer allocator.free(client_pubkey.data.?);
-    const expected_client_pid = PeerId.fromPublicKey(allocator, &client_pubkey) catch |err| {
-        std.log.warn("PeerId.fromPublicKey failed: {}", .{err});
+    const expected_client_pid = ctx.client_host_identity.peerId(allocator) catch |err| {
+        std.log.warn("peerId failed: {}", .{err});
         return;
     };
 
@@ -939,6 +928,69 @@ test "QUIC bidirectional peer ID verification" {
     try std.testing.expect(ctx.server_conn.peer_id.?.eql(&expected_client_pid));
     // Client extracted the SERVER's peer_id
     try std.testing.expect(ctx.client_conn.peer_id.?.eql(&expected_server_pid));
+}
+
+test "QUIC handshake supports secp256k1 host identities" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server_host_identity = identity.KeyPair.generate(.SECP256K1) catch |err| {
+        std.log.warn("server secp256k1 key generation failed: {}", .{err});
+        return;
+    };
+    defer server_host_identity.deinit();
+
+    var client_host_identity = identity.KeyPair.generate(.SECP256K1) catch |err| {
+        std.log.warn("client secp256k1 key generation failed: {}", .{err});
+        return;
+    };
+    defer client_host_identity.deinit();
+
+    const server_eng = QuicEngine.init(allocator, io, .{
+        .is_server = true,
+        .host_identity = &server_host_identity,
+    }) catch |err| {
+        std.log.warn("server engine init failed: {}", .{err});
+        return;
+    };
+    defer server_eng.deinit();
+
+    const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    const bound_server_addr = try server_eng.bindSocket(io, &server_addr);
+    server_eng.startBackgroundLoops(io);
+
+    const client_eng = QuicEngine.init(allocator, io, .{
+        .is_server = false,
+        .host_identity = &client_host_identity,
+    }) catch |err| {
+        std.log.warn("client engine init failed: {}", .{err});
+        server_eng.stop(io);
+        return;
+    };
+    defer client_eng.deinit();
+
+    const bound_client_addr = try client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
+    var remote_sa = engine_mod.ipAddressToSockaddr(bound_server_addr);
+    var local_sa = engine_mod.ipAddressToSockaddr(bound_client_addr);
+    const client_conn = try client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa));
+    defer client_conn.deinit();
+    client_eng.startBackgroundLoops(io);
+
+    const server_conn = try server_eng.accept(io);
+    defer server_conn.deinit();
+
+    const expected_server_pid = try server_host_identity.peerId(allocator);
+    const expected_client_pid = try client_host_identity.peerId(allocator);
+
+    try std.testing.expect(client_conn.remotePeerId() != null);
+    try std.testing.expect(server_conn.remotePeerId() != null);
+    try std.testing.expect(client_conn.remotePeerId().?.eql(&expected_server_pid));
+    try std.testing.expect(server_conn.remotePeerId().?.eql(&expected_client_pid));
+
+    client_conn.close(io);
+    server_conn.close(io);
+    client_eng.stop(io);
+    server_eng.stop(io);
 }
 
 test "QUIC connection close cleanup" {
@@ -979,8 +1031,8 @@ test "QUIC connection close cleanup" {
     ctx.client_eng.deinit();
     ctx.server_conn.deinit();
     ctx.client_conn.deinit();
-    ssl.EVP_PKEY_free(ctx.server_host_key);
-    ssl.EVP_PKEY_free(ctx.client_host_key);
+    ctx.server_host_identity.deinit();
+    ctx.client_host_identity.deinit();
 }
 
 test "QUIC large message spanning multiple reads" {
@@ -1047,15 +1099,15 @@ test "QuicTransport dial and listen via multiaddr" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const server_host_key = tls.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(server_host_key);
-    const client_host_key = tls.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(client_host_key);
+    var server_host_identity = identity.KeyPair.generate(.ECDSA) catch return;
+    defer server_host_identity.deinit();
+    var client_host_identity = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client_host_identity.deinit();
 
     // Server transport: listen on /ip4/127.0.0.1/udp/0/quic-v1
     var server_transport = QuicTransport.init(allocator, .{
         .is_server = true,
-        .host_key = server_host_key,
+        .host_identity = &server_host_identity,
     });
 
     var listen_addr = Multiaddr.fromProtocols(allocator, &.{
@@ -1084,7 +1136,7 @@ test "QuicTransport dial and listen via multiaddr" {
     // Client transport: dial
     var client_transport = QuicTransport.init(allocator, .{
         .is_server = false,
-        .host_key = client_host_key,
+        .host_identity = &client_host_identity,
     });
 
     var dial_addr = Multiaddr.fromProtocols(allocator, &.{
@@ -1152,16 +1204,16 @@ test "QuicTransport listener supports additive IPv4 and IPv6 binds" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const server_host_key = tls.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(server_host_key);
-    const client4_host_key = tls.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(client4_host_key);
-    const client6_host_key = tls.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(client6_host_key);
+    var server_host_identity = identity.KeyPair.generate(.ECDSA) catch return;
+    defer server_host_identity.deinit();
+    var client4_host_identity = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client4_host_identity.deinit();
+    var client6_host_identity = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client6_host_identity.deinit();
 
     var server_transport = QuicTransport.init(allocator, .{
         .is_server = true,
-        .host_key = server_host_key,
+        .host_identity = &server_host_identity,
     });
 
     var listen_addr4 = Multiaddr.fromProtocols(allocator, &.{
@@ -1216,7 +1268,7 @@ test "QuicTransport listener supports additive IPv4 and IPv6 binds" {
 
     var client4_transport = QuicTransport.init(allocator, .{
         .is_server = false,
-        .host_key = client4_host_key,
+        .host_identity = &client4_host_identity,
     });
     var dial_addr4 = Multiaddr.fromProtocols(allocator, &.{
         .{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
@@ -1237,7 +1289,7 @@ test "QuicTransport listener supports additive IPv4 and IPv6 binds" {
 
     var client6_transport = QuicTransport.init(allocator, .{
         .is_server = false,
-        .host_key = client6_host_key,
+        .host_identity = &client6_host_identity,
     });
     var dial_addr6 = Multiaddr.fromProtocols(allocator, &.{
         .{ .Ip6 = Ip6Addr{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } },

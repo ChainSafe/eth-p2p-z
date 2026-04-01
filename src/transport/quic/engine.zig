@@ -5,6 +5,7 @@ const net = Io.net;
 
 const ssl = @import("ssl");
 const tls = @import("../../security/tls.zig");
+const identity = @import("../../identity.zig");
 const PeerId = @import("peer_id").PeerId;
 const keys = @import("peer_id").keys;
 
@@ -387,10 +388,9 @@ pub const QuicEngine = struct {
         alpn: [:0]const u8 = "libp2p",
         max_streams_per_conn: u32 = 100,
         idle_timeout_secs: u32 = 30,
-        /// Host identity key for TLS certificate generation.
-        /// If provided, a libp2p TLS certificate will be generated and loaded
-        /// into the SSL context. Required for completing TLS handshakes.
-        host_key: ?*ssl.EVP_PKEY = null,
+        /// libp2p host identity used to sign the libp2p TLS extension.
+        /// The engine always generates its own TLS subject key internally.
+        host_identity: ?*const identity.KeyPair = null,
     };
 
     pub fn init(allocator: Allocator, io: Io, config: Config) !*QuicEngine {
@@ -484,25 +484,24 @@ pub const QuicEngine = struct {
             customVerifyCallback,
         );
 
-        // Load libp2p TLS certificate if host key is provided
-        if (config.host_key) |host_key| {
+        // Load libp2p TLS certificate if a host identity is provided.
+        if (config.host_identity) |host_identity| {
             const subject_key = tls.generateKeyPair(.ECDSA) catch return error.KeyGenFailed;
             defer ssl.EVP_PKEY_free(subject_key);
 
-            var host_pubkey = tls.createProtobufEncodedPublicKey(allocator, host_key) catch
+            var host_pubkey = host_identity.publicKey(allocator) catch
                 return error.KeyEncodeFailed;
             defer if (host_pubkey.data) |d| allocator.free(d);
 
             const cert = tls.buildCert(
                 allocator,
                 &host_pubkey,
-                @as(?*anyopaque, @ptrCast(host_key)),
-                tls.signDataWithTlsKey,
+                @ptrCast(@constCast(host_identity)),
+                identity.signWithKeyPair,
                 subject_key,
             ) catch return error.CertBuildFailed;
             defer ssl.X509_free(cert);
 
-            // Debug: dump PEM cert for interop analysis
             if (tls.x509ToPem(allocator, cert)) |pem| {
                 defer allocator.free(pem);
                 log.debug("Generated TLS cert:\n{s}", .{pem});

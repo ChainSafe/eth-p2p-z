@@ -2,6 +2,7 @@ const std = @import("std");
 const ssl = @import("ssl");
 const secp = @import("secp256k1");
 const secp_context = @import("../secp_context.zig");
+const identity = @import("../identity.zig");
 const Allocator = std.mem.Allocator;
 const keys = @import("peer_id").keys;
 const PeerId = @import("peer_id").PeerId;
@@ -1135,6 +1136,59 @@ test "Verify certificate with RSA keys" {
     var expected_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
     defer std.testing.allocator.free(expected_pubkey.data.?);
     const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
+    try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
+}
+
+test "Build certificate using secp256k1 host key" {
+    var host_key = try identity.KeyPair.generate(.SECP256K1);
+    defer host_key.deinit();
+
+    const subject_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    var host_pubkey = try host_key.publicKey(std.testing.allocator);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @ptrCast(@constCast(&host_key)),
+        identity.signWithKeyPair,
+        subject_key,
+    );
+    defer ssl.X509_free(cert);
+
+    const pem_buf = try x509ToPem(std.testing.allocator, cert);
+    defer std.testing.allocator.free(pem_buf);
+    try std.testing.expect(pem_buf.len > 0);
+}
+
+test "Verify certificate with secp256k1 host key" {
+    var host_key = try identity.KeyPair.generate(.SECP256K1);
+    defer host_key.deinit();
+
+    const subject_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    var host_pubkey = try host_key.publicKey(std.testing.allocator);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @ptrCast(@constCast(&host_key)),
+        identity.signWithKeyPair,
+        subject_key,
+    );
+    defer ssl.X509_free(cert);
+
+    const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
+    std.testing.allocator.free(peer_info.host_pubkey.data.?);
+
+    try std.testing.expect(peer_info.is_valid);
+    try std.testing.expect(peer_info.host_pubkey.type == .SECP256K1);
+
+    const expected_peer_id = try host_key.peerId(std.testing.allocator);
     try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
 }
 

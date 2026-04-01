@@ -10,10 +10,10 @@ const identify_mod = @import("protocol/identify.zig");
 const engine_mod = @import("transport/quic/engine.zig");
 const QuicEngine = engine_mod.QuicEngine;
 const quic_mod = @import("transport/quic/quic.zig");
+const identity = @import("identity.zig");
 const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
-const ssl = @import("ssl");
 const net = Io.net;
 
 /// Configuration for comptime Switch composition.
@@ -26,7 +26,7 @@ pub const SwitchConfig = struct {
 
 /// Runtime configuration for the Switch's QUIC engine infrastructure.
 pub const EngineConfig = struct {
-    host_key: ?*ssl.EVP_PKEY = null,
+    host_identity: ?*const identity.KeyPair = null,
 };
 
 /// Comptime-composed libp2p Switch.
@@ -96,7 +96,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             if (self.server_engine == null) {
                 const eng = try QuicEngine.init(self.allocator, io, .{
                     .is_server = true,
-                    .host_key = self.engine_config.host_key,
+                    .host_identity = self.engine_config.host_identity,
                 });
                 self.server_engine = eng;
                 errdefer {
@@ -129,7 +129,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             if (self.client_engine == null) {
                 const eng = try QuicEngine.init(self.allocator, io, .{
                     .is_server = false,
-                    .host_key = self.engine_config.host_key,
+                    .host_identity = self.engine_config.host_identity,
                 });
                 self.client_engine = eng;
                 eng.startBackgroundLoops(io);
@@ -459,16 +459,15 @@ test "Switch comptime validation accepts valid config" {
 
 test "Swarm ping over QUIC" {
     const ping_mod = @import("protocol/ping.zig");
-    const tls_mod = @import("security/tls.zig");
     const ma = multiaddr;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(key1);
-    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(key2);
+    var key1 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer key1.deinit();
+    var key2 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer key2.deinit();
 
     const Node = Switch(.{
         .transports = &.{quic_mod.QuicTransport},
@@ -476,7 +475,7 @@ test "Swarm ping over QUIC" {
     });
 
     // Server
-    var server = Node.init(allocator, .{ .host_key = key1 }, .{ping_mod.Handler{}});
+    var server = Node.init(allocator, .{ .host_identity = &key1 }, .{ping_mod.Handler{}});
     defer server.deinit(io);
 
     var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
@@ -488,7 +487,7 @@ test "Swarm ping over QUIC" {
     server.listen(io, listen_addr) catch return;
 
     // Client
-    var client = Node.init(allocator, .{ .host_key = key2 }, .{ping_mod.Handler{}});
+    var client = Node.init(allocator, .{ .host_identity = &key2 }, .{ping_mod.Handler{}});
     defer client.deinit(io);
 
     const bound = server.listenAddrs();
@@ -517,16 +516,15 @@ test "Swarm ping over QUIC" {
 
 test "Swarm gossipsub subscription over QUIC" {
     const gossipsub_service = @import("protocol/gossipsub/service.zig");
-    const tls_mod = @import("security/tls.zig");
     const ma = multiaddr;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(key1);
-    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(key2);
+    var key1 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer key1.deinit();
+    var key2 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer key2.deinit();
 
     // Server gossipsub
     const svc1 = gossipsub_service.Service.init(allocator, .{}) catch return;
@@ -536,7 +534,7 @@ test "Swarm gossipsub subscription over QUIC" {
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{gossipsub_service.Handler},
     });
-    var server = Node.init(allocator, .{ .host_key = key1 }, .{gossipsub_service.Handler{ .svc = svc1 }});
+    var server = Node.init(allocator, .{ .host_identity = &key1 }, .{gossipsub_service.Handler{ .svc = svc1 }});
     defer server.deinit(io);
 
     var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
@@ -552,7 +550,7 @@ test "Swarm gossipsub subscription over QUIC" {
     defer svc2.deinit();
     svc2.subscribe("test-topic") catch return;
 
-    var client = Node.init(allocator, .{ .host_key = key2 }, .{gossipsub_service.Handler{ .svc = svc2 }});
+    var client = Node.init(allocator, .{ .host_identity = &key2 }, .{gossipsub_service.Handler{ .svc = svc2 }});
     defer client.deinit(io);
 
     const bound = server.listenAddrs();
@@ -599,21 +597,20 @@ test "Swarm gossipsub subscription over QUIC" {
 }
 
 test "Switch supports additive IPv4 and IPv6 listen sockets" {
-    const tls_mod = @import("security/tls.zig");
     const ma = multiaddr;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const key = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(key);
+    var key = identity.KeyPair.generate(.ECDSA) catch return;
+    defer key.deinit();
 
     const Node = Switch(.{
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{},
     });
 
-    var node = Node.init(allocator, .{ .host_key = key }, .{});
+    var node = Node.init(allocator, .{ .host_identity = &key }, .{});
     defer node.deinit(io);
 
     var listen_addr4 = ma.Multiaddr.fromProtocols(allocator, &.{
@@ -666,23 +663,22 @@ test "Switch supports additive IPv4 and IPv6 listen sockets" {
 
 test "Switch removes disconnected peers from the connection map" {
     const ping_mod = @import("protocol/ping.zig");
-    const tls_mod = @import("security/tls.zig");
     const ma = multiaddr;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(key1);
-    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(key2);
+    var key1 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer key1.deinit();
+    var key2 = identity.KeyPair.generate(.ECDSA) catch return;
+    defer key2.deinit();
 
     const Node = Switch(.{
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{ping_mod.Handler},
     });
 
-    var server = Node.init(allocator, .{ .host_key = key1 }, .{ping_mod.Handler{}});
+    var server = Node.init(allocator, .{ .host_identity = &key1 }, .{ping_mod.Handler{}});
     defer server.deinit(io);
 
     var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
@@ -693,7 +689,7 @@ test "Switch removes disconnected peers from the connection map" {
     defer listen_addr.deinit();
     try server.listen(io, listen_addr);
 
-    var client = Node.init(allocator, .{ .host_key = key2 }, .{ping_mod.Handler{}});
+    var client = Node.init(allocator, .{ .host_identity = &key2 }, .{ping_mod.Handler{}});
     defer client.deinit(io);
 
     const bound = server.listenAddrs();
