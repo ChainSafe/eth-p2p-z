@@ -5,6 +5,7 @@ const net = Io.net;
 const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
 const Ip4Addr = multiaddr.Ip4Addr;
+const Ip6Addr = multiaddr.Ip6Addr;
 
 const PeerId = @import("peer_id").PeerId;
 const ssl = @import("ssl");
@@ -113,7 +114,6 @@ pub const Connection = struct {
 /// QUIC listener that accepts incoming connections.
 pub const Listener = struct {
     engine: *QuicEngine,
-    local_address: ?net.IpAddress,
     owns_engine: bool = true,
 
     pub fn accept(self: *Listener, io: Io) !Connection {
@@ -136,7 +136,16 @@ pub const Listener = struct {
     }
 
     pub fn localAddr(self: *const Listener) ?net.IpAddress {
-        return self.local_address;
+        return self.engine.localAddr();
+    }
+
+    pub fn localAddrs(self: *const Listener) []const net.IpAddress {
+        return self.engine.localAddrs();
+    }
+
+    pub fn addAddress(self: *Listener, io: Io, addr: Multiaddr) !net.IpAddress {
+        const parsed = try parseQuicMultiaddr(addr);
+        return self.engine.bindSocket(io, &parsed.ip);
     }
 };
 
@@ -171,12 +180,11 @@ pub const QuicTransport = struct {
         errdefer eng.deinit();
 
         // Bind to ephemeral port (0)
-        const local = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
-        try eng.bindSocket(io, &local);
+        const local = unspecifiedForFamily(parsed.ip);
+        const local_bound = try eng.bindSocket(io, &local);
 
         // Convert target and local addresses to sockaddr
         var remote_sa = engine_mod.ipAddressToSockaddr(parsed.ip);
-        const local_bound = (eng.socket orelse return error.NoSocket).address;
         var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
         const conn = try eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa));
 
@@ -197,15 +205,27 @@ pub const QuicTransport = struct {
         errdefer eng.deinit();
 
         // Bind to the requested address
-        try eng.bindSocket(io, &parsed.ip);
+        _ = try eng.bindSocket(io, &parsed.ip);
 
         // Start receive and timer loops (stored in engine.background)
         eng.startBackgroundLoops(io);
 
         return .{
             .engine = eng,
-            .local_address = if (eng.socket) |s| s.address else null,
         };
+    }
+
+    pub fn listenMany(self: *QuicTransport, io: Io, addrs: []const Multiaddr) !quic.Listener {
+        if (addrs.len == 0) return error.NoListenAddresses;
+
+        var listener = try self.listen(io, addrs[0]);
+        errdefer listener.deinit(io);
+
+        for (addrs[1..]) |addr| {
+            _ = try listener.addAddress(io, addr);
+        }
+
+        return listener;
     }
 
     /// Check if a multiaddr represents a QUIC address.
@@ -263,6 +283,13 @@ pub fn parseQuicMultiaddr(addr: Multiaddr) !ParsedQuicAddr {
         return .{ .ip = .{ .ip6 = .{ .bytes = bytes, .port = port } } };
     }
     return error.MissingIpAddress;
+}
+
+fn unspecifiedForFamily(addr: net.IpAddress) net.IpAddress {
+    return switch (addr) {
+        .ip4 => .{ .ip4 = net.Ip4Address.unspecified(0) },
+        .ip6 => .{ .ip6 = net.Ip6Address.unspecified(0) },
+    };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -329,7 +356,7 @@ test "QUIC engine socket binding" {
 
     // Bind to loopback ephemeral port
     const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
-    eng.bindSocket(io, &addr) catch |err| {
+    _ = eng.bindSocket(io, &addr) catch |err| {
         std.log.warn("bindSocket failed: {}", .{err});
         return;
     };
@@ -353,7 +380,7 @@ test "QUIC engine background loops start and stop" {
     };
 
     const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
-    eng.bindSocket(io, &addr) catch |err| {
+    _ = eng.bindSocket(io, &addr) catch |err| {
         std.log.warn("bindSocket failed: {}", .{err});
         eng.deinit();
         return;
@@ -381,7 +408,7 @@ test "QUIC engine client connect initiates handshake" {
     };
 
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
-    eng.bindSocket(io, &addr) catch |err| {
+    _ = eng.bindSocket(io, &addr) catch |err| {
         std.log.warn("bindSocket failed: {}", .{err});
         eng.deinit();
         return;
@@ -456,7 +483,7 @@ test "QUIC full handshake between server and client" {
     };
     // Bind server to loopback ephemeral port
     const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
-    server_eng.bindSocket(io, &server_addr) catch |err| {
+    _ = server_eng.bindSocket(io, &server_addr) catch |err| {
         std.log.warn("Server bindSocket failed: {}", .{err});
         server_eng.deinit();
         return;
@@ -487,7 +514,7 @@ test "QUIC full handshake between server and client" {
     };
     // Bind client to ephemeral port
     const client_addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
-    client_eng.bindSocket(io, &client_addr) catch |err| {
+    _ = client_eng.bindSocket(io, &client_addr) catch |err| {
         std.log.warn("Client bindSocket failed: {}", .{err});
         client_eng.deinit();
         server_eng.stop(io);
@@ -562,7 +589,7 @@ test "QUIC stream read/write round-trip" {
         .host_key = server_host_key,
     }) catch return;
     const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
-    server_eng.bindSocket(io, &server_addr) catch {
+    _ = server_eng.bindSocket(io, &server_addr) catch {
         server_eng.deinit();
         return;
     };
@@ -584,7 +611,7 @@ test "QUIC stream read/write round-trip" {
         server_eng.deinit();
         return;
     };
-    client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
+    _ = client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
         client_eng.deinit();
         server_eng.stop(io);
         server_eng.deinit();
@@ -762,7 +789,7 @@ const TestContext = struct {
         });
         errdefer server_eng.deinit();
         const server_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
-        try server_eng.bindSocket(io, &server_addr);
+        _ = try server_eng.bindSocket(io, &server_addr);
         server_eng.startBackgroundLoops(io);
 
         const server_port = switch ((server_eng.socket orelse return error.NoSocket).address) {
@@ -778,7 +805,7 @@ const TestContext = struct {
             client_eng.deinit();
             server_eng.stop(io);
         }
-        try client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
+        _ = try client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
 
         const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
         var remote_sa = engine_mod.ipAddressToSockaddr(remote);
@@ -1119,4 +1146,118 @@ test "QuicTransport dial and listen via multiaddr" {
     server_conn.deinit(io);
     client_conn.deinit(io);
     listener.deinit(io);
+}
+
+test "QuicTransport listener supports additive IPv4 and IPv6 binds" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const server_host_key = tls.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(server_host_key);
+    const client4_host_key = tls.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(client4_host_key);
+    const client6_host_key = tls.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(client6_host_key);
+
+    var server_transport = QuicTransport.init(allocator, .{
+        .is_server = true,
+        .host_key = server_host_key,
+    });
+
+    var listen_addr4 = Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr4.deinit();
+
+    var listener = server_transport.listen(io, listen_addr4) catch |err| {
+        std.log.warn("listen failed: {}", .{err});
+        return;
+    };
+    defer listener.deinit(io);
+
+    const first_addr = listener.localAddr() orelse return;
+    const port = switch (first_addr) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    try std.testing.expect(port > 0);
+
+    var listen_addr6 = Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip6 = Ip6Addr{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr6.deinit();
+
+    _ = listener.addAddress(io, listen_addr6) catch |err| {
+        std.log.warn("IPv6 additive listen unavailable in test environment: {}", .{err});
+        return;
+    };
+
+    const bound_addrs = listener.localAddrs();
+    try std.testing.expectEqual(@as(usize, 2), bound_addrs.len);
+
+    var saw_ip4 = false;
+    var saw_ip6 = false;
+    for (bound_addrs) |addr| switch (addr) {
+        .ip4 => |a| {
+            saw_ip4 = true;
+            try std.testing.expectEqual(port, a.port);
+        },
+        .ip6 => |a| {
+            saw_ip6 = true;
+            try std.testing.expectEqual(port, a.port);
+        },
+    };
+    try std.testing.expect(saw_ip4);
+    try std.testing.expect(saw_ip6);
+
+    var client4_transport = QuicTransport.init(allocator, .{
+        .is_server = false,
+        .host_key = client4_host_key,
+    });
+    var dial_addr4 = Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr4.deinit();
+    var client4_conn = client4_transport.dial(io, dial_addr4) catch |err| {
+        std.log.warn("IPv4 dial failed: {}", .{err});
+        return;
+    };
+    defer client4_conn.deinit(io);
+    var server4_conn = listener.accept(io) catch |err| {
+        std.log.warn("IPv4 accept failed: {}", .{err});
+        return;
+    };
+    defer server4_conn.deinit(io);
+
+    var client6_transport = QuicTransport.init(allocator, .{
+        .is_server = false,
+        .host_key = client6_host_key,
+    });
+    var dial_addr6 = Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip6 = Ip6Addr{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr6.deinit();
+    var client6_conn = client6_transport.dial(io, dial_addr6) catch |err| {
+        std.log.warn("IPv6 dial failed: {}", .{err});
+        return;
+    };
+    defer client6_conn.deinit(io);
+    var server6_conn = listener.accept(io) catch |err| {
+        std.log.warn("IPv6 accept failed: {}", .{err});
+        return;
+    };
+    defer server6_conn.deinit(io);
+
+    try std.testing.expect(client4_conn.remotePeerId() != null);
+    try std.testing.expect(server4_conn.remotePeerId() != null);
+    try std.testing.expect(client6_conn.remotePeerId() != null);
+    try std.testing.expect(server6_conn.remotePeerId() != null);
 }

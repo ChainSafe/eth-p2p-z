@@ -346,7 +346,7 @@ pub const CertVerifyCtx = struct {
 
 /// Bridges lsquic's C callback model with Zig's std.Io suspension model.
 ///
-/// The engine owns a UDP socket, the lsquic_engine_t, and manages the
+/// The engine owns one or more UDP sockets, the lsquic_engine_t, and manages the
 /// lifecycle of connections and streams. It runs two concurrent tasks:
 ///   1. UDP receive loop: reads datagrams -> feeds to lsquic
 ///   2. Engine process loop: timer-driven lsquic_engine_process_conns()
@@ -361,6 +361,8 @@ pub const QuicEngine = struct {
     conn_queue_buf: [16]ConnEvent,
     conn_queue: Io.Queue(ConnEvent),
     socket: ?net.Socket,
+    sockets: std.ArrayList(net.Socket),
+    bound_addrs: std.ArrayList(net.IpAddress),
     io: Io,
     is_server: bool,
     running: bool,
@@ -418,6 +420,8 @@ pub const QuicEngine = struct {
         self.cert_verify_ctx = CertVerifyCtx.init(allocator);
         self.conn_queue_buf = undefined;
         self.socket = null;
+        self.sockets = .empty;
+        self.bound_addrs = .empty;
         self.io = io;
         self.is_server = config.is_server;
         self.running = false;
@@ -549,6 +553,11 @@ pub const QuicEngine = struct {
     }
 
     pub fn deinit(self: *QuicEngine) void {
+        for (self.sockets.items) |sock| {
+            sock.close(self.io);
+        }
+        self.sockets.deinit(self.allocator);
+        self.bound_addrs.deinit(self.allocator);
         lsquic.lsquic_engine_destroy(self.engine);
         ssl.SSL_CTX_free(self.ssl_ctx);
         self.cert_verify_ctx.deinit();
@@ -616,26 +625,58 @@ pub const QuicEngine = struct {
     /// Start the background receive and timer loops.
     /// Must be called after bindSocket().
     pub fn startBackgroundLoops(self: *QuicEngine, io: Io) void {
+        if (self.running) return;
         self.running = true;
-        self.background.async(io, QuicEngine.runReceiveLoop, .{ self, io });
+        for (self.sockets.items) |sock| {
+            self.background.async(io, QuicEngine.runReceiveLoop, .{ self, io, sock });
+        }
         self.background.async(io, QuicEngine.runTimerLoop, .{ self, io });
     }
 
     /// Bind a UDP socket.
     /// The socket is managed by std.Io which handles blocking/non-blocking internally.
     /// For the C callback packetsOut, we use std.c.sendmsg directly which handles EAGAIN.
-    pub fn bindSocket(self: *QuicEngine, io: Io, address: *const net.IpAddress) !void {
+    pub fn bindSocket(self: *QuicEngine, io: Io, address: *const net.IpAddress) !net.IpAddress {
         const sock = try net.IpAddress.bind(address, io, .{ .mode = .dgram });
-        self.socket = sock;
+        errdefer sock.close(io);
+        try self.sockets.append(self.allocator, sock);
+        errdefer _ = self.sockets.pop();
+        try self.bound_addrs.append(self.allocator, sock.address);
+        errdefer _ = self.bound_addrs.pop();
+
+        if (self.socket == null) {
+            self.socket = sock;
+        }
+        if (self.running) {
+            self.background.async(io, QuicEngine.runReceiveLoop, .{ self, io, sock });
+        }
+        return sock.address;
+    }
+
+    pub fn localAddr(self: *const QuicEngine) ?net.IpAddress {
+        return if (self.bound_addrs.items.len > 0) self.bound_addrs.items[0] else null;
+    }
+
+    pub fn localAddrs(self: *const QuicEngine) []const net.IpAddress {
+        return self.bound_addrs.items;
+    }
+
+    pub fn socketForFamily(self: *const QuicEngine, family: net.IpAddress.Family) ?net.Socket {
+        for (self.sockets.items) |sock| {
+            switch (sock.address) {
+                .ip4 => if (family == .ip4) return sock,
+                .ip6 => if (family == .ip6) return sock,
+            }
+        }
+        return null;
     }
 
     /// Run the UDP receive loop: reads datagrams and feeds them to lsquic.
     /// This should be spawned via Group.async.
-    pub fn runReceiveLoop(self: *QuicEngine, io: Io) void {
+    pub fn runReceiveLoop(self: *QuicEngine, io: Io, sock: net.Socket) void {
         log.debug("runReceiveLoop started", .{});
         while (self.running) {
             var buf: [65535]u8 = undefined;
-            const sock = self.socket orelse return;
             const msg = sock.receive(io, &buf) catch |err| {
                 switch (err) {
                     error.Canceled => {
@@ -1010,7 +1051,6 @@ pub const QuicEngine = struct {
     ) callconv(.c) c_int {
         log.debug("packetsOut called, count={}", .{count});
         const engine: *QuicEngine = @ptrCast(@alignCast(packets_out_ctx));
-        const sock = engine.socket orelse return -1;
 
         var sent: c_int = 0;
         var i: c_uint = 0;
@@ -1028,6 +1068,13 @@ pub const QuicEngine = struct {
                 else => 0,
             } else 0;
 
+            const local_sa: ?*const std.c.sockaddr = @ptrCast(@alignCast(spec.local_sa));
+            const local_addr = if (local_sa) |lsa|
+                sockaddrToIpAddress(lsa) orelse return -1
+            else
+                return -1;
+            const sock = engine.findSocketForLocalAddr(local_addr) orelse return -1;
+
             const rc = std.c.sendmsg(sock.handle, &msg, 0);
             if (rc < 0) {
                 const e: std.c.E = @enumFromInt(std.c._errno().*);
@@ -1043,6 +1090,16 @@ pub const QuicEngine = struct {
             sent += 1;
         }
         return sent;
+    }
+
+    fn findSocketForLocalAddr(self: *const QuicEngine, addr: net.IpAddress) ?net.Socket {
+        for (self.sockets.items, self.bound_addrs.items) |sock, bound_addr| {
+            if (ipAddressEql(bound_addr, addr)) return sock;
+        }
+        for (self.sockets.items, self.bound_addrs.items) |sock, bound_addr| {
+            if (sameFamilyAndPort(bound_addr, addr)) return sock;
+        }
+        return null;
     }
 
     fn getSslCtx(peer_ctx: ?*anyopaque, _: ?*const lsquic.struct_sockaddr) callconv(.c) ?*lsquic.struct_ssl_ctx_st {
@@ -1158,6 +1215,63 @@ pub fn ipAddressToSockaddr(addr: net.IpAddress) SockaddrStorage {
         },
     }
     return storage;
+}
+
+fn sockaddrToIpAddress(addr: *const std.c.sockaddr) ?net.IpAddress {
+    return switch (addr.family) {
+        std.posix.AF.INET => blk: {
+            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(addr));
+            break :blk .{
+                .ip4 = .{
+                    .port = std.mem.bigToNative(u16, in.port),
+                    .bytes = @bitCast(in.addr),
+                },
+            };
+        },
+        std.posix.AF.INET6 => blk: {
+            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+            break :blk .{
+                .ip6 = .{
+                    .port = std.mem.bigToNative(u16, in6.port),
+                    .bytes = in6.addr,
+                    .flow = in6.flowinfo,
+                    .interface = .{ .index = in6.scope_id },
+                },
+            };
+        },
+        else => null,
+    };
+}
+
+fn ipAddressEql(a: net.IpAddress, b: net.IpAddress) bool {
+    return switch (a) {
+        .ip4 => |a4| switch (b) {
+            .ip4 => |b4| a4.port == b4.port and std.mem.eql(u8, &a4.bytes, &b4.bytes),
+            .ip6 => false,
+        },
+        .ip6 => |a6| switch (b) {
+            .ip4 => false,
+            .ip6 => |b6| {
+                return a6.port == b6.port and
+                    a6.flow == b6.flow and
+                    a6.interface.index == b6.interface.index and
+                    std.mem.eql(u8, &a6.bytes, &b6.bytes);
+            },
+        },
+    };
+}
+
+fn sameFamilyAndPort(a: net.IpAddress, b: net.IpAddress) bool {
+    return switch (a) {
+        .ip4 => |a4| switch (b) {
+            .ip4 => |b4| a4.port == b4.port,
+            .ip6 => false,
+        },
+        .ip6 => |a6| switch (b) {
+            .ip4 => false,
+            .ip6 => |b6| a6.port == b6.port,
+        },
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

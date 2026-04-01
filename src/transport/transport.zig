@@ -57,7 +57,7 @@ fn assertErrorUnionPayload(comptime owner: type, comptime name: []const u8, comp
 /// A Transport must provide:
 ///   - Connection type with: openStream, acceptStream, close, remotePeerId
 ///   - Stream type with: read, write, closeRead, closeWrite, close
-///   - Listener type with: accept, close, localAddr
+///   - Listener type with: accept, close, localAddrs
 ///   - fn dial(self: *Self, io: std.Io, addr: Multiaddr) DialError!Connection
 ///   - fn listen(self: *Self, io: std.Io, addr: Multiaddr) ListenError!Listener
 ///   - fn matchesMultiaddr(addr: Multiaddr) bool
@@ -149,15 +149,15 @@ pub fn assertTransportInterface(comptime T: type) void {
     if (!@hasDecl(Listener, "close")) {
         @compileError("Listener type of '" ++ @typeName(T) ++ "' missing 'close'");
     }
-    if (!@hasDecl(Listener, "localAddr")) {
-        @compileError("Listener type of '" ++ @typeName(T) ++ "' missing 'localAddr'");
+    if (!@hasDecl(Listener, "localAddrs")) {
+        @compileError("Listener type of '" ++ @typeName(T) ++ "' missing 'localAddrs'");
     }
     assertFnParamTypes(Listener, "accept", &.{ *Listener, Io });
     assertErrorUnionPayload(Listener, "accept", Conn);
     assertFnParamTypes(Listener, "close", &.{ *Listener, Io });
     assertReturnType(Listener, "close", void);
-    assertFnParamTypes(Listener, "localAddr", &.{*const Listener});
-    assertReturnType(Listener, "localAddr", ?Io.net.IpAddress);
+    assertFnParamTypes(Listener, "localAddrs", &.{*const Listener});
+    assertReturnType(Listener, "localAddrs", []const Io.net.IpAddress);
 
     assertFnParamTypes(T, "dial", &.{ *T, Io, Multiaddr });
     assertErrorUnionPayload(T, "dial", Conn);

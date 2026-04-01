@@ -99,22 +99,25 @@ pub fn Switch(comptime config: SwitchConfig) type {
                     .host_key = self.engine_config.host_key,
                 });
                 self.server_engine = eng;
-            } else {
-                return error.AlreadyListening;
+                errdefer {
+                    eng.deinit();
+                    self.server_engine = null;
+                }
+
+                _ = try eng.bindSocket(io, &parsed.ip);
+                eng.startBackgroundLoops(io);
+                self.background.async(io, Self.acceptLoop, .{ self, io });
+                return;
             }
 
             const eng = self.server_engine.?;
-            try eng.bindSocket(io, &parsed.ip);
-            eng.startBackgroundLoops(io);
-
-            self.background.async(io, Self.acceptLoop, .{ self, io });
+            _ = try eng.bindSocket(io, &parsed.ip);
         }
 
-        /// Returns the server engine's bound address (useful for port-0 tests).
-        pub fn listenAddrs(self: *const Self) ?net.IpAddress {
-            const eng = self.server_engine orelse return null;
-            const sock = eng.socket orelse return null;
-            return sock.address;
+        /// Returns all server engine listen addresses (useful for port-0 tests).
+        pub fn listenAddrs(self: *const Self) []const net.IpAddress {
+            const eng = self.server_engine orelse return &.{};
+            return eng.localAddrs();
         }
 
         /// Dial a remote peer via QUIC multiaddr.
@@ -128,14 +131,13 @@ pub fn Switch(comptime config: SwitchConfig) type {
                     .is_server = false,
                     .host_key = self.engine_config.host_key,
                 });
-                try eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
-                eng.startBackgroundLoops(io);
                 self.client_engine = eng;
+                eng.startBackgroundLoops(io);
             }
 
             const eng = self.client_engine.?;
+            const local_bound = try ensureClientLocalAddr(eng, io, parsed.ip);
             var remote_sa = engine_mod.ipAddressToSockaddr(parsed.ip);
-            const local_bound = (eng.socket orelse return error.NoSocket).address;
             var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
             const conn = try eng.connect(io, @ptrCast(@alignCast(&remote_sa)), @ptrCast(@alignCast(&local_sa)));
             errdefer {
@@ -370,6 +372,20 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 }
             }
         }
+
+        fn ensureClientLocalAddr(eng: *QuicEngine, io: Io, remote: net.IpAddress) !net.IpAddress {
+            const existing = switch (remote) {
+                .ip4 => eng.socketForFamily(.ip4),
+                .ip6 => eng.socketForFamily(.ip6),
+            };
+            if (existing) |sock| return sock.address;
+
+            const bind_addr: net.IpAddress = switch (remote) {
+                .ip4 => .{ .ip4 = net.Ip4Address.unspecified(0) },
+                .ip6 => .{ .ip6 = net.Ip6Address.unspecified(0) },
+            };
+            return eng.bindSocket(io, &bind_addr);
+        }
     };
 }
 
@@ -407,8 +423,8 @@ test "Switch comptime validation accepts valid config" {
                 return .{};
             }
             pub fn close(_: *@This(), _: Io) void {}
-            pub fn localAddr(_: *const @This()) ?net.IpAddress {
-                return null;
+            pub fn localAddrs(_: *const @This()) []const net.IpAddress {
+                return &.{};
             }
         };
         pub fn dial(_: *@This(), _: Io, _: Multiaddr) !Connection {
@@ -475,8 +491,9 @@ test "Swarm ping over QUIC" {
     var client = Node.init(allocator, .{ .host_key = key2 }, .{ping_mod.Handler{}});
     defer client.deinit(io);
 
-    const bound = server.listenAddrs() orelse return;
-    const port = switch (bound) {
+    const bound = server.listenAddrs();
+    if (bound.len == 0) return;
+    const port = switch (bound[0]) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
@@ -538,8 +555,9 @@ test "Swarm gossipsub subscription over QUIC" {
     var client = Node.init(allocator, .{ .host_key = key2 }, .{gossipsub_service.Handler{ .svc = svc2 }});
     defer client.deinit(io);
 
-    const bound = server.listenAddrs() orelse return;
-    const port = switch (bound) {
+    const bound = server.listenAddrs();
+    if (bound.len == 0) return;
+    const port = switch (bound[0]) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
@@ -580,7 +598,7 @@ test "Swarm gossipsub subscription over QUIC" {
     server.close(io);
 }
 
-test "Switch rejects repeated listen on the same node" {
+test "Switch supports additive IPv4 and IPv6 listen sockets" {
     const tls_mod = @import("security/tls.zig");
     const ma = multiaddr;
 
@@ -598,15 +616,52 @@ test "Switch rejects repeated listen on the same node" {
     var node = Node.init(allocator, .{ .host_key = key }, .{});
     defer node.deinit(io);
 
-    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+    var listen_addr4 = ma.Multiaddr.fromProtocols(allocator, &.{
         .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
         .{ .Udp = 0 },
         .QuicV1,
     }) catch return;
-    defer listen_addr.deinit();
+    defer listen_addr4.deinit();
 
-    try node.listen(io, listen_addr);
-    try std.testing.expectError(error.AlreadyListening, node.listen(io, listen_addr));
+    try node.listen(io, listen_addr4);
+
+    const addrs4 = node.listenAddrs();
+    try std.testing.expectEqual(@as(usize, 1), addrs4.len);
+    const port = switch (addrs4[0]) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    try std.testing.expect(port > 0);
+
+    var listen_addr6 = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip6 = ma.Ip6Addr{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr6.deinit();
+
+    node.listen(io, listen_addr6) catch |err| {
+        std.log.warn("IPv6 additive listen unavailable in test environment: {}", .{err});
+        return;
+    };
+
+    const addrs = node.listenAddrs();
+    try std.testing.expectEqual(@as(usize, 2), addrs.len);
+
+    var saw_ip4 = false;
+    var saw_ip6 = false;
+    for (addrs) |addr| switch (addr) {
+        .ip4 => |a| {
+            saw_ip4 = true;
+            try std.testing.expectEqual(port, a.port);
+        },
+        .ip6 => |a| {
+            saw_ip6 = true;
+            try std.testing.expectEqual(port, a.port);
+        },
+    };
+    try std.testing.expect(saw_ip4);
+    try std.testing.expect(saw_ip6);
 }
 
 test "Switch removes disconnected peers from the connection map" {
@@ -641,8 +696,9 @@ test "Switch removes disconnected peers from the connection map" {
     var client = Node.init(allocator, .{ .host_key = key2 }, .{ping_mod.Handler{}});
     defer client.deinit(io);
 
-    const bound = server.listenAddrs() orelse return;
-    const port = switch (bound) {
+    const bound = server.listenAddrs();
+    if (bound.len == 0) return;
+    const port = switch (bound[0]) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
