@@ -388,18 +388,25 @@ pub const CertVerifyCtx = struct {
             try self.pending_server_verified.append(self.allocator, peer);
             return;
         }
+        // For client connections, also use a FIFO rather than keying by conn
+        // pointer. lsquic promotes mini-conns to full-conns during the
+        // handshake, so the pointer from lsquic_ssl_to_conn in the verify
+        // callback may differ from the lc passed to on_hsk_done.
         const gop = try self.verified_by_conn.getOrPut(connKey(lc));
         if (gop.found_existing) {
             if (gop.value_ptr.host_pubkey.data) |d| self.allocator.free(d);
         }
         gop.value_ptr.* = peer;
+        // Also append to the pending list as a fallback for conn-pointer mismatch.
+        try self.pending_server_verified.append(self.allocator, peer);
     }
 
     pub fn takeVerified(self: *CertVerifyCtx, lc: *lsquic.lsquic_conn_t) ?VerifiedPeer {
-        return if (self.verified_by_conn.fetchRemove(connKey(lc))) |entry|
-            entry.value
-        else
-            null;
+        // Try exact conn pointer match first (works when lsquic doesn't promote).
+        if (self.verified_by_conn.fetchRemove(connKey(lc))) |entry|
+            return entry.value;
+        // Fall back to FIFO for client connections where the pointer changed.
+        return self.takeNextServerVerified();
     }
 
     pub fn discardVerified(self: *CertVerifyCtx, lc: *lsquic.lsquic_conn_t) void {
@@ -682,8 +689,10 @@ pub const QuicEngine = struct {
         conn.lsquic_conn = lc;
         lsquic.lsquic_conn_set_ctx(lc, @ptrCast(conn));
 
-        // Process the connection to trigger handshake
-        lsquic.lsquic_engine_process_conns(self.engine);
+        // Process the connection to trigger handshake.
+        // Must go through processEngine() to respect the reentrancy guard —
+        // runTimerLoop/runReceiveLoop may already be inside process_conns.
+        self.processEngine();
 
         return conn;
     }
