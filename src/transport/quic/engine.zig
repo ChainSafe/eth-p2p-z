@@ -46,6 +46,36 @@ fn tryQueueOneUncancelable(comptime Elem: type, queue: *Io.Queue(Elem), io: Io, 
     return (try queue.putUncancelable(io, &.{item}, 0)) == 1;
 }
 
+const unsent_retry_interval_ms: i64 = 10;
+
+const ProcessWait = union(enum) {
+    immediate,
+    indefinite,
+    timeout_us: i64,
+};
+
+fn computeProcessWait(advisory_diff_us: ?c_int, has_unsent: bool) ProcessWait {
+    if (advisory_diff_us) |diff| {
+        if (diff <= 0) return .immediate;
+        const advisory_us: i64 = @intCast(diff);
+        if (has_unsent) {
+            return .{ .timeout_us = @min(advisory_us, unsent_retry_interval_ms * std.time.us_per_ms) };
+        }
+        return .{ .timeout_us = advisory_us };
+    }
+    if (has_unsent) {
+        return .{ .timeout_us = unsent_retry_interval_ms * std.time.us_per_ms };
+    }
+    return .indefinite;
+}
+
+fn timeoutFromMicroseconds(us: i64) Io.Timeout {
+    return .{ .duration = .{
+        .raw = Io.Duration.fromNanoseconds(@as(i96, us) * std.time.ns_per_us),
+        .clock = .awake,
+    } };
+}
+
 fn receiveLoopBackoffMs(consecutive_errors: u32) u64 {
     if (consecutive_errors == 0) return 0;
     const shift: u6 = @intCast(@min(consecutive_errors - 1, 63));
@@ -168,6 +198,7 @@ pub const QuicStream = struct {
         if (written < 0) return error.WriteFailed;
         if (written > 0) {
             _ = lsquic.lsquic_stream_flush(ls);
+            self.conn.engine.requestProcessWake();
         }
         return @intCast(written);
     }
@@ -179,6 +210,7 @@ pub const QuicStream = struct {
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_shutdown(ls, 0);
                 _ = lsquic.lsquic_stream_wantread(ls, 0);
+                self.conn.engine.requestProcessWake();
             }
         }
         self.read_queue.close(self.conn.engine.io);
@@ -190,6 +222,7 @@ pub const QuicStream = struct {
         if (self.lsquic_stream) |ls| {
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_shutdown(ls, 1);
+                self.conn.engine.requestProcessWake();
             }
         }
     }
@@ -202,6 +235,7 @@ pub const QuicStream = struct {
             // which must later call deinit() once it is done with the wrapper.
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_close(ls);
+                self.conn.engine.requestProcessWake();
             }
         }
     }
@@ -281,6 +315,7 @@ pub const QuicConnection = struct {
         if (self.closed) return error.ConnectionClosed;
         const lc = self.lsquic_conn orelse return error.ConnectionClosed;
         lsquic.lsquic_conn_make_stream(lc);
+        self.engine.requestProcessWake();
         // Let the background timer loop call processEngine to create the stream
         // via onNewStream. Calling processEngine synchronously here can crash
         // inside lsquic's SSL post-handshake processing when the crypto stream
@@ -309,6 +344,7 @@ pub const QuicConnection = struct {
             lsquic.lsquic_conn_set_ctx(lc, null);
             lsquic.lsquic_conn_close(lc);
             self.lsquic_conn = null;
+            self.engine.requestProcessWake();
         }
         self.closed = true;
         self.stream_queue.close(io);
@@ -523,6 +559,7 @@ pub const QuicEngine = struct {
     is_server: bool,
     running: bool,
     has_unsent: bool,
+    process_wake: Io.Event,
     /// Server-side connection pending to be pushed to conn_queue.
     /// Set in onNewConn callback (which runs inside lsquic_engine_process_conns),
     /// consumed by processEngine() after lsquic returns to avoid re-entrancy.
@@ -581,6 +618,7 @@ pub const QuicEngine = struct {
         self.is_server = config.is_server;
         self.running = false;
         self.has_unsent = false;
+        self.process_wake = .unset;
         self.processing = false;
         self.pending_server_conn = null;
         self.background = .init;
@@ -909,34 +947,26 @@ pub const QuicEngine = struct {
         log.debug("runTimerLoop started", .{});
         while (self.running) {
             var diff: c_int = 0;
-            if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) {
-                // lsquic wants us to call process_conns after `diff` microseconds
-                const us: i64 = if (diff > 0) @intCast(diff) else 0;
-                const sleep_timeout: Io.Timeout = .{
-                    .duration = .{
-                        .raw = Io.Duration.fromNanoseconds(@as(i96, us) * std.time.ns_per_us),
-                        .clock = .awake,
-                    },
-                };
-                sleep_timeout.sleep(io) catch |err| switch (err) {
+            const advisory_diff = if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) diff else null;
+            switch (computeProcessWait(advisory_diff, self.has_unsent)) {
+                .immediate => {},
+                .indefinite => self.process_wake.wait(io) catch |err| switch (err) {
                     error.Canceled => return,
-                };
-            } else {
-                // No connections to process; sleep a short interval
-                const sleep_timeout: Io.Timeout = .{
-                    .duration = .{
-                        .raw = Io.Duration.fromMilliseconds(50),
-                        .clock = .awake,
-                    },
-                };
-                sleep_timeout.sleep(io) catch |err| switch (err) {
+                },
+                .timeout_us => |us| self.process_wake.waitTimeout(io, timeoutFromMicroseconds(us)) catch |err| switch (err) {
+                    error.Timeout => {},
                     error.Canceled => return,
-                };
+                },
             }
 
+            self.process_wake.reset();
             if (!self.running) return;
             self.processEngine();
         }
+    }
+
+    fn requestProcessWake(self: *QuicEngine) void {
+        self.process_wake.set(self.io);
     }
 
     /// Process lsquic connections and retry unsent packets if needed.
@@ -1360,6 +1390,7 @@ pub const QuicEngine = struct {
                     // Flag unsent packets so the timer loop can retry
                     // via lsquic_engine_send_unsent_packets().
                     engine.has_unsent = true;
+                    engine.requestProcessWake();
                     return sent;
                 }
                 return -1;
@@ -1686,6 +1717,32 @@ test "isTerminalReceiveError only treats broken local socket as terminal" {
     try std.testing.expect(!isTerminalReceiveError(error.ConnectionResetByPeer));
     try std.testing.expect(!isTerminalReceiveError(error.NetworkDown));
     try std.testing.expect(!isTerminalReceiveError(error.SystemResources));
+}
+
+test "computeProcessWait prefers explicit wake, advisory tick, and unsent retry appropriately" {
+    try std.testing.expectEqual(ProcessWait.immediate, computeProcessWait(0, false));
+    try std.testing.expectEqual(ProcessWait.immediate, computeProcessWait(-5, true));
+    try std.testing.expectEqual(ProcessWait.indefinite, computeProcessWait(null, false));
+
+    switch (computeProcessWait(25_000, false)) {
+        .timeout_us => |us| try std.testing.expectEqual(@as(i64, 25_000), us),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (computeProcessWait(null, true)) {
+        .timeout_us => |us| try std.testing.expectEqual(unsent_retry_interval_ms * std.time.us_per_ms, us),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (computeProcessWait(25_000, true)) {
+        .timeout_us => |us| try std.testing.expectEqual(@as(i64, 10_000), us),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (computeProcessWait(5_000, true)) {
+        .timeout_us => |us| try std.testing.expectEqual(@as(i64, 5_000), us),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "QuicEngine init and deinit" {
