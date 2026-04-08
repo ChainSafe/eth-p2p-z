@@ -40,6 +40,38 @@ pub const ReadEvent = struct {
     owned_buf: []u8, // allocated buffer, caller must free
 };
 
+fn tryQueueOneUncancelable(comptime Elem: type, queue: *Io.Queue(Elem), io: Io, item: Elem) Io.QueueClosedError!bool {
+    // `min = 0` is std.Io's non-blocking queue mode: enqueue one item if there is
+    // room now, otherwise return 0 without suspending inside callback-driven code.
+    return (try queue.putUncancelable(io, &.{item}, 0)) == 1;
+}
+
+fn receiveLoopBackoffMs(consecutive_errors: u32) u64 {
+    if (consecutive_errors == 0) return 0;
+    const shift: u6 = @intCast(@min(consecutive_errors - 1, 63));
+    return @min(@as(u64, 1) << shift, 100);
+}
+
+fn shouldLogReceiveError(consecutive_errors: u32) bool {
+    return consecutive_errors <= 3 or std.math.isPowerOfTwo(consecutive_errors);
+}
+
+fn isTerminalReceiveError(err: net.Socket.ReceiveError) bool {
+    return switch (err) {
+        error.SocketUnconnected => true,
+        else => false,
+    };
+}
+
+fn sleepMilliseconds(io: Io, ms: u64) Io.Cancelable!void {
+    if (ms == 0) return;
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(@intCast(ms)),
+        .clock = .awake,
+    } };
+    try timeout.sleep(io);
+}
+
 // ── QuicStream ─────────────────────────────────────────────────────────
 
 /// QUIC stream backed by lsquic. Reads/writes suspend via Io.Queue.
@@ -181,10 +213,24 @@ pub const QuicStream = struct {
                 _ = lsquic.lsquic_stream_close(ls);
             }
         }
+        self.drainReadQueue();
         if (self.leftover_buf) |lb| {
             self.allocator.free(lb);
         }
         self.allocator.destroy(self);
+    }
+
+    fn drainReadQueue(self: *QuicStream) void {
+        var events: [16]ReadEvent = undefined;
+        while (true) {
+            const count = self.read_queue.getUncancelable(self.conn.engine.io, &events, 0) catch |err| switch (err) {
+                error.Closed => break,
+            };
+            if (count == 0) break;
+            for (events[0..count]) |event| {
+                self.allocator.free(event.owned_buf);
+            }
+        }
     }
 };
 
@@ -318,7 +364,39 @@ pub const QuicConnection = struct {
             lsquic.lsquic_conn_set_ctx(lc, null);
             lsquic.lsquic_conn_close(lc);
         }
+        self.drainStreamQueues();
         self.allocator.destroy(self);
+    }
+
+    fn drainStreamQueues(self: *QuicConnection) void {
+        var stream_events: [16]StreamEvent = undefined;
+        while (true) {
+            const count = self.stream_queue.getUncancelable(self.engine.io, &stream_events, 0) catch |err| switch (err) {
+                error.Closed => break,
+            };
+            if (count == 0) break;
+            for (stream_events[0..count]) |event| {
+                event.stream.deinit();
+            }
+        }
+
+        while (true) {
+            const count = self.outbound_stream_queue.getUncancelable(self.engine.io, &stream_events, 0) catch |err| switch (err) {
+                error.Closed => break,
+            };
+            if (count == 0) break;
+            for (stream_events[0..count]) |event| {
+                event.stream.deinit();
+            }
+        }
+
+        var hsk_events: [1]HandshakeResult = undefined;
+        while (true) {
+            const count = self.hsk_queue.getUncancelable(self.engine.io, &hsk_events, 0) catch |err| switch (err) {
+                error.Closed => break,
+            };
+            if (count == 0) break;
+        }
     }
 };
 
@@ -629,6 +707,11 @@ pub const QuicEngine = struct {
     }
 
     pub fn deinit(self: *QuicEngine) void {
+        if (self.pending_server_conn) |conn| {
+            self.pending_server_conn = null;
+            conn.deinit();
+        }
+        self.drainConnQueue();
         for (self.sockets.items) |sock| {
             sock.close(self.io);
         }
@@ -638,6 +721,19 @@ pub const QuicEngine = struct {
         ssl.SSL_CTX_free(self.ssl_ctx);
         self.cert_verify_ctx.deinit();
         self.allocator.destroy(self);
+    }
+
+    fn drainConnQueue(self: *QuicEngine) void {
+        var events: [16]ConnEvent = undefined;
+        while (true) {
+            const count = self.conn_queue.getUncancelable(self.io, &events, 0) catch |err| switch (err) {
+                error.Closed => break,
+            };
+            if (count == 0) break;
+            for (events[0..count]) |event| {
+                event.conn.deinit();
+            }
+        }
     }
 
     /// Accept a new QUIC connection (blocks until one arrives).
@@ -752,6 +848,7 @@ pub const QuicEngine = struct {
     /// This should be spawned via Group.async.
     pub fn runReceiveLoop(self: *QuicEngine, io: Io, sock: net.Socket) void {
         log.debug("runReceiveLoop started", .{});
+        var consecutive_errors: u32 = 0;
         while (self.running) {
             var buf: [65535]u8 = undefined;
             const msg = sock.receive(io, &buf) catch |err| {
@@ -760,9 +857,29 @@ pub const QuicEngine = struct {
                         log.debug("runReceiveLoop: receive canceled, exiting", .{});
                         return;
                     },
-                    else => continue,
+                    else => {
+                        if (isTerminalReceiveError(err)) {
+                            log.warn("runReceiveLoop: stopping receive loop after terminal socket error: {}", .{err});
+                            return;
+                        }
+                        consecutive_errors +|= 1;
+                        const backoff_ms = receiveLoopBackoffMs(consecutive_errors);
+                        if (shouldLogReceiveError(consecutive_errors)) {
+                            log.warn("runReceiveLoop: receive failed (attempt {d}, backoff {d}ms): {}", .{
+                                consecutive_errors,
+                                backoff_ms,
+                                err,
+                            });
+                        }
+                        sleepMilliseconds(io, backoff_ms) catch |sleep_err| switch (sleep_err) {
+                            error.Canceled => return,
+                        };
+                        continue;
+                    },
                 }
             };
+
+            consecutive_errors = 0;
 
             log.debug("runReceiveLoop: received {} bytes", .{msg.data.len});
 
@@ -841,11 +958,17 @@ pub const QuicEngine = struct {
         if (self.pending_server_conn) |conn| {
             self.pending_server_conn = null;
             log.debug("processEngine: pushing pending server conn to accept queue", .{});
-            self.conn_queue.putOneUncancelable(self.io, .{ .conn = conn }) catch |err| {
-                log.err("processEngine: failed to push server conn: {}", .{err});
+            const queued = tryQueueOneUncancelable(ConnEvent, &self.conn_queue, self.io, .{ .conn = conn }) catch |err| {
+                log.warn("processEngine: accept queue closed while handing off server conn: {}", .{err});
                 conn.close(self.io);
                 conn.deinit();
+                return;
             };
+            if (!queued) {
+                log.warn("processEngine: accept queue full, closing server conn", .{});
+                conn.close(self.io);
+                conn.deinit();
+            }
         }
     }
 
@@ -883,9 +1006,8 @@ pub const QuicEngine = struct {
             log.warn("onNewConn: no verified peer info from custom verify callback", .{});
         }
 
-        // Defer push to conn_queue: we're inside lsquic_engine_process_conns,
-        // so we can't call putOneUncancelable (which may trigger re-entrancy).
-        // processEngine() will drain this after lsquic returns.
+        // Defer the queue handoff until after process_conns returns so we never
+        // block inside lsquic callback execution.
         engine.pending_server_conn = conn;
         log.debug("onNewConn: server conn queued for accept", .{});
 
@@ -901,9 +1023,13 @@ pub const QuicEngine = struct {
                 const conn_ctx = lsquic.lsquic_conn_get_ctx(c);
                 if (conn_ctx) |ctx| {
                     const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
-                    conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {
+                    const queued = tryQueueOneUncancelable(HandshakeResult, &conn.hsk_queue, conn.engine.io, .failed) catch {
                         lsquic.lsquic_conn_close(c);
+                        return;
                     };
+                    if (!queued) {
+                        lsquic.lsquic_conn_close(c);
+                    }
                 }
                 lsquic.lsquic_conn_close(c);
             }
@@ -923,17 +1049,25 @@ pub const QuicEngine = struct {
                 log.debug("onHskDone: peer_id extracted from custom verify", .{});
             } else {
                 log.warn("onHskDone: no verified peer info from custom verify callback", .{});
-                conn.hsk_queue.putOneUncancelable(conn.engine.io, .failed) catch {
+                const queued = tryQueueOneUncancelable(HandshakeResult, &conn.hsk_queue, conn.engine.io, .failed) catch {
                     if (lc) |c| lsquic.lsquic_conn_close(c);
+                    return;
                 };
+                if (!queued) {
+                    if (lc) |c| lsquic.lsquic_conn_close(c);
+                }
                 if (lc) |c| lsquic.lsquic_conn_close(c);
                 return;
             }
 
             // Signal success to waitHandshake
-            conn.hsk_queue.putOneUncancelable(conn.engine.io, .ok) catch {
+            const queued = tryQueueOneUncancelable(HandshakeResult, &conn.hsk_queue, conn.engine.io, .ok) catch {
                 if (lc) |c| lsquic.lsquic_conn_close(c);
+                return;
             };
+            if (!queued) {
+                if (lc) |c| lsquic.lsquic_conn_close(c);
+            }
 
             // Note: on_hsk_done is CLIENT-ONLY in lsquic.
             // The client already has its QuicConnection from connect(), so we
@@ -1037,24 +1171,36 @@ pub const QuicEngine = struct {
         const is_locally_initiated = (engine.is_server == is_server_initiated);
 
         if (is_locally_initiated) {
-            conn.outbound_stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch |err| {
-                log.warn("onNewStream: dropping local stream due to queue overflow: {}", .{err});
+            const queued = tryQueueOneUncancelable(StreamEvent, &conn.outbound_stream_queue, engine.io, .{ .stream = stream }) catch |err| {
+                log.warn("onNewStream: outbound stream queue closed: {}", .{err});
                 stream.close(engine.io);
                 stream.deinit();
                 return null;
             };
+            if (!queued) {
+                log.warn("onNewStream: dropping local stream because outbound stream queue is full", .{});
+                stream.close(engine.io);
+                stream.deinit();
+                return null;
+            }
         } else {
             // Arm wantread immediately for inbound streams so lsquic
             // delivers data via onRead before the stream is closed.
             // Without this, Lighthouse can send data + half-close before
             // our reader calls read(), causing UnexpectedEof.
             _ = lsquic.lsquic_stream_wantread(s, 1);
-            conn.stream_queue.putOneUncancelable(engine.io, .{ .stream = stream }) catch |err| {
-                log.warn("onNewStream: dropping inbound stream due to queue overflow: {}", .{err});
+            const queued = tryQueueOneUncancelable(StreamEvent, &conn.stream_queue, engine.io, .{ .stream = stream }) catch |err| {
+                log.warn("onNewStream: inbound stream queue closed: {}", .{err});
                 stream.close(engine.io);
                 stream.deinit();
                 return null;
             };
+            if (!queued) {
+                log.warn("onNewStream: dropping inbound stream because accept queue is full", .{});
+                stream.close(engine.io);
+                stream.deinit();
+                return null;
+            }
         }
 
         return @ptrCast(stream);
@@ -1102,15 +1248,22 @@ pub const QuicEngine = struct {
         @memcpy(owned, buf[0..len]);
 
         // Push read event
-        stream.read_queue.putOneUncancelable(stream.conn.engine.io, .{
+        const queued = tryQueueOneUncancelable(ReadEvent, &stream.read_queue, stream.conn.engine.io, .{
             .data = owned,
             .owned_buf = owned,
         }) catch {
             stream.allocator.free(owned);
-            log.warn("onRead: read queue overflow, closing stream", .{});
+            log.warn("onRead: read queue closed, closing stream", .{});
             stream.close(stream.conn.engine.io);
             stream.read_queue.close(stream.conn.engine.io);
+            return;
         };
+        if (!queued) {
+            stream.allocator.free(owned);
+            log.warn("onRead: read queue full, closing stream", .{});
+            stream.close(stream.conn.engine.io);
+            stream.read_queue.close(stream.conn.engine.io);
+        }
     }
 
     fn onWrite(ls: ?*lsquic.lsquic_stream_t, _: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
@@ -1139,13 +1292,17 @@ pub const QuicEngine = struct {
                     // Push drained data to the read queue
                     const owned = stream.allocator.alloc(u8, len) catch break;
                     @memcpy(owned, drain_buf[0..len]);
-                    stream.read_queue.putOneUncancelable(stream.conn.engine.io, .{
+                    const queued = tryQueueOneUncancelable(ReadEvent, &stream.read_queue, stream.conn.engine.io, .{
                         .data = owned,
                         .owned_buf = owned,
                     }) catch {
                         stream.allocator.free(owned);
                         break;
                     };
+                    if (!queued) {
+                        stream.allocator.free(owned);
+                        break;
+                    }
                 }
                 if (drain_total > 0) {
                     log.info("onStreamClose: drained {d} bytes from stream", .{drain_total});
@@ -1503,6 +1660,32 @@ test "CertVerifyCtx preserves server-side verification order" {
     const peer_b = ctx.takeNextServerVerified() orelse return error.TestUnexpectedNull;
     defer allocator.free(peer_b.host_pubkey.data.?);
     try std.testing.expectEqual(@as(u8, 2), peer_b.host_pubkey.data.?[0]);
+}
+
+test "tryQueueOneUncancelable reports full queues without blocking" {
+    const io = std.testing.io;
+    var buf: [1]u8 = undefined;
+    var queue = Io.Queue(u8).init(&buf);
+
+    try std.testing.expect(try tryQueueOneUncancelable(u8, &queue, io, 1));
+    try std.testing.expect(!(try tryQueueOneUncancelable(u8, &queue, io, 2)));
+    try std.testing.expectEqual(@as(u8, 1), try queue.getOne(io));
+}
+
+test "receiveLoopBackoffMs grows exponentially and caps" {
+    try std.testing.expectEqual(@as(u64, 0), receiveLoopBackoffMs(0));
+    try std.testing.expectEqual(@as(u64, 1), receiveLoopBackoffMs(1));
+    try std.testing.expectEqual(@as(u64, 2), receiveLoopBackoffMs(2));
+    try std.testing.expectEqual(@as(u64, 4), receiveLoopBackoffMs(3));
+    try std.testing.expectEqual(@as(u64, 64), receiveLoopBackoffMs(7));
+    try std.testing.expectEqual(@as(u64, 100), receiveLoopBackoffMs(8));
+}
+
+test "isTerminalReceiveError only treats broken local socket as terminal" {
+    try std.testing.expect(isTerminalReceiveError(error.SocketUnconnected));
+    try std.testing.expect(!isTerminalReceiveError(error.ConnectionResetByPeer));
+    try std.testing.expect(!isTerminalReceiveError(error.NetworkDown));
+    try std.testing.expect(!isTerminalReceiveError(error.SystemResources));
 }
 
 test "QuicEngine init and deinit" {
