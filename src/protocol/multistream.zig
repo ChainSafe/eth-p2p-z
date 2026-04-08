@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const log = std.log.scoped(.multistream);
 const stream_util = @import("../util/stream.zig");
 
 pub const protocol_id = "/multistream/1.0.0";
@@ -76,16 +77,22 @@ pub fn negotiateOutbound(
 ) Error![]const u8 {
     var buf: [max_message_length]u8 = undefined;
 
+    log.info("outbound: writing multistream header", .{});
     try writeMessage(io, stream, protocol_id);
 
+    log.info("outbound: reading multistream header response", .{});
     const header = try readMessage(io, stream, &buf);
     if (!std.mem.eql(u8, header, protocol_id)) {
         return Error.FirstLineShouldBeMultistream;
     }
+    log.info("outbound: header exchange complete", .{});
 
     for (proposed_protocols) |proto| {
+        log.info("outbound: proposing {s}", .{proto});
         try writeMessage(io, stream, proto);
+        log.info("outbound: waiting for response", .{});
         const response = try readMessage(io, stream, &buf);
+        log.info("outbound: got response: {s}", .{response});
         if (std.mem.eql(u8, response, proto)) {
             return proto;
         }

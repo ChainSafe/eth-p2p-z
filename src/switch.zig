@@ -332,10 +332,13 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// registered in the Switch's protocol list.
         pub fn dialProtocol(self: *Self, io: Io, peer_id: []const u8, protocol_id: []const u8) !quic_mod.Stream {
             const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+            log.info("dialProtocol: opening stream for {s}", .{protocol_id});
             const s_inner = try conn.openStream(io);
+            log.info("dialProtocol: stream opened, starting multistream negotiation", .{});
             var s = quic_mod.Stream{ .inner = s_inner };
             errdefer s.deinit();
             _ = try multistream.negotiateOutbound(io, &s, &.{protocol_id});
+            log.info("dialProtocol: multistream negotiated for {s}", .{protocol_id});
             return s;
         }
         /// Concrete context type for swarm stream tasks (Io.Group.async requires
@@ -351,6 +354,49 @@ pub fn Switch(comptime config: SwitchConfig) type {
             }
             break :blk false;
         };
+
+        /// Return a snapshot of connected peer IDs.
+        /// Keys are deep-copied into caller-owned slices so the result is
+        /// safe even if connections are modified concurrently by async tasks.
+        /// Caller must free each entry and the outer slice with `allocator`.
+        pub fn snapshotConnectedPeerIds(self: *const Self, allocator: Allocator) ![][]const u8 {
+            const n = self.connections.count();
+            if (n == 0) return try allocator.alloc([]const u8, 0);
+
+            // Phase 1: deep-copy key BYTES into a stack-local buffer.
+            // No allocations → no yield points → HashMap stays stable.
+            // Peer IDs are multihash-encoded (typically 38 bytes for secp256k1).
+            const max_peers = 256;
+            const max_id_len = 64;
+            var key_buf: [max_peers][max_id_len]u8 = undefined;
+            var key_lens: [max_peers]usize = undefined;
+            var count: usize = 0;
+            {
+                var it = self.connections.keyIterator();
+                while (it.next()) |key_ptr| {
+                    if (count >= max_peers) break;
+                    const key = key_ptr.*;
+                    if (key.len > max_id_len) continue; // skip oversized keys
+                    @memcpy(key_buf[count][0..key.len], key);
+                    key_lens[count] = key.len;
+                    count += 1;
+                }
+            }
+
+            // Phase 2: allocate from the deep-copied bytes (may yield, but
+            // we no longer hold any references into the HashMap).
+            const ids = try allocator.alloc([]const u8, count);
+            var copied: usize = 0;
+            errdefer {
+                for (ids[0..copied]) |id| allocator.free(id);
+                allocator.free(ids);
+            }
+            for (0..count) |i| {
+                ids[copied] = try allocator.dupe(u8, key_buf[i][0..key_lens[i]]);
+                copied += 1;
+            }
+            return ids[0..copied];
+        }
 
         /// Auto-trigger identify on a newly connected peer.
         /// No-op if identify is not registered in this Switch's protocols.
