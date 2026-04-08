@@ -57,10 +57,6 @@ pub const QuicStream = struct {
     /// Leftover data from a previous ReadEvent when caller's buffer was too small.
     leftover_buf: ?[]u8 = null,
     leftover_offset: usize = 0,
-    /// Pending write data queued by write(), drained by onWrite callback.
-    pending_write: std.ArrayListUnmanaged(u8) = .empty,
-    /// Whether closeWrite was requested (deferred to onWrite).
-    pending_shutdown_write: bool = false,
 
     pub fn init(allocator: Allocator, ls: *lsquic.lsquic_stream_t, conn: *QuicConnection) !*QuicStream {
         const self = try allocator.create(QuicStream);
@@ -115,7 +111,6 @@ pub const QuicStream = struct {
         // false EOF when onRead fires before STREAM frames are processed.
         if (self.lsquic_stream) |ls| {
             _ = lsquic.lsquic_stream_wantread(ls, 1);
-            self.conn.engine.needs_process = true;
         }
         const event = self.read_queue.getOne(io) catch |err| switch (err) {
             error.Closed => return 0, // EOF — peer closed the stream
@@ -137,16 +132,12 @@ pub const QuicStream = struct {
     pub fn write(self: *QuicStream, _: Io, data: []const u8) anyerror!usize {
         if (self.closed or self.write_closed) return error.StreamClosed;
         const ls = self.lsquic_stream orelse return error.StreamClosed;
-        // Queue data for the onWrite callback to drain into lsquic.
-        // We do NOT call processEngine here — doing so re-enters
-        // process_conns which double-ticks the connection (triggers
-        // LSCONN_TICKED assertion). Instead, wantwrite + needs_process
-        // cause the timer loop to dispatch onWrite on its next cycle.
-        self.pending_write.appendSlice(self.allocator, data) catch
-            return error.WriteFailed;
-        _ = lsquic.lsquic_stream_wantwrite(ls, 1);
-        self.conn.engine.needs_process = true;
-        return data.len;
+        const written = lsquic.lsquic_stream_write(ls, data.ptr, data.len);
+        if (written < 0) return error.WriteFailed;
+        if (written > 0) {
+            _ = lsquic.lsquic_stream_flush(ls);
+        }
+        return @intCast(written);
     }
 
     pub fn closeRead(self: *QuicStream, _: Io) void {
@@ -166,9 +157,7 @@ pub const QuicStream = struct {
         self.write_closed = true;
         if (self.lsquic_stream) |ls| {
             if (!self.conn.closed) {
-                self.pending_shutdown_write = true;
-                _ = lsquic.lsquic_stream_wantwrite(ls, 1);
-                self.conn.engine.needs_process = true;
+                _ = lsquic.lsquic_stream_shutdown(ls, 1);
             }
         }
     }
@@ -181,7 +170,6 @@ pub const QuicStream = struct {
             // which must later call deinit() once it is done with the wrapper.
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_close(ls);
-                self.conn.engine.needs_process = true;
             }
         }
     }
@@ -196,7 +184,6 @@ pub const QuicStream = struct {
         if (self.leftover_buf) |lb| {
             self.allocator.free(lb);
         }
-        self.pending_write.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -276,7 +263,6 @@ pub const QuicConnection = struct {
             lsquic.lsquic_conn_set_ctx(lc, null);
             lsquic.lsquic_conn_close(lc);
             self.lsquic_conn = null;
-            self.engine.needs_process = true;
         }
         self.closed = true;
         self.stream_queue.close(io);
@@ -362,8 +348,11 @@ pub const CertVerifyCtx = struct {
     }
 
     pub fn deinit(self: *CertVerifyCtx) void {
+        var iter = self.verified_by_conn.valueIterator();
+        while (iter.next()) |vp| {
+            if (vp.host_pubkey.data) |d| self.allocator.free(d);
+        }
         self.verified_by_conn.deinit();
-        // Free any unclaimed verified peers still in the FIFO.
         while (self.pending_server_head < self.pending_server_verified.items.len) : (self.pending_server_head += 1) {
             const vp = self.pending_server_verified.items[self.pending_server_head];
             if (vp.host_pubkey.data) |d| self.allocator.free(d);
@@ -371,8 +360,8 @@ pub const CertVerifyCtx = struct {
         self.pending_server_verified.deinit(self.allocator);
     }
 
-    fn connKey(lc: *lsquic.lsquic_conn_t) usize {
-        return @intFromPtr(lc);
+    fn connCtxKey(conn_ctx: *anyopaque) usize {
+        return @intFromPtr(conn_ctx);
     }
 
     fn compactPendingServer(self: *CertVerifyCtx) void {
@@ -391,29 +380,34 @@ pub const CertVerifyCtx = struct {
 
     pub fn storeVerified(
         self: *CertVerifyCtx,
-        lc: *lsquic.lsquic_conn_t,
+        conn_ctx: ?*anyopaque,
         is_server: bool,
         peer: VerifiedPeer,
     ) !void {
-        _ = lc;
-        _ = is_server;
-        // All verified peers go into a single FIFO queue. Using a conn-pointer
-        // keyed map caused double-free bugs because lsquic promotes mini-conn →
-        // full-conn, changing the pointer. The FIFO handles both server and
-        // client connections correctly since TLS verifications complete in order.
-        try self.pending_server_verified.append(self.allocator, peer);
+        if (is_server) {
+            try self.pending_server_verified.append(self.allocator, peer);
+            return;
+        }
+        const ctx = conn_ctx orelse return error.MissingConnContext;
+        const gop = try self.verified_by_conn.getOrPut(connCtxKey(ctx));
+        if (gop.found_existing) {
+            if (gop.value_ptr.host_pubkey.data) |d| self.allocator.free(d);
+        }
+        gop.value_ptr.* = peer;
     }
 
-    pub fn takeVerified(self: *CertVerifyCtx, lc: *lsquic.lsquic_conn_t) ?VerifiedPeer {
-        _ = lc;
-        return self.takeNextServerVerified();
+    pub fn takeVerified(self: *CertVerifyCtx, conn_ctx: ?*anyopaque) ?VerifiedPeer {
+        if (conn_ctx == null) return null;
+        return if (self.verified_by_conn.fetchRemove(connCtxKey(conn_ctx.?))) |entry|
+            entry.value
+        else
+            null;
     }
 
-    pub fn discardVerified(self: *CertVerifyCtx, lc: *lsquic.lsquic_conn_t) void {
-        // Discard the next FIFO entry (caller doesn't want it).
-        _ = lc;
-        if (self.takeNextServerVerified()) |vp| {
-            if (vp.host_pubkey.data) |d| self.allocator.free(d);
+    pub fn discardVerified(self: *CertVerifyCtx, conn_ctx: ?*anyopaque) void {
+        if (conn_ctx == null) return;
+        if (self.verified_by_conn.fetchRemove(connCtxKey(conn_ctx.?))) |entry| {
+            if (entry.value.host_pubkey.data) |d| self.allocator.free(d);
         }
     }
 
@@ -458,8 +452,6 @@ pub const QuicEngine = struct {
 
     /// Guard against re-entrant calls to lsquic_engine_process_conns.
     processing: bool,
-    /// Set by stream writes to trigger processEngine on the next timer tick.
-    needs_process: bool,
 
     /// Background task group for receive and timer loops.
     /// Owned by the engine so it outlives the stack frames that spawn the loops.
@@ -512,7 +504,6 @@ pub const QuicEngine = struct {
         self.running = false;
         self.has_unsent = false;
         self.processing = false;
-        self.needs_process = false;
         self.pending_server_conn = null;
         self.background = .init;
 
@@ -694,13 +685,8 @@ pub const QuicEngine = struct {
         conn.lsquic_conn = lc;
         lsquic.lsquic_conn_set_ctx(lc, @ptrCast(conn));
 
-        // Tick the new connection to start the TLS handshake immediately.
-        // This is safe: the connection was just created by lsquic_engine_connect
-        // and has LSCONN_TICKED=0. processEngine ticks it once, sets/clears
-        // the flag within the same call. Other application code (write/read/close)
-        // must NOT call processEngine — they just set needs_process for the
-        // timer loop — because they operate on existing connections that may
-        // already have been ticked.
+        // Tick the new connection immediately, but go through processEngine()
+        // so connect() obeys the same re-entrancy guard as the background loops.
         self.processEngine();
 
         return conn;
@@ -805,37 +791,31 @@ pub const QuicEngine = struct {
     pub fn runTimerLoop(self: *QuicEngine, io: Io) void {
         log.debug("runTimerLoop started", .{});
         while (self.running) {
-            // If a stream write flagged needs_process, skip the sleep and
-            // flush immediately. This handles the edge case where write()
-            // couldn't call processEngine (reentrancy guard was active).
-            if (!self.needs_process) {
-                var diff: c_int = 0;
-                if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) {
-                    // lsquic wants us to call process_conns after `diff` microseconds
-                    const us: i64 = if (diff > 0) @intCast(diff) else 0;
-                    const sleep_timeout: Io.Timeout = .{
-                        .duration = .{
-                            .raw = Io.Duration.fromNanoseconds(@as(i96, us) * std.time.ns_per_us),
-                            .clock = .awake,
-                        },
-                    };
-                    sleep_timeout.sleep(io) catch |err| switch (err) {
-                        error.Canceled => return,
-                    };
-                } else {
-                    // No connections to process; sleep a short interval
-                    const sleep_timeout: Io.Timeout = .{
-                        .duration = .{
-                            .raw = Io.Duration.fromMilliseconds(50),
-                            .clock = .awake,
-                        },
-                    };
-                    sleep_timeout.sleep(io) catch |err| switch (err) {
-                        error.Canceled => return,
-                    };
-                }
+            var diff: c_int = 0;
+            if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) {
+                // lsquic wants us to call process_conns after `diff` microseconds
+                const us: i64 = if (diff > 0) @intCast(diff) else 0;
+                const sleep_timeout: Io.Timeout = .{
+                    .duration = .{
+                        .raw = Io.Duration.fromNanoseconds(@as(i96, us) * std.time.ns_per_us),
+                        .clock = .awake,
+                    },
+                };
+                sleep_timeout.sleep(io) catch |err| switch (err) {
+                    error.Canceled => return,
+                };
+            } else {
+                // No connections to process; sleep a short interval
+                const sleep_timeout: Io.Timeout = .{
+                    .duration = .{
+                        .raw = Io.Duration.fromMilliseconds(50),
+                        .clock = .awake,
+                    },
+                };
+                sleep_timeout.sleep(io) catch |err| switch (err) {
+                    error.Canceled => return,
+                };
             }
-            self.needs_process = false;
 
             if (!self.running) return;
             self.processEngine();
@@ -849,7 +829,6 @@ pub const QuicEngine = struct {
         if (self.processing) return;
         self.processing = true;
         defer self.processing = false;
-        self.needs_process = false;
         // Retry unsent packets first (socket may now be writable)
         if (self.has_unsent) {
             self.has_unsent = false;
@@ -938,7 +917,7 @@ pub const QuicEngine = struct {
 
             // Extract peer identity stored by customVerifyCallback for this
             // concrete lsquic connection.
-            if (conn.engine.cert_verify_ctx.takeVerified(lc.?)) |verified| {
+            if (conn.engine.cert_verify_ctx.takeVerified(conn_ctx)) |verified| {
                 conn.peer_id = verified.peer_id;
                 if (verified.host_pubkey.data) |d| conn.allocator.free(d);
                 log.debug("onHskDone: peer_id extracted from custom verify", .{});
@@ -1018,7 +997,7 @@ pub const QuicEngine = struct {
             const conn: *QuicConnection = @ptrCast(@alignCast(raw));
             conn.closed = true;
             conn.lsquic_conn = null;
-            if (lc) |c| conn.engine.cert_verify_ctx.discardVerified(c);
+            conn.engine.cert_verify_ctx.discardVerified(ctx);
             // Clear conn context so lsquic doesn't assert on engine destroy
             if (lc) |c| lsquic.lsquic_conn_set_ctx(c, null);
             // Close both queues using engine's stored io
@@ -1134,44 +1113,12 @@ pub const QuicEngine = struct {
         };
     }
 
-    fn onWrite(ls: ?*lsquic.lsquic_stream_t, ctx: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
-        const s = ls orelse return;
-        const stream: *QuicStream = if (ctx) |raw| @ptrCast(@alignCast(raw)) else {
+    fn onWrite(ls: ?*lsquic.lsquic_stream_t, _: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
+        // We handle writes synchronously in QuicStream.write(), so just
+        // disable write notifications.
+        if (ls) |s| {
             _ = lsquic.lsquic_stream_wantwrite(s, 0);
-            return;
-        };
-
-        // Drain pending writes into lsquic inside the callback.
-        if (stream.pending_write.items.len > 0) {
-            const data = stream.pending_write.items;
-            const written = lsquic.lsquic_stream_write(s, data.ptr, data.len);
-            if (written > 0) {
-                const n: usize = @intCast(written);
-                if (n == data.len) {
-                    stream.pending_write.clearRetainingCapacity();
-                } else {
-                    std.mem.copyForwards(u8, stream.pending_write.items[0..data.len - n], data[n..]);
-                    stream.pending_write.items.len -= n;
-                }
-            }
         }
-
-        if (stream.pending_write.items.len > 0) return; // keep wantwrite armed
-
-        // Flush buffered data into STREAM frames. This is safe inside
-        // onWrite (ENPUB_PROC set). lsquic generates STREAM frames for
-        // the data written above and queues them for sending. The
-        // LSCONN_HAS_OUTGOING flag is set after ci_tick returns, not
-        // by stream_flush, so multiple flushes per connection are safe
-        // when called from within the onWrite dispatch loop.
-        _ = lsquic.lsquic_stream_flush(s);
-
-        if (stream.pending_shutdown_write) {
-            stream.pending_shutdown_write = false;
-            _ = lsquic.lsquic_stream_shutdown(s, 1);
-        }
-
-        _ = lsquic.lsquic_stream_wantwrite(s, 0);
     }
 
     fn onStreamClose(ls: ?*lsquic.lsquic_stream_t, ctx: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
@@ -1338,8 +1285,12 @@ pub const QuicEngine = struct {
             info.host_pubkey.type, if (info.host_pubkey.data) |d| d.len else 0,
         });
 
-        // Store verified peer info for consumption by onNewConn/onHskDone
-        ctx.storeVerified(lc, ssl.SSL_is_server(s) == 1, .{
+        const conn_ctx = lsquic.lsquic_conn_get_ctx(lc);
+
+        // Store verified peer info for consumption by onNewConn/onHskDone.
+        // For clients, key by the stable conn_ctx pointer rather than the
+        // lsquic connection pointer, which may differ across handshake stages.
+        ctx.storeVerified(conn_ctx, ssl.SSL_is_server(s) == 1, .{
             .peer_id = info.peer_id,
             .host_pubkey = info.host_pubkey,
         }) catch |err| {
@@ -1460,57 +1411,11 @@ fn sameFamilyAndPort(a: net.IpAddress, b: net.IpAddress) bool {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-test "pending write drain handles full consumption" {
-    const allocator = std.testing.allocator;
-    var pending: std.ArrayListUnmanaged(u8) = .empty;
-    defer pending.deinit(allocator);
-
-    try pending.appendSlice(allocator, "hello world");
-
-    // Simulate full drain (lsquic_stream_write accepts all bytes)
-    const written: usize = pending.items.len;
-    if (written == pending.items.len) {
-        pending.clearRetainingCapacity();
-    }
-    try std.testing.expectEqual(@as(usize, 0), pending.items.len);
-}
-
-test "pending write drain handles partial consumption" {
-    const allocator = std.testing.allocator;
-    var pending: std.ArrayListUnmanaged(u8) = .empty;
-    defer pending.deinit(allocator);
-
-    try pending.appendSlice(allocator, "hello world");
-
-    // Simulate partial drain (lsquic_stream_write accepts 5 bytes)
-    const data_len = pending.items.len;
-    const written: usize = 5;
-    std.mem.copyForwards(u8, pending.items[0 .. data_len - written], pending.items[written..]);
-    pending.items.len -= written;
-
-    try std.testing.expectEqualStrings(" world", pending.items);
-}
-
-test "pending write drain accumulates multiple writes" {
-    const allocator = std.testing.allocator;
-    var pending: std.ArrayListUnmanaged(u8) = .empty;
-    defer pending.deinit(allocator);
-
-    // Simulate multistream header: varint + content + newline
-    try pending.appendSlice(allocator, &[_]u8{0x13}); // varint
-    try pending.appendSlice(allocator, "/multistream/1.0.0");
-    try pending.appendSlice(allocator, "\n");
-
-    try std.testing.expectEqual(@as(usize, 20), pending.items.len);
-    try std.testing.expectEqual(@as(u8, 0x13), pending.items[0]);
-    try std.testing.expectEqual(@as(u8, '\n'), pending.items[19]);
-}
-
-test "CertVerifyCtx stores and retrieves via FIFO" {
+test "CertVerifyCtx stores and retrieves by connection context" {
     const allocator = std.testing.allocator;
     var ctx = CertVerifyCtx.init(allocator);
     defer ctx.deinit();
-    const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
+    const conn_ctx_a: *anyopaque = @ptrFromInt(0x1000);
 
     // Create a test VerifiedPeer with dummy data
     const test_key_data = try allocator.dupe(u8, &[_]u8{ 1, 2, 3, 4 });
@@ -1519,8 +1424,8 @@ test "CertVerifyCtx stores and retrieves via FIFO" {
         .host_pubkey = keys.PublicKey{ .type = .ED25519, .data = test_key_data },
     };
 
-    try ctx.storeVerified(conn_a, false, test_peer);
-    const peer = ctx.takeVerified(conn_a);
+    try ctx.storeVerified(conn_ctx_a, false, test_peer);
+    const peer = ctx.takeVerified(conn_ctx_a);
     try std.testing.expect(peer != null);
     // Caller owns the taken peer's host_pubkey data
     allocator.free(peer.?.host_pubkey.data.?);
@@ -1530,27 +1435,27 @@ test "CertVerifyCtx returns null when empty" {
     const allocator = std.testing.allocator;
     var ctx = CertVerifyCtx.init(allocator);
     defer ctx.deinit();
-    const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
+    const conn_ctx_a: *anyopaque = @ptrFromInt(0x1000);
 
-    const peer = ctx.takeVerified(conn_a);
+    const peer = ctx.takeVerified(conn_ctx_a);
     try std.testing.expect(peer == null);
 }
 
-test "CertVerifyCtx returns peers in FIFO order" {
+test "CertVerifyCtx keeps peer identities isolated per connection context" {
     const allocator = std.testing.allocator;
     var ctx = CertVerifyCtx.init(allocator);
     defer ctx.deinit();
-    const conn_a: *lsquic.lsquic_conn_t = @ptrFromInt(0x1000);
-    const conn_b: *lsquic.lsquic_conn_t = @ptrFromInt(0x2000);
+    const conn_ctx_a: *anyopaque = @ptrFromInt(0x1000);
+    const conn_ctx_b: *anyopaque = @ptrFromInt(0x2000);
 
-    try ctx.storeVerified(conn_a, false, .{
+    try ctx.storeVerified(conn_ctx_a, false, .{
         .peer_id = std.mem.zeroes(PeerId),
         .host_pubkey = .{
             .type = .ED25519,
             .data = try allocator.dupe(u8, &[_]u8{1}),
         },
     });
-    try ctx.storeVerified(conn_b, false, .{
+    try ctx.storeVerified(conn_ctx_b, false, .{
         .peer_id = std.mem.zeroes(PeerId),
         .host_pubkey = .{
             .type = .ED25519,
@@ -1558,14 +1463,15 @@ test "CertVerifyCtx returns peers in FIFO order" {
         },
     });
 
-    // FIFO: first stored → first returned, regardless of conn pointer
-    const peer_first = ctx.takeVerified(conn_b) orelse return error.TestUnexpectedNull;
-    defer allocator.free(peer_first.host_pubkey.data.?);
-    try std.testing.expectEqual(@as(u8, 1), peer_first.host_pubkey.data.?[0]);
+    const peer_b = ctx.takeVerified(conn_ctx_b) orelse return error.TestUnexpectedNull;
+    defer allocator.free(peer_b.host_pubkey.data.?);
+    try std.testing.expectEqual(@as(usize, 1), peer_b.host_pubkey.data.?.len);
+    try std.testing.expectEqual(@as(u8, 2), peer_b.host_pubkey.data.?[0]);
 
-    const peer_second = ctx.takeVerified(conn_a) orelse return error.TestUnexpectedNull;
-    defer allocator.free(peer_second.host_pubkey.data.?);
-    try std.testing.expectEqual(@as(u8, 2), peer_second.host_pubkey.data.?[0]);
+    const peer_a = ctx.takeVerified(conn_ctx_a) orelse return error.TestUnexpectedNull;
+    defer allocator.free(peer_a.host_pubkey.data.?);
+    try std.testing.expectEqual(@as(usize, 1), peer_a.host_pubkey.data.?.len);
+    try std.testing.expectEqual(@as(u8, 1), peer_a.host_pubkey.data.?[0]);
 }
 
 test "CertVerifyCtx preserves server-side verification order" {
@@ -1652,11 +1558,8 @@ test "ipAddressToSockaddr converts IPv6 correctly" {
         try std.testing.expectEqual(@as(u16, @intCast(std.posix.AF.INET6)), family);
     }
 
-    // Port at offset 2, big-endian
     const port_be = std.mem.readInt(u16, storage.data[2..4], .big);
     try std.testing.expectEqual(@as(u16, 443), port_be);
-
-    // IPv6 addr at offset 8 (after family(2) + port(2) + flowinfo(4))
     try std.testing.expectEqual(@as(u8, 0x20), storage.data[8]);
     try std.testing.expectEqual(@as(u8, 0x01), storage.data[9]);
     try std.testing.expectEqual(@as(u8, 0x0d), storage.data[10]);
