@@ -29,6 +29,23 @@ fn writeMessage(io: Io, stream: anytype, msg: []const u8) Error!void {
     writeAllGeneric(io, stream, message_suffix) catch return Error.UnexpectedEof;
 }
 
+fn writeMessages(io: Io, stream: anytype, messages: []const []const u8) Error!void {
+    var total_len: usize = 0;
+    for (messages) |msg| {
+        total_len += encodedMessageLength(msg);
+    }
+
+    var buf: [max_message_length * 2]u8 = undefined;
+    if (total_len > buf.len) return Error.ProtocolIdTooLong;
+
+    var offset: usize = 0;
+    for (messages) |msg| {
+        offset += encodeMessageInto(buf[offset..], msg);
+    }
+
+    writeAllGeneric(io, stream, buf[0..offset]) catch return Error.UnexpectedEof;
+}
+
 fn writeAllGeneric(io: Io, stream: anytype, data: []const u8) !void {
     var total: usize = 0;
     while (total < data.len) {
@@ -76,16 +93,25 @@ pub fn negotiateOutbound(
 ) Error![]const u8 {
     var buf: [max_message_length]u8 = undefined;
 
-    try writeMessage(io, stream, protocol_id);
+    if (proposed_protocols.len == 0) return Error.NoSupportedProtocols;
 
-    const header = try readMessage(io, stream, &buf);
-    if (!std.mem.eql(u8, header, protocol_id)) {
-        return Error.FirstLineShouldBeMultistream;
+    // Mirror go/js-libp2p by pipelining the protocol header with the first
+    // proposal. Some peers optimistically expect the initial select attempt
+    // to arrive immediately after the multistream header.
+    try writeMessages(io, stream, &.{ protocol_id, proposed_protocols[0] });
+
+    var response = try readMessage(io, stream, &buf);
+    if (std.mem.eql(u8, response, protocol_id)) {
+        response = try readMessage(io, stream, &buf);
     }
 
-    for (proposed_protocols) |proto| {
+    if (std.mem.eql(u8, response, proposed_protocols[0])) {
+        return proposed_protocols[0];
+    }
+
+    for (proposed_protocols[1..]) |proto| {
         try writeMessage(io, stream, proto);
-        const response = try readMessage(io, stream, &buf);
+        response = try readMessage(io, stream, &buf);
         if (std.mem.eql(u8, response, proto)) {
             return proto;
         }
@@ -138,6 +164,20 @@ fn encodeUvarint(value: usize, buf: []u8) usize {
     }
     buf[i] = @intCast(v);
     return i + 1;
+}
+
+fn encodedMessageLength(msg: []const u8) usize {
+    var len_buf: [max_varint_bytes + 1]u8 = undefined;
+    return encodeUvarint(msg.len + 1, &len_buf) + msg.len + message_suffix.len;
+}
+
+fn encodeMessageInto(buf: []u8, msg: []const u8) usize {
+    var len_buf: [max_varint_bytes + 1]u8 = undefined;
+    const len_bytes = encodeUvarint(msg.len + 1, &len_buf);
+    @memcpy(buf[0..len_bytes], len_buf[0..len_bytes]);
+    @memcpy(buf[len_bytes .. len_bytes + msg.len], msg);
+    @memcpy(buf[len_bytes + msg.len ..][0..message_suffix.len], message_suffix);
+    return len_bytes + msg.len + message_suffix.len;
 }
 
 // --- Tests ---
@@ -209,6 +249,65 @@ test "negotiateOutbound falls back to second protocol" {
     const proposed = [_][]const u8{ "/ipfs/ping/1.0.0", "/ipfs/id/1.0.0" };
     const result = try negotiateOutbound(undefined, &stream, &proposed);
     try std.testing.expectEqualStrings("/ipfs/id/1.0.0", result);
+}
+
+test "negotiateOutbound pipelines header with first proposal" {
+    const OptimisticStream = struct {
+        const Self = @This();
+
+        read_buf: []const u8,
+        read_pos: usize = 0,
+        write_buf: std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+        write_calls: usize = 0,
+
+        fn init(allocator: std.mem.Allocator, read_data: []const u8) Self {
+            return .{
+                .read_buf = read_data,
+                .write_buf = .empty,
+                .allocator = allocator,
+            };
+        }
+
+        fn deinit(self: *Self) void {
+            self.write_buf.deinit(self.allocator);
+        }
+
+        fn read(self: *Self, _: Io, buf: []u8) !usize {
+            if (self.read_pos >= self.read_buf.len) return 0;
+            const remaining = self.read_buf.len - self.read_pos;
+            const n = @min(remaining, buf.len);
+            @memcpy(buf[0..n], self.read_buf[self.read_pos..][0..n]);
+            self.read_pos += n;
+            return n;
+        }
+
+        fn write(self: *Self, _: Io, data: []const u8) !usize {
+            self.write_calls += 1;
+            try self.write_buf.appendSlice(self.allocator, data);
+            return data.len;
+        }
+
+        fn closeRead(_: *Self, _: Io) void {}
+        fn closeWrite(_: *Self, _: Io) void {}
+        fn close(_: *Self, _: Io) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    const header_msg = try encodeMessage(allocator, protocol_id);
+    defer allocator.free(header_msg);
+    const proto_msg = try encodeMessage(allocator, "/ipfs/ping/1.0.0");
+    defer allocator.free(proto_msg);
+    const read_data = try std.mem.concat(allocator, u8, &.{ header_msg, proto_msg });
+    defer allocator.free(read_data);
+
+    var stream = OptimisticStream.init(allocator, read_data);
+    defer stream.deinit();
+
+    const proposed = [_][]const u8{"/ipfs/ping/1.0.0"};
+    const selected = try negotiateOutbound(std.testing.io, &stream, &proposed);
+    try std.testing.expectEqualStrings("/ipfs/ping/1.0.0", selected);
+    try std.testing.expectEqual(@as(usize, 1), stream.write_calls);
 }
 
 test "negotiateOutbound all rejected" {

@@ -33,6 +33,69 @@ pub const EngineConfig = struct {
     max_inbound_connections_per_ip: usize = 16,
 };
 
+const dial_handshake_timeout_ms: u64 = 5_000;
+
+const TimerResult = enum {
+    fired,
+    canceled,
+};
+
+const DialHandshakeResult = union(enum) {
+    success: PeerId,
+    failure: anyerror,
+};
+
+fn timeoutFromMilliseconds(ms: u64) Io.Timeout {
+    return .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(@intCast(ms)),
+        .clock = .awake,
+    } };
+}
+
+fn waitTimeout(io: Io, timeout: Io.Timeout) TimerResult {
+    timeout.sleep(io) catch |err| switch (err) {
+        error.Canceled => return .canceled,
+    };
+    return .fired;
+}
+
+fn waitForDialHandshakeWithTimeout(io: Io, conn: anytype, timeout_ms: u64) !PeerId {
+    const Conn = @TypeOf(conn);
+    const Waiter = struct {
+        fn run(wait_conn: Conn, wait_io: Io) DialHandshakeResult {
+            const peer_id = wait_conn.waitHandshake(wait_io) catch |err| {
+                return .{ .failure = err };
+            };
+            return .{ .success = peer_id };
+        }
+    };
+
+    var events_buf: [2]union(enum) {
+        handshake: DialHandshakeResult,
+        timeout: TimerResult,
+    } = undefined;
+    var select = Io.Select(@TypeOf(events_buf[0])).init(io, &events_buf);
+
+    select.async(.handshake, Waiter.run, .{ conn, io });
+    select.async(.timeout, waitTimeout, .{ io, timeoutFromMilliseconds(timeout_ms) });
+
+    defer select.cancelDiscard();
+
+    while (true) {
+        const event = try select.await();
+        switch (event) {
+            .handshake => |result| switch (result) {
+                .success => |peer_id| return peer_id,
+                .failure => |err| return err,
+            },
+            .timeout => |result| switch (result) {
+                .fired => return error.HandshakeTimeout,
+                .canceled => {},
+            },
+        }
+    }
+}
+
 /// Comptime-composed libp2p Switch.
 ///
 /// Validates transports and protocols at compile time, dispatches inbound
@@ -164,8 +227,9 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 conn.deinit();
             }
 
-            // Wait for TLS handshake — suspends until onHskDone fires
-            const peer_id = conn.waitHandshake(io) catch return error.HandshakeFailed;
+            // Wait for TLS handshake with an explicit dial timeout so a peer
+            // that never completes the handshake cannot pin the caller forever.
+            const peer_id = try waitForDialHandshakeWithTimeout(io, conn, dial_handshake_timeout_ms);
             var pid_buf: [128]u8 = undefined;
             const raw_peer_id = peer_id.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
 
@@ -271,7 +335,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             if (peer_id) |pid| {
                 if (self.connections.get(pid) == conn) {
                     if (self.connections.fetchRemove(pid)) |kv| {
-                        self.notifyPeerDisconnected(kv.key);
+                        self.notifyPeerDisconnected(io, kv.key);
                         self.allocator.free(kv.key);
                         kv.value.deinit();
                         return;
@@ -378,7 +442,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             // Notify handlers, free connection objects, and free map keys
             var it = self.connections.iterator();
             while (it.next()) |entry| {
-                self.notifyPeerDisconnected(@as(?[]const u8, entry.key_ptr.*));
+                self.notifyPeerDisconnected(io, @as(?[]const u8, entry.key_ptr.*));
                 entry.value_ptr.*.deinit();
                 self.allocator.free(entry.key_ptr.*);
             }
@@ -421,11 +485,11 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// Notify all protocol handlers that a peer has disconnected.
         /// Only calls handlers that declare `onPeerDisconnected` (comptime check).
         /// Matches rust-libp2p's FromSwarm::ConnectionClosed pattern.
-        pub fn notifyPeerDisconnected(self: *Self, peer_id: ?[]const u8) void {
+        pub fn notifyPeerDisconnected(self: *Self, io: Io, peer_id: ?[]const u8) void {
             const pid = peer_id orelse return;
             inline for (config.protocols, 0..) |P, i| {
                 if (@hasDecl(P, "onPeerDisconnected")) {
-                    self.handlers[i].onPeerDisconnected(pid);
+                    self.handlers[i].onPeerDisconnected(io, pid);
                 }
             }
         }
@@ -544,6 +608,47 @@ test "Switch comptime validation accepts valid config" {
 
     // Verify protocol IDs are correct
     try std.testing.expectEqualStrings("/test/mock/1.0.0", TestSwitch.supported_protocol_ids[0]);
+}
+
+test "waitForDialHandshakeWithTimeout returns handshake result" {
+    const MockConn = struct {
+        peer_id: PeerId,
+
+        pub fn waitHandshake(self: *@This(), _: Io) !PeerId {
+            return self.peer_id;
+        }
+    };
+
+    const expected = std.mem.zeroes(PeerId);
+    var conn = MockConn{ .peer_id = expected };
+    const actual = try waitForDialHandshakeWithTimeout(std.testing.io, &conn, 10);
+    try std.testing.expectEqualDeep(expected, actual);
+}
+
+test "waitForDialHandshakeWithTimeout forwards handshake failure" {
+    const MockConn = struct {
+        pub fn waitHandshake(_: *@This(), _: Io) !PeerId {
+            return error.HandshakeFailed;
+        }
+    };
+
+    var conn = MockConn{};
+    try std.testing.expectError(error.HandshakeFailed, waitForDialHandshakeWithTimeout(std.testing.io, &conn, 10));
+}
+
+test "waitForDialHandshakeWithTimeout times out blocked handshake" {
+    const MockConn = struct {
+        gate: *Io.Event,
+
+        pub fn waitHandshake(self: *@This(), io: Io) !PeerId {
+            try self.gate.wait(io);
+            return std.mem.zeroes(PeerId);
+        }
+    };
+
+    var gate: Io.Event = .unset;
+    var conn = MockConn{ .gate = &gate };
+    try std.testing.expectError(error.HandshakeTimeout, waitForDialHandshakeWithTimeout(std.testing.io, &conn, 5));
 }
 
 test "Swarm ping over QUIC" {
@@ -731,7 +836,7 @@ test "Swarm gossipsub subscription over QUIC" {
 
     // Server gossipsub
     const svc1 = gossipsub_service.Service.init(allocator, .{}) catch return;
-    defer svc1.deinit();
+    defer svc1.deinit(io);
 
     const Node = Switch(.{
         .transports = &.{quic_mod.QuicTransport},
@@ -750,8 +855,8 @@ test "Swarm gossipsub subscription over QUIC" {
 
     // Client gossipsub
     const svc2 = gossipsub_service.Service.init(allocator, .{}) catch return;
-    defer svc2.deinit();
-    svc2.subscribe("test-topic") catch return;
+    defer svc2.deinit(io);
+    svc2.subscribe(io, "test-topic") catch return;
 
     var client = Node.init(allocator, .{ .host_identity = &key2 }, .{gossipsub_service.Handler{ .svc = svc2 }});
     defer client.deinit(io);
@@ -782,7 +887,7 @@ test "Swarm gossipsub subscription over QUIC" {
     sleep_timeout.sleep(io) catch {};
 
     // Verify subscription event on server
-    const events = svc1.drainEvents() catch return;
+    const events = svc1.drainEvents(io) catch return;
     defer {
         for (events) |*event| {
             event.deinit(allocator);

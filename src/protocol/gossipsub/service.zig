@@ -30,13 +30,13 @@ const log = std.log.scoped(.gossipsub_service);
 ///     .publish_policy = .anonymous,
 ///     .msg_id_fn = myNoSignMsgId,
 /// });
-/// defer svc.deinit();
+/// defer svc.deinit(io);
 ///
-/// svc.subscribe("my-topic");
-/// _ = svc.publish("my-topic", "hello world");
+/// try svc.subscribe(io, "my-topic");
+/// _ = try svc.publish(io, "my-topic", "hello world");
 ///
 /// // Drain pending sends and write to peer streams
-/// const sends = svc.drainPendingSends();
+/// const sends = svc.drainPendingSends(io);
 /// for (sends) |s| {
 ///     // write s.data to s.peer's outbound stream...
 ///     allocator.free(s.peer);
@@ -58,13 +58,14 @@ pub const Service = struct {
     rng_state: u64,
     /// Current time in milliseconds, set externally via setTime.
     time_ms: u64,
-    /// Io instance, stored when handling inbound/outbound streams.
-    io: ?Io,
     /// Outbound streams keyed by peer ID (owned keys).
-    /// Values include both the AnyStream and a destructor for the heap-allocated backing.
-    outbound_streams: std.StringHashMap(OwnedStream),
+    outbound_streams: std.StringHashMap(*ManagedStream),
     /// Topics we are subscribed to (owned keys), for announcing to new peers.
     tracked_subscriptions: std.StringHashMap(void),
+    /// Serializes router and stream state across concurrent service fibers.
+    state_mu: Io.Mutex,
+    /// Borrowed only while running synchronous router callbacks that may write.
+    active_io: ?Io,
 
     /// An AnyStream with heap-allocated backing that can be freed.
     const OwnedStream = struct {
@@ -86,6 +87,71 @@ pub const Service = struct {
             self.destroy_fn(alloc, self.backing_ptr);
         }
     };
+
+    const ManagedStream = struct {
+        owned: OwnedStream,
+        ref_count: std.atomic.Value(usize) = .init(1),
+
+        fn retain(self: *ManagedStream) void {
+            _ = self.ref_count.fetchAdd(1, .monotonic);
+        }
+
+        fn release(self: *ManagedStream, alloc: Allocator) void {
+            const previous = self.ref_count.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous == 1) {
+                self.owned.destroyBacking(alloc);
+                alloc.destroy(self);
+            }
+        }
+
+        fn close(self: *ManagedStream, io: Io) void {
+            self.owned.close(io);
+        }
+
+        fn write(self: *ManagedStream, io: Io, data: []const u8) anyerror!usize {
+            return self.owned.write(io, data);
+        }
+    };
+
+    fn installPeerStream(self: *Self, peer_id: []const u8, stream: anytype) !?*ManagedStream {
+        if (self.outbound_streams.contains(peer_id)) return null;
+
+        const StreamT = @TypeOf(stream.*);
+        const heap_stream = try self.allocator.create(StreamT);
+        errdefer self.allocator.destroy(heap_stream);
+
+        heap_stream.* = stream.*;
+        if (@hasDecl(StreamT, "transferOwnership")) {
+            stream.transferOwnership();
+        }
+
+        const managed = try self.allocator.create(ManagedStream);
+        errdefer self.allocator.destroy(managed);
+
+        managed.* = .{
+            .owned = .{
+                .stream = AnyStream.wrap(StreamT, heap_stream),
+                .backing_ptr = @ptrCast(heap_stream),
+                .destroy_fn = struct {
+                    fn destroy(alloc: Allocator, ptr: *anyopaque) void {
+                        const p: *StreamT = @ptrCast(@alignCast(ptr));
+                        if (@hasDecl(StreamT, "deinit")) {
+                            p.deinit();
+                        }
+                        alloc.destroy(p);
+                    }
+                }.destroy,
+            },
+        };
+        errdefer managed.owned.destroyBacking(self.allocator);
+
+        const peer_copy = try self.allocator.dupe(u8, peer_id);
+        errdefer self.allocator.free(peer_copy);
+
+        try self.outbound_streams.put(peer_copy, managed);
+        return managed;
+    }
 
     /// A pending outbound RPC message to a specific peer.
     pub const PendingRpc = struct {
@@ -111,9 +177,10 @@ pub const Service = struct {
             .pending_send_bytes = 0,
             .rng_state = 12345,
             .time_ms = 0,
-            .io = null,
-            .outbound_streams = std.StringHashMap(OwnedStream).init(allocator),
+            .outbound_streams = std.StringHashMap(*ManagedStream).init(allocator),
             .tracked_subscriptions = std.StringHashMap(void).init(allocator),
+            .state_mu = .init,
+            .active_io = null,
         };
         self.router = RouterType.init(allocator, gs_config, self) catch |e| {
             allocator.destroy(self);
@@ -122,8 +189,25 @@ pub const Service = struct {
         return self;
     }
 
+    fn lock(self: *Self, io: Io) void {
+        self.state_mu.lockUncancelable(io);
+    }
+
+    fn unlock(self: *Self, io: Io) void {
+        self.state_mu.unlock(io);
+    }
+
+    fn activateIo(self: *Self, io: Io) void {
+        std.debug.assert(self.active_io == null);
+        self.active_io = io;
+    }
+
+    fn deactivateIo(self: *Self) void {
+        self.active_io = null;
+    }
+
     /// Release all resources owned by this Service.
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: Io) void {
         for (self.pending_sends.items) |p| {
             self.allocator.free(p.peer);
             self.allocator.free(p.data);
@@ -133,10 +217,8 @@ pub const Service = struct {
         // Clean up outbound streams
         var os_iter = self.outbound_streams.iterator();
         while (os_iter.next()) |entry| {
-            if (self.io) |io| {
-                entry.value_ptr.*.close(io);
-            }
-            entry.value_ptr.*.destroyBacking(self.allocator);
+            entry.value_ptr.*.close(io);
+            entry.value_ptr.*.release(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.outbound_streams.deinit();
@@ -167,43 +249,25 @@ pub const Service = struct {
         else
             return;
 
-        self.io = io;
+        var installed_stream: ?*ManagedStream = null;
+        defer if (installed_stream) |managed| managed.release(self.allocator);
 
-        // Register inbound peer and store stream for bidirectional gossip.
-        self.router.addPeer(peer_id) catch {};
         {
-            const StreamT = @TypeOf(stream.*);
-            const heap_stream = self.allocator.create(StreamT) catch return;
-            heap_stream.* = stream.*;
-            if (@hasDecl(StreamT, "transferOwnership")) {
-                stream.transferOwnership();
+            self.lock(io);
+            defer self.unlock(io);
+            self.activateIo(io);
+            defer self.deactivateIo();
+
+            self.router.addPeer(peer_id) catch {};
+            if (try self.installPeerStream(peer_id, stream)) |managed| {
+                managed.retain();
+                installed_stream = managed;
+            } else {
+                log.info("gossipsub: keeping existing peer stream for duplicate inbound stream", .{});
             }
-            const any = AnyStream.wrap(StreamT, heap_stream);
-            const owned = OwnedStream{
-                .stream = any,
-                .backing_ptr = @ptrCast(heap_stream),
-                .destroy_fn = struct {
-                    fn destroy(alloc: Allocator, ptr: *anyopaque) void {
-                        const p: *StreamT = @ptrCast(@alignCast(ptr));
-                        if (@hasDecl(StreamT, "deinit")) {
-                            p.deinit();
-                        }
-                        alloc.destroy(p);
-                    }
-                }.destroy,
-            };
-            if (self.outbound_streams.fetchRemove(peer_id)) |o| {
-                o.value.destroy_fn(self.allocator, o.value.backing_ptr);
-                self.allocator.free(o.key);
-            }
-            self.outbound_streams.put(
-                self.allocator.dupe(u8, peer_id) catch return,
-                owned,
-            ) catch {};
+            self.sendSubscriptionAnnouncement(peer_id);
+            log.info("gossipsub: announced {d} subscriptions to inbound peer", .{self.tracked_subscriptions.count()});
         }
-        // Announce our topic subscriptions to this peer
-        self.sendSubscriptionAnnouncement(peer_id);
-        log.info("gossipsub: announced {d} subscriptions to inbound peer", .{self.tracked_subscriptions.count()});
 
         var decoder = FrameDecoder.init(self.allocator);
         defer decoder.deinit();
@@ -229,9 +293,13 @@ pub const Service = struct {
             while (decoder.next() catch null) |frame| {
                 defer self.allocator.free(frame);
                 log.debug("gossipsub: decoded frame of {d} bytes", .{frame.len});
+                self.lock(io);
+                self.activateIo(io);
                 self.router.handleRpc(peer_id, frame) catch |err| {
                     log.warn("gossipsub: handleRpc error: {}", .{err});
                 };
+                self.deactivateIo();
+                self.unlock(io);
             }
         }
     }
@@ -247,49 +315,14 @@ pub const Service = struct {
         else
             return;
 
-        self.io = io;
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
 
-        // Heap-allocate a copy of the stream so the AnyStream pointer
-        // outlives the caller's stack frame (newStream/openStream).
-        const StreamT = @TypeOf(stream.*);
-        const heap_stream = try self.allocator.create(StreamT);
-        heap_stream.* = stream.*;
-        if (@hasDecl(StreamT, "transferOwnership")) {
-            stream.transferOwnership();
+        if ((try self.installPeerStream(peer_id, stream)) == null) {
+            log.info("gossipsub: keeping existing peer stream for duplicate outbound stream", .{});
         }
-        const any = AnyStream.wrap(StreamT, heap_stream);
-
-        const owned = OwnedStream{
-            .stream = any,
-            .backing_ptr = @ptrCast(heap_stream),
-            .destroy_fn = struct {
-                fn destroy(alloc: Allocator, ptr: *anyopaque) void {
-                    const p: *StreamT = @ptrCast(@alignCast(ptr));
-                    if (@hasDecl(StreamT, "deinit")) {
-                        p.deinit();
-                    }
-                    alloc.destroy(p);
-                }
-            }.destroy,
-        };
-
-        // If peer already has an outbound stream, close the old one and free the old key
-        if (self.outbound_streams.fetchRemove(peer_id)) |old| {
-            old.value.close(io);
-            old.value.destroyBacking(self.allocator);
-            self.allocator.free(old.key);
-        }
-
-        const peer_copy = try self.allocator.dupe(u8, peer_id);
-        self.outbound_streams.put(peer_copy, owned) catch {
-            self.allocator.free(peer_copy);
-            heap_stream.close(io);
-            if (@hasDecl(StreamT, "deinit")) {
-                heap_stream.deinit();
-            }
-            self.allocator.destroy(heap_stream);
-            return;
-        };
 
         self.router.addPeer(peer_id) catch {};
         self.sendSubscriptionAnnouncement(peer_id);
@@ -327,11 +360,13 @@ pub const Service = struct {
     /// pending-sends queue for unit tests and unconnected peers.
     pub fn sendRpc(self: *Self, peer: []const u8, data: []const u8) bool {
         // Try direct write to outbound stream
-        if (self.io) |io| {
-            if (self.outbound_streams.get(peer)) |owned_stream| {
+        if (self.outbound_streams.get(peer)) |managed_stream| {
+            if (self.active_io) |io| {
+                managed_stream.retain();
+                defer managed_stream.release(self.allocator);
                 var total: usize = 0;
                 while (total < data.len) {
-                    const n = owned_stream.write(io, data[total..]) catch return false;
+                    const n = managed_stream.write(io, data[total..]) catch return false;
                     if (n == 0) return false;
                     total += n;
                 }
@@ -390,7 +425,11 @@ pub const Service = struct {
     // ---------------------------------------------------------------
 
     /// Subscribe to a topic. Joins the mesh for this topic.
-    pub fn subscribe(self: *Self, topic: []const u8) !void {
+    pub fn subscribe(self: *Self, io: Io, topic: []const u8) !void {
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
         try self.router.subscribe(topic);
         if (!self.tracked_subscriptions.contains(topic)) {
             const topic_copy = try self.allocator.dupe(u8, topic);
@@ -401,7 +440,11 @@ pub const Service = struct {
     }
 
     /// Unsubscribe from a topic. Leaves the mesh for this topic.
-    pub fn unsubscribe(self: *Self, topic: []const u8) !void {
+    pub fn unsubscribe(self: *Self, io: Io, topic: []const u8) !void {
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
         try self.router.unsubscribe(topic);
         if (self.tracked_subscriptions.fetchRemove(topic)) |kv| {
             self.allocator.free(kv.key);
@@ -410,22 +453,30 @@ pub const Service = struct {
 
     /// Publish a message to a topic.
     /// Returns the number of peers the message was sent to.
-    pub fn publish(self: *Self, topic: []const u8, data: []const u8) !u32 {
+    pub fn publish(self: *Self, io: Io, topic: []const u8, data: []const u8) !u32 {
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
         return try self.router.publish(topic, data);
     }
 
     /// Notify the Router that a new peer has connected.
-    pub fn addPeer(self: *Self, peer_id: []const u8) !void {
+    pub fn addPeer(self: *Self, io: Io, peer_id: []const u8) !void {
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
         try self.router.addPeer(peer_id);
     }
 
     /// Notify the Router that a peer has disconnected.
-    pub fn removePeer(self: *Self, peer_id: []const u8) void {
+    pub fn removePeer(self: *Self, io: Io, peer_id: []const u8) void {
+        self.lock(io);
+        defer self.unlock(io);
         if (self.outbound_streams.fetchRemove(peer_id)) |entry| {
-            if (self.io) |io| {
-                entry.value.close(io);
-            }
-            entry.value.destroyBacking(self.allocator);
+            entry.value.close(io);
+            entry.value.release(self.allocator);
             self.allocator.free(entry.key);
         }
         self.router.removePeer(peer_id);
@@ -433,38 +484,54 @@ pub const Service = struct {
 
     /// Execute one heartbeat tick. Should be called periodically
     /// (e.g., every Config.heartbeat_interval_ms milliseconds).
-    pub fn heartbeat(self: *Self) !void {
+    pub fn heartbeat(self: *Self, io: Io) !void {
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
         try self.router.heartbeat();
     }
 
     /// Drain accumulated events from the Router.
     /// Caller owns the returned slice and must call `deinit()` on each event,
     /// then free the slice itself.
-    pub fn drainEvents(self: *Self) ![]Event {
+    pub fn drainEvents(self: *Self, io: Io) ![]Event {
+        self.lock(io);
+        defer self.unlock(io);
         return try self.router.drainEvents();
     }
 
     /// Pass a received RPC (protobuf bytes, without varint length prefix) to
     /// the Router for processing.
-    pub fn handleRpc(self: *Self, from_peer: []const u8, rpc_bytes: []const u8) !void {
+    pub fn handleRpc(self: *Self, io: Io, from_peer: []const u8, rpc_bytes: []const u8) !void {
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
         try self.router.handleRpc(from_peer, rpc_bytes);
     }
 
     /// Drain all pending outbound RPCs. Caller owns the returned slice
     /// and must free each entry's `peer` and `data` slices, plus the slice itself.
-    pub fn drainPendingSends(self: *Self) []PendingRpc {
+    pub fn drainPendingSends(self: *Self, io: Io) []PendingRpc {
+        self.lock(io);
+        defer self.unlock(io);
         const drained = self.pending_sends.toOwnedSlice(self.allocator) catch return &.{};
         self.pending_send_bytes = 0;
         return drained;
     }
 
     /// Set the current time (for testing or external time source).
-    pub fn setTime(self: *Self, ms: u64) void {
+    pub fn setTime(self: *Self, io: Io, ms: u64) void {
+        self.lock(io);
+        defer self.unlock(io);
         self.time_ms = ms;
     }
 
     /// Set the PRNG seed.
-    pub fn setSeed(self: *Self, seed: u64) void {
+    pub fn setSeed(self: *Self, io: Io, seed: u64) void {
+        self.lock(io);
+        defer self.unlock(io);
         self.rng_state = seed;
     }
 };
@@ -487,8 +554,8 @@ pub const Handler = struct {
 
     /// Called by the Switch when a connection to this peer closes.
     /// Matches rust-libp2p's on_connection_closed / FromSwarm::ConnectionClosed.
-    pub fn onPeerDisconnected(self: *Handler, peer_id: []const u8) void {
-        self.svc.removePeer(peer_id);
+    pub fn onPeerDisconnected(self: *Handler, io: Io, peer_id: []const u8) void {
+        self.svc.removePeer(io, peer_id);
     }
 };
 
@@ -510,35 +577,35 @@ const test_config: Config = .{
 
 test "Service init and deinit" {
     const svc = try Service.init(std.testing.allocator, .{});
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 }
 
 test "Service subscribe and unsubscribe" {
     const svc = try Service.init(std.testing.allocator, .{});
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 
-    try svc.subscribe("test-topic");
-    try svc.unsubscribe("test-topic");
+    try svc.subscribe(std.testing.io, "test-topic");
+    try svc.unsubscribe(std.testing.io, "test-topic");
 }
 
 test "Service subscribe, publish, heartbeat" {
     const svc = try Service.init(std.testing.allocator, test_config);
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 
-    try svc.subscribe("test-topic");
+    try svc.subscribe(std.testing.io, "test-topic");
 
     // Add a peer and publish
-    try svc.addPeer("peer-1");
+    try svc.addPeer(std.testing.io, "peer-1");
 
     // Run heartbeat to establish mesh
-    svc.setTime(1000);
-    try svc.heartbeat();
+    svc.setTime(std.testing.io, 1000);
+    try svc.heartbeat(std.testing.io);
 
     // Publish a message
-    _ = try svc.publish("test-topic", "hello");
+    _ = try svc.publish(std.testing.io, "test-topic", "hello");
 
     // Check pending sends
-    const sends = svc.drainPendingSends();
+    const sends = svc.drainPendingSends(std.testing.io);
     defer {
         for (sends) |s| {
             svc.allocator.free(s.peer);
@@ -547,15 +614,15 @@ test "Service subscribe, publish, heartbeat" {
         svc.allocator.free(sends);
     }
 
-    try svc.unsubscribe("test-topic");
-    svc.removePeer("peer-1");
+    try svc.unsubscribe(std.testing.io, "test-topic");
+    svc.removePeer(std.testing.io, "peer-1");
 }
 
 test "Service drainPendingSends returns empty when nothing pending" {
     const svc = try Service.init(std.testing.allocator, .{});
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 
-    const sends = svc.drainPendingSends();
+    const sends = svc.drainPendingSends(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), sends.len);
     svc.allocator.free(sends);
 }
@@ -565,13 +632,13 @@ test "Service sendRpc enforces pending queue limits" {
         .max_pending_sends = 1,
         .max_pending_send_bytes = 16,
     });
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 
     try std.testing.expect(svc.sendRpc("peer-1", "1234"));
     try std.testing.expect(!svc.sendRpc("peer-2", "5678"));
     try std.testing.expectEqual(@as(usize, 1), svc.pending_sends.items.len);
 
-    const sends = svc.drainPendingSends();
+    const sends = svc.drainPendingSends(std.testing.io);
     defer {
         for (sends) |s| {
             svc.allocator.free(s.peer);
@@ -585,12 +652,12 @@ test "Service sendRpc enforces pending queue limits" {
 
 test "Service setTime and setSeed" {
     const svc = try Service.init(std.testing.allocator, .{});
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 
-    svc.setTime(42000);
+    svc.setTime(std.testing.io, 42000);
     try std.testing.expectEqual(@as(u64, 42000), svc.currentTimeMs());
 
-    svc.setSeed(99);
+    svc.setSeed(std.testing.io, 99);
     const r1 = svc.randomU64();
     const r2 = svc.randomU64();
     try std.testing.expect(r1 != r2);
@@ -598,13 +665,13 @@ test "Service setTime and setSeed" {
 
 test "Service randomU64 is deterministic for same seed" {
     const svc = try Service.init(std.testing.allocator, .{});
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 
-    svc.setSeed(12345);
+    svc.setSeed(std.testing.io, 12345);
     const a1 = svc.randomU64();
     const a2 = svc.randomU64();
 
-    svc.setSeed(12345);
+    svc.setSeed(std.testing.io, 12345);
     const b1 = svc.randomU64();
     const b2 = svc.randomU64();
 
@@ -618,11 +685,11 @@ test "Service protocol id matches meshsub v1.2" {
 
 test "Service publish generates pending sends to mesh peers" {
     const svc = try Service.init(std.testing.allocator, test_config);
-    defer svc.deinit();
+    defer svc.deinit(std.testing.io);
 
-    try svc.subscribe("topic-a");
-    try svc.addPeer("peer-1");
-    try svc.addPeer("peer-2");
+    try svc.subscribe(std.testing.io, "topic-a");
+    try svc.addPeer(std.testing.io, "peer-1");
+    try svc.addPeer(std.testing.io, "peer-2");
 
     // Subscribe peers to the topic so they are eligible for mesh
     var subs = [_]?rpc.RPC.SubOpts{
@@ -631,15 +698,15 @@ test "Service publish generates pending sends to mesh peers" {
     var rpc_msg = rpc.RPC{ .subscriptions = &subs };
     const encoded = rpc_msg.encode(std.testing.allocator) catch unreachable;
     defer std.testing.allocator.free(encoded);
-    try svc.handleRpc("peer-1", encoded);
-    try svc.handleRpc("peer-2", encoded);
+    try svc.handleRpc(std.testing.io, "peer-1", encoded);
+    try svc.handleRpc(std.testing.io, "peer-2", encoded);
 
     // Heartbeat to graft peers into mesh
-    svc.setTime(1000);
-    try svc.heartbeat();
+    svc.setTime(std.testing.io, 1000);
+    try svc.heartbeat(std.testing.io);
 
     // Clear any sends from heartbeat (GRAFT messages)
-    const heartbeat_sends = svc.drainPendingSends();
+    const heartbeat_sends = svc.drainPendingSends(std.testing.io);
     for (heartbeat_sends) |s| {
         svc.allocator.free(s.peer);
         svc.allocator.free(s.data);
@@ -647,11 +714,11 @@ test "Service publish generates pending sends to mesh peers" {
     svc.allocator.free(heartbeat_sends);
 
     // Publish a message
-    const sent_count = try svc.publish("topic-a", "test-data");
+    const sent_count = try svc.publish(std.testing.io, "topic-a", "test-data");
     try std.testing.expect(sent_count > 0);
 
     // Verify pending sends were generated
-    const sends = svc.drainPendingSends();
+    const sends = svc.drainPendingSends(std.testing.io);
     defer {
         for (sends) |s| {
             svc.allocator.free(s.peer);
@@ -660,4 +727,144 @@ test "Service publish generates pending sends to mesh peers" {
         svc.allocator.free(sends);
     }
     try std.testing.expect(sends.len > 0);
+}
+
+test "duplicate inbound peer stream keeps original installed stream" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const TestStream = struct {
+        const Self = @This();
+
+        id: u8,
+        deinit_count: *usize,
+        owns_inner: bool = true,
+
+        pub fn read(_: *Self, _: Io, _: []u8) !usize {
+            return 0;
+        }
+
+        pub fn write(_: *Self, _: Io, data: []const u8) !usize {
+            return data.len;
+        }
+
+        pub fn closeRead(_: *Self, _: Io) void {}
+        pub fn closeWrite(_: *Self, _: Io) void {}
+        pub fn close(_: *Self, _: Io) void {}
+
+        pub fn deinit(self: *Self) void {
+            if (!self.owns_inner) return;
+            self.deinit_count.* += 1;
+            self.owns_inner = false;
+        }
+
+        pub fn transferOwnership(self: *Self) void {
+            self.owns_inner = false;
+        }
+    };
+
+    const svc = try Service.init(allocator, .{});
+    defer svc.deinit(io);
+
+    var deinit_count: usize = 0;
+    var stream_a = TestStream{ .id = 1, .deinit_count = &deinit_count };
+    var stream_b = TestStream{ .id = 2, .deinit_count = &deinit_count };
+
+    try svc.handleInbound(io, &stream_a, .{ .peer_id = @as(?[]const u8, "peer-1") });
+    try std.testing.expectEqual(@as(usize, 0), deinit_count);
+    try std.testing.expect(svc.outbound_streams.contains("peer-1"));
+
+    const stored_before = svc.outbound_streams.get("peer-1").?;
+    const first_backing = @as(*TestStream, @ptrCast(@alignCast(stored_before.owned.backing_ptr)));
+    try std.testing.expectEqual(@as(u8, 1), first_backing.id);
+
+    try svc.handleInbound(io, &stream_b, .{ .peer_id = @as(?[]const u8, "peer-1") });
+    try std.testing.expectEqual(@as(usize, 0), deinit_count);
+
+    const stored_after = svc.outbound_streams.get("peer-1").?;
+    const second_backing = @as(*TestStream, @ptrCast(@alignCast(stored_after.owned.backing_ptr)));
+    try std.testing.expectEqual(@as(u8, 1), second_backing.id);
+
+    svc.removePeer(io, "peer-1");
+    try std.testing.expectEqual(@as(usize, 1), deinit_count);
+}
+
+test "removePeer defers stream destruction until active inbound handler exits" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const BlockingStream = struct {
+        const Self = @This();
+
+        close_count: *usize,
+        deinit_count: *usize,
+        started: *Io.Event,
+        finish: *Io.Event,
+        started_once: bool = false,
+        owns_inner: bool = true,
+
+        pub fn read(self: *Self, read_io: Io, _: []u8) !usize {
+            if (!self.started_once) {
+                self.started_once = true;
+                self.started.set(read_io);
+            }
+            try self.finish.wait(read_io);
+            return 0;
+        }
+
+        pub fn write(_: *Self, _: Io, data: []const u8) !usize {
+            return data.len;
+        }
+
+        pub fn closeRead(_: *Self, _: Io) void {}
+        pub fn closeWrite(_: *Self, _: Io) void {}
+
+        pub fn close(self: *Self, _: Io) void {
+            self.close_count.* += 1;
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (!self.owns_inner) return;
+            self.deinit_count.* += 1;
+            self.owns_inner = false;
+        }
+
+        pub fn transferOwnership(self: *Self) void {
+            self.owns_inner = false;
+        }
+    };
+
+    const Runner = struct {
+        fn run(svc: *Service, runner_io: Io, stream: *BlockingStream, done: *Io.Event) void {
+            defer done.set(runner_io);
+            svc.handleInbound(runner_io, stream, .{ .peer_id = @as(?[]const u8, "peer-1") }) catch {};
+        }
+    };
+
+    const svc = try Service.init(allocator, .{});
+    defer svc.deinit(io);
+
+    var started: Io.Event = .unset;
+    var finish: Io.Event = .unset;
+    var done: Io.Event = .unset;
+    var close_count: usize = 0;
+    var deinit_count: usize = 0;
+    var stream = BlockingStream{
+        .close_count = &close_count,
+        .deinit_count = &deinit_count,
+        .started = &started,
+        .finish = &finish,
+    };
+    var group: Io.Group = .init;
+
+    group.async(io, Runner.run, .{ svc, io, &stream, &done });
+    try started.wait(io);
+
+    svc.removePeer(io, "peer-1");
+    try std.testing.expectEqual(@as(usize, 1), close_count);
+    try std.testing.expectEqual(@as(usize, 0), deinit_count);
+
+    finish.set(io);
+    try done.wait(io);
+    try std.testing.expectEqual(@as(usize, 1), deinit_count);
 }

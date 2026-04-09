@@ -59,7 +59,8 @@ pub const Handler = struct {
     }
 
     /// Called by Switch when a peer disconnects. Frees stored identify result.
-    pub fn onPeerDisconnected(self: *Handler, peer_id: []const u8) void {
+    pub fn onPeerDisconnected(self: *Handler, io: Io, peer_id: []const u8) void {
+        _ = io;
         if (self.peer_results.fetchOrderedRemove(peer_id)) |kv| {
             var result = kv.value;
             result.deinit(self.allocator);
