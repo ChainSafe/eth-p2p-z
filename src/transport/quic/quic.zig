@@ -765,6 +765,47 @@ test "QUIC stream supports half-close request-response" {
     try std.testing.expectEqual(@as(usize, 0), response_eof_n);
 }
 
+test "QUIC stream supports sequential writes before peer reads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ctx = TestContext.initPair(allocator, io) catch |err| {
+        std.log.warn("TestContext init failed: {}", .{err});
+        return;
+    };
+    defer ctx.deinit(io);
+
+    var client_stream = ctx.client_conn.openStream(io) catch |err| {
+        std.log.warn("openStream failed: {}", .{err});
+        return;
+    };
+    defer client_stream.deinit();
+
+    const chunks = [_][]const u8{ "hello", "-", "world" };
+    for (chunks) |chunk| {
+        try std.testing.expectEqual(chunk.len, try client_stream.write(io, chunk));
+    }
+    client_stream.closeWrite(io);
+
+    var server_stream = ctx.server_conn.acceptStream(io) catch |err| {
+        std.log.warn("acceptStream failed: {}", .{err});
+        return;
+    };
+    defer server_stream.deinit();
+
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(allocator);
+
+    while (true) {
+        var buf: [64]u8 = undefined;
+        const n = try server_stream.read(io, &buf);
+        if (n == 0) break;
+        try received.appendSlice(allocator, buf[0..n]);
+    }
+
+    try std.testing.expectEqualSlices(u8, "hello-world", received.items);
+}
+
 // ── Test Helpers ──────────────────────────────────────────────────────
 
 const TestContext = struct {

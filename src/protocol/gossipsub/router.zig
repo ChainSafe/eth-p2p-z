@@ -264,14 +264,15 @@ pub fn Router(comptime Handler: type) type {
                 var iter = self.peer_scores.iterator();
                 while (iter.next()) |entry| {
                     entry.value_ptr.deinit();
+                    self.allocator.free(entry.key_ptr.*);
                 }
                 self.peer_scores.deinit();
             }
             self.topic_score_params.deinit();
 
             // v1.3 extensions
-            self.extensions_sent.deinit();
-            self.peer_extensions.deinit();
+            deinitKeyedMap(&self.extensions_sent, self.allocator);
+            deinitKeyedMap(&self.peer_extensions, self.allocator);
 
             // v1.2 per-peer IDONTWANT
             {
@@ -426,7 +427,9 @@ pub fn Router(comptime Handler: type) type {
         pub fn addPeer(self: *Self, peer_id: []const u8) !void {
             // Initialize scoring for this peer
             if (!self.peer_scores.contains(peer_id)) {
-                try self.peer_scores.put(peer_id, PeerScore.init(self.allocator, self.handler.currentTimeMs()));
+                const owned_peer_id = try self.allocator.dupe(u8, peer_id);
+                errdefer self.allocator.free(owned_peer_id);
+                try self.peer_scores.put(owned_peer_id, PeerScore.init(self.allocator, self.handler.currentTimeMs()));
             }
 
             // v1.3: Send extensions on first contact
@@ -473,11 +476,16 @@ pub fn Router(comptime Handler: type) type {
             }
 
             // Remove extensions
-            _ = self.peer_extensions.remove(peer_id);
-            _ = self.extensions_sent.remove(peer_id);
+            if (self.peer_extensions.fetchRemove(peer_id)) |kv| {
+                self.allocator.free(kv.key);
+            }
+            if (self.extensions_sent.fetchRemove(peer_id)) |kv| {
+                self.allocator.free(kv.key);
+            }
 
             // Remove scoring (keep score data for retain_score_ms - simplified: remove immediately)
             if (self.peer_scores.fetchRemove(peer_id)) |kv| {
+                self.allocator.free(kv.key);
                 var ps = kv.value;
                 ps.deinit();
             }
@@ -1082,7 +1090,9 @@ pub fn Router(comptime Handler: type) type {
             const extensions = config_mod.Extensions{
                 .partial_messages = ext.getPartialMessages(),
             };
-            try self.peer_extensions.put(from_peer, extensions);
+            const owned_peer_id = try self.allocator.dupe(u8, from_peer);
+            errdefer self.allocator.free(owned_peer_id);
+            try self.peer_extensions.put(owned_peer_id, extensions);
 
             try self.appendOwnedEvent(.{ .peer_extensions = .{
                 .peer_id = from_peer,
@@ -1113,7 +1123,10 @@ pub fn Router(comptime Handler: type) type {
             const frame = codec.encodeRpc(self.allocator, &rpc_msg) catch return;
             defer self.allocator.free(frame);
             if (self.handler.sendRpc(peer, frame)) {
-                self.extensions_sent.put(peer, {}) catch {};
+                const owned_peer_id = self.allocator.dupe(u8, peer) catch return;
+                self.extensions_sent.put(owned_peer_id, {}) catch {
+                    self.allocator.free(owned_peer_id);
+                };
             }
         }
 

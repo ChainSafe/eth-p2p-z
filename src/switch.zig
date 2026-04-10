@@ -200,8 +200,10 @@ pub fn Switch(comptime config: SwitchConfig) type {
         }
 
         /// Dial a remote peer via QUIC multiaddr.
-        /// Creates the client engine lazily on first call. Returns peer_id bytes
-        /// (owned by the connections map — valid until peer disconnects).
+        /// Creates the client engine lazily on first call.
+        ///
+        /// Returns caller-owned peer_id bytes. The caller must free the returned
+        /// slice with this switch's allocator.
         pub fn dial(self: *Self, io: Io, addr: Multiaddr) ![]const u8 {
             const parsed = try quic_mod.parseQuicMultiaddr(addr);
             if (self.active_connection_count >= self.engine_config.max_connections) {
@@ -233,7 +235,15 @@ pub fn Switch(comptime config: SwitchConfig) type {
             var pid_buf: [128]u8 = undefined;
             const raw_peer_id = peer_id.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
 
-            // Register connection (heap-owned key)
+            if (self.connections.contains(raw_peer_id)) {
+                return error.AlreadyConnected;
+            }
+
+            const returned_pid = try self.allocator.dupe(u8, raw_peer_id);
+            errdefer self.allocator.free(returned_pid);
+
+            // Register connection under a separate heap-owned key so the
+            // returned peer ID remains independent of connection-map lifetime.
             const owned_pid = try self.allocator.dupe(u8, raw_peer_id);
             errdefer self.allocator.free(owned_pid);
             try self.connections.put(owned_pid, conn);
@@ -242,7 +252,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             self.active_connection_count += 1;
             self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn, .{} });
 
-            return owned_pid;
+            return returned_pid;
         }
 
         /// Background fiber: accepts inbound connections from the server engine.
@@ -296,25 +306,50 @@ pub fn Switch(comptime config: SwitchConfig) type {
             };
             // Wait for TLS handshake to complete (server: immediate, client: suspends)
             var pid_buf: [128]u8 = undefined;
-            const peer_id: ?[]const u8 = if (conn.waitHandshake(io)) |pid|
-                pid.toBytes(&pid_buf) catch null
-            else |_|
-                null;
+            const peer_id: []const u8 = blk: {
+                const pid = conn.waitHandshake(io) catch |err| {
+                    log.warn("swarmConnectionTask: handshake failed: {}", .{err});
+                    conn.close(io);
+                    conn.deinit();
+                    return;
+                };
+                break :blk pid.toBytes(&pid_buf) catch {
+                    log.warn("swarmConnectionTask: peer id encoding failed", .{});
+                    conn.close(io);
+                    conn.deinit();
+                    return;
+                };
+            };
 
             // Register if not already registered (accepted connections from listen)
-            if (peer_id) |pid| {
-                if (!self.connections.contains(pid)) {
-                    const owned = self.allocator.dupe(u8, pid) catch null;
-                    if (owned) |key| {
-                        self.connections.put(key, conn) catch {
-                            self.allocator.free(key);
-                        };
-                    }
+            if (self.connections.get(peer_id)) |existing| {
+                if (existing != conn) {
+                    log.info("swarmConnectionTask: rejecting duplicate connection for peer", .{});
+                    conn.close(io);
+                    conn.deinit();
+                    return;
                 }
+            } else {
+                const owned = self.allocator.dupe(u8, peer_id) catch {
+                    log.warn("swarmConnectionTask: failed to allocate peer id key", .{});
+                    conn.close(io);
+                    conn.deinit();
+                    return;
+                };
+                self.connections.put(owned, conn) catch |err| {
+                    log.warn("swarmConnectionTask: failed to register connection: {}", .{err});
+                    self.allocator.free(owned);
+                    conn.close(io);
+                    conn.deinit();
+                    return;
+                };
+            }
 
-                log.info("swarmConnectionTask: peer_id resolved, entering stream accept loop", .{});
-                // Auto-trigger identify (like go-libp2p's IDService).
-                // Runs in background so it doesn't block stream acceptance.
+            log.info("swarmConnectionTask: peer_id resolved, entering stream accept loop", .{});
+            // Auto-trigger identify (like go-libp2p's IDService).
+            // Runs in background so it doesn't block stream acceptance.
+            const identify_peer_id = self.allocator.dupe(u8, peer_id) catch null;
+            if (identify_peer_id) |pid| {
                 self.background.async(io, Self.identifyPeer, .{ self, io, pid });
             }
 
@@ -327,22 +362,27 @@ pub fn Switch(comptime config: SwitchConfig) type {
                     log.debug("swarmConnectionTask: connection closed", .{});
                     break;
                 };
+                const stream_peer_id = self.allocator.dupe(u8, peer_id) catch {
+                    log.warn("swarmConnectionTask: failed to allocate peer id for inbound stream", .{});
+                    var stream = quic_mod.Stream{ .inner = s_inner };
+                    stream.close(io);
+                    stream.deinit();
+                    continue;
+                };
                 self.background.async(io, Self.swarmStreamTask, .{
-                    self, io, quic_mod.Stream{ .inner = s_inner }, SwarmStreamCtx{ .peer_id = peer_id },
+                    self, io, quic_mod.Stream{ .inner = s_inner }, SwarmStreamCtx{ .peer_id = stream_peer_id },
                 });
             }
 
-            if (peer_id) |pid| {
-                if (self.connections.get(pid) == conn) {
-                    if (self.connections.fetchRemove(pid)) |kv| {
-                        self.notifyPeerDisconnected(io, kv.key);
-                        self.allocator.free(kv.key);
-                        kv.value.deinit();
-                        return;
-                    }
-                } else {
-                    log.info("swarmConnectionTask: connection closed but map points to a different conn for peer", .{});
+            if (self.connections.get(peer_id) == conn) {
+                if (self.connections.fetchRemove(peer_id)) |kv| {
+                    self.notifyPeerDisconnected(io, kv.key);
+                    self.allocator.free(kv.key);
+                    kv.value.deinit();
+                    return;
                 }
+            } else {
+                log.info("swarmConnectionTask: connection closed but map points to a different conn for peer", .{});
             }
 
             conn.deinit();
@@ -352,6 +392,9 @@ pub fn Switch(comptime config: SwitchConfig) type {
         fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: SwarmStreamCtx) void {
             log.info("swarmStreamTask: dispatching stream", .{});
             var mutable_stream = s;
+            defer {
+                if (ctx.peer_id) |peer_id| self.allocator.free(peer_id);
+            }
             defer mutable_stream.deinit();
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
@@ -419,6 +462,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// Auto-trigger identify on a newly connected peer.
         /// No-op if identify is not registered in this Switch's protocols.
         fn identifyPeer(self: *Self, io: Io, peer_id: []const u8) void {
+            defer self.allocator.free(peer_id);
             if (has_identify) {
                 self.newStream(io, peer_id, identify_mod.Handler) catch |err| {
                     log.warn("auto-identify failed for peer: {}", .{err});
@@ -698,6 +742,7 @@ test "Swarm ping over QUIC" {
     defer dial_addr.deinit();
 
     const peer_id = client.dial(io, dial_addr) catch return;
+    defer allocator.free(peer_id);
 
     // Ping via newStream — Handler generates payload and measures RTT internally
     try client.newStream(io, peer_id, ping_mod.Handler);
@@ -752,8 +797,63 @@ test "Switch dial enforces max_connections" {
     }) catch return;
     defer dial_addr.deinit();
 
-    _ = try client.dial(io, dial_addr);
+    const peer_id = try client.dial(io, dial_addr);
+    defer allocator.free(peer_id);
     try std.testing.expectError(error.ConnectionLimitReached, client.dial(io, dial_addr));
+}
+
+test "Switch rejects duplicate outbound connection to same peer" {
+    const ma = multiaddr;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server_key = identity.KeyPair.generate(.ECDSA) catch return;
+    defer server_key.deinit();
+    var client_key = identity.KeyPair.generate(.ECDSA) catch return;
+    defer client_key.deinit();
+
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{},
+    });
+
+    var server = Node.init(allocator, .{ .host_identity = &server_key }, .{});
+    defer server.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
+    }) catch return;
+    defer listen_addr.deinit();
+    try server.listen(io, listen_addr);
+
+    var client = Node.init(allocator, .{ .host_identity = &client_key }, .{});
+    defer client.deinit(io);
+
+    const bound = server.listenAddrs();
+    if (bound.len == 0) return error.TestUnexpectedResult;
+    const port = switch (bound[0]) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr.deinit();
+
+    const peer_id = try client.dial(io, dial_addr);
+    defer allocator.free(peer_id);
+
+    if (client.dial(io, dial_addr)) |duplicate_peer_id| {
+        allocator.free(duplicate_peer_id);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.AlreadyConnected, err);
+    }
 }
 
 test "Switch enforces max_inbound_connections_per_ip" {
@@ -806,7 +906,8 @@ test "Switch enforces max_inbound_connections_per_ip" {
     }) catch return;
     defer dial_addr.deinit();
 
-    _ = try client1.dial(io, dial_addr);
+    const peer_id1 = try client1.dial(io, dial_addr);
+    defer allocator.free(peer_id1);
 
     const settle_timeout: Io.Timeout = .{ .duration = .{
         .raw = Io.Duration.fromMilliseconds(100),
@@ -814,7 +915,9 @@ test "Switch enforces max_inbound_connections_per_ip" {
     } };
     settle_timeout.sleep(io) catch {};
 
-    _ = client2.dial(io, dial_addr) catch {};
+    if (client2.dial(io, dial_addr)) |peer_id2| {
+        allocator.free(peer_id2);
+    } else |_| {}
     settle_timeout.sleep(io) catch {};
 
     try std.testing.expectEqual(@as(usize, 1), server.active_connection_count);
@@ -875,6 +978,7 @@ test "Swarm gossipsub subscription over QUIC" {
     defer dial_addr.deinit();
 
     const peer_id = client.dial(io, dial_addr) catch return;
+    defer allocator.free(peer_id);
 
     // Open gossipsub stream -- newStream auto-provides peer_id ctx
     client.newStream(io, peer_id, gossipsub_service.Handler) catch return;
@@ -1019,6 +1123,7 @@ test "Switch removes disconnected peers from the connection map" {
     defer dial_addr.deinit();
 
     const peer_id = try client.dial(io, dial_addr);
+    defer allocator.free(peer_id);
 
     const settle_timeout: Io.Timeout = .{ .duration = .{
         .raw = Io.Duration.fromMilliseconds(100),

@@ -51,6 +51,9 @@ fn tryQueueOneUncancelable(comptime Elem: type, queue: *Io.Queue(Elem), io: Io, 
 }
 
 const unsent_retry_interval_ms: i64 = 10;
+/// Large req/resp bodies can burst many QUIC read callbacks before the
+/// application stream reader is rescheduled.
+const stream_read_queue_capacity: usize = 8192;
 
 const ProcessWait = union(enum) {
     immediate,
@@ -114,7 +117,7 @@ pub const QuicStream = struct {
     lsquic_stream: ?*lsquic.lsquic_stream_t,
     conn: *QuicConnection,
     io: Io,
-    read_queue_buf: [16]ReadEvent,
+    read_queue_buf: [stream_read_queue_capacity]ReadEvent,
     read_queue: Io.Queue(ReadEvent),
     write_queue_buf: [1]WriteEvent,
     write_queue: Io.Queue(WriteEvent),
