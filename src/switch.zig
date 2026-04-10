@@ -6,7 +6,6 @@ const log = std.log.scoped(.@"switch");
 const transport_mod = @import("transport/transport.zig");
 const protocol_mod = @import("protocol/protocol.zig");
 const multistream = @import("protocol/multistream.zig");
-const identify_mod = @import("protocol/identify.zig");
 const engine_mod = @import("transport/quic/engine.zig");
 const QuicEngine = engine_mod.QuicEngine;
 const quic_mod = @import("transport/quic/quic.zig");
@@ -346,12 +345,6 @@ pub fn Switch(comptime config: SwitchConfig) type {
             }
 
             log.info("swarmConnectionTask: peer_id resolved, entering stream accept loop", .{});
-            // Auto-trigger identify (like go-libp2p's IDService).
-            // Runs in background so it doesn't block stream acceptance.
-            const identify_peer_id = self.allocator.dupe(u8, peer_id) catch null;
-            if (identify_peer_id) |pid| {
-                self.background.async(io, Self.identifyPeer, .{ self, io, pid });
-            }
 
             // Accept streams loop — blocks until connection closes or engine stops.
             // Note: stream_group tasks are implicitly cleaned up when the parent
@@ -450,25 +443,6 @@ pub fn Switch(comptime config: SwitchConfig) type {
         const SwarmStreamCtx = struct {
             peer_id: ?[]const u8 = null,
         };
-
-        /// Whether identify is registered as a protocol (comptime check).
-        const has_identify = blk: {
-            for (config.protocols) |P| {
-                if (P == identify_mod.Handler) break :blk true;
-            }
-            break :blk false;
-        };
-
-        /// Auto-trigger identify on a newly connected peer.
-        /// No-op if identify is not registered in this Switch's protocols.
-        fn identifyPeer(self: *Self, io: Io, peer_id: []const u8) void {
-            defer self.allocator.free(peer_id);
-            if (has_identify) {
-                self.newStream(io, peer_id, identify_mod.Handler) catch |err| {
-                    log.warn("auto-identify failed for peer: {}", .{err});
-                };
-            }
-        }
 
         /// Gracefully shut down the Switch.
         /// Cancels background fibers, stops engines, notifies handlers, cleans up.

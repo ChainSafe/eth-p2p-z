@@ -35,7 +35,7 @@ const max_varint_bytes: u32 = 10;
 
 /// Identify protocol handler.
 /// Identify is stateful — stores per-peer results.
-/// Follows go-libp2p pattern: auto-triggered on new connections by the Switch.
+/// Applications should open this protocol explicitly after accepting a peer.
 pub const Handler = struct {
     allocator: std.mem.Allocator,
     config: Config,
