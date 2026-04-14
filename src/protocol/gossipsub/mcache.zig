@@ -246,11 +246,8 @@ pub const MessageCache = struct {
 
         if (self.history.items[history_len - 1]) |*last_window| {
             for (last_window.items) |entry| {
-                if (self.msgs.fetchRemove(entry.mid)) |*kv| {
-                    self.allocator.free(kv.key);
-                    self.allocator.free(kv.value.backing);
-                }
-
+                // `peertx` keys borrow the canonical message-id allocation from `msgs`.
+                // Remove the peer-transmission entry before freeing the backing message-id.
                 if (self.peertx.fetchRemove(entry.mid)) |*kv| {
                     var peer_map = kv.value;
                     var key_iter = peer_map.keyIterator();
@@ -258,6 +255,11 @@ pub const MessageCache = struct {
                         self.allocator.free(key.*);
                     }
                     peer_map.deinit();
+                }
+
+                if (self.msgs.fetchRemove(entry.mid)) |*kv| {
+                    self.allocator.free(kv.key);
+                    self.allocator.free(kv.value.backing);
                 }
             }
             last_window.deinit(self.allocator);
@@ -507,15 +509,20 @@ test "MessageCache shift evicts oldest window" {
     try cache.put(&stored.message);
 
     try std.testing.expectEqual(@as(u32, 1), cache.msgs.count());
+    _ = try cache.getForPeer("p1s1", "peer-a");
+    try std.testing.expectEqual(@as(u32, 1), cache.peertx.count());
 
     cache.shift();
     try std.testing.expectEqual(@as(u32, 1), cache.msgs.count());
+    try std.testing.expectEqual(@as(u32, 1), cache.peertx.count());
 
     cache.shift();
     try std.testing.expectEqual(@as(u32, 1), cache.msgs.count());
+    try std.testing.expectEqual(@as(u32, 1), cache.peertx.count());
 
     cache.shift();
     try std.testing.expectEqual(@as(u32, 0), cache.msgs.count());
+    try std.testing.expectEqual(@as(u32, 0), cache.peertx.count());
 }
 
 test "MessageCache shift empty cache" {
