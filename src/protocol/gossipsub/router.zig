@@ -126,7 +126,11 @@ pub fn Router(comptime Handler: type) type {
                 };
             }
 
-            fn deinit(self: *PeerScore) void {
+            fn deinit(self: *PeerScore, allocator: std.mem.Allocator) void {
+                var key_iter = self.topic_scores.keyIterator();
+                while (key_iter.next()) |key| {
+                    allocator.free(key.*);
+                }
                 self.topic_scores.deinit();
             }
 
@@ -263,7 +267,7 @@ pub fn Router(comptime Handler: type) type {
             {
                 var iter = self.peer_scores.iterator();
                 while (iter.next()) |entry| {
-                    entry.value_ptr.deinit();
+                    entry.value_ptr.deinit(self.allocator);
                     self.allocator.free(entry.key_ptr.*);
                 }
                 self.peer_scores.deinit();
@@ -487,7 +491,7 @@ pub fn Router(comptime Handler: type) type {
             if (self.peer_scores.fetchRemove(peer_id)) |kv| {
                 self.allocator.free(kv.key);
                 var ps = kv.value;
-                ps.deinit();
+                ps.deinit(self.allocator);
             }
         }
 
@@ -1148,36 +1152,32 @@ pub fn Router(comptime Handler: type) type {
         /// Record first message delivery for scoring.
         fn recordFirstDelivery(self: *Self, peer_id: []const u8, topic: []const u8) void {
             const ps = self.peer_scores.getPtr(peer_id) orelse return;
-            const gop = ps.topic_scores.getOrPut(topic) catch return;
-            if (!gop.found_existing) gop.value_ptr.* = .{};
-            gop.value_ptr.first_message_deliveries += 1;
+            const topic_score = self.getOrPutPeerTopicScore(ps, topic) orelse return;
+            topic_score.first_message_deliveries += 1;
         }
 
         /// Record mesh message delivery for scoring.
         fn recordMeshDelivery(self: *Self, peer_id: []const u8, topic: []const u8) void {
             const ps = self.peer_scores.getPtr(peer_id) orelse return;
-            const gop = ps.topic_scores.getOrPut(topic) catch return;
-            if (!gop.found_existing) gop.value_ptr.* = .{};
-            if (gop.value_ptr.in_mesh) {
-                gop.value_ptr.mesh_message_deliveries += 1;
+            const topic_score = self.getOrPutPeerTopicScore(ps, topic) orelse return;
+            if (topic_score.in_mesh) {
+                topic_score.mesh_message_deliveries += 1;
             }
         }
 
         /// Record invalid message delivery for scoring.
         pub fn recordInvalidMessage(self: *Self, peer_id: []const u8, topic: []const u8) void {
             const ps = self.peer_scores.getPtr(peer_id) orelse return;
-            const gop = ps.topic_scores.getOrPut(topic) catch return;
-            if (!gop.found_existing) gop.value_ptr.* = .{};
-            gop.value_ptr.invalid_message_deliveries += 1;
+            const topic_score = self.getOrPutPeerTopicScore(ps, topic) orelse return;
+            topic_score.invalid_message_deliveries += 1;
         }
 
         /// Mark a peer as in-mesh for a topic (for scoring).
         fn scoreGraft(self: *Self, peer_id: []const u8, topic: []const u8) void {
             const ps = self.peer_scores.getPtr(peer_id) orelse return;
-            const gop = ps.topic_scores.getOrPut(topic) catch return;
-            if (!gop.found_existing) gop.value_ptr.* = .{};
-            gop.value_ptr.in_mesh = true;
-            gop.value_ptr.mesh_joined_ms = self.handler.currentTimeMs();
+            const topic_score = self.getOrPutPeerTopicScore(ps, topic) orelse return;
+            topic_score.in_mesh = true;
+            topic_score.mesh_joined_ms = self.handler.currentTimeMs();
         }
 
         /// Mark a peer as out-of-mesh for a topic (for scoring).
@@ -1186,6 +1186,23 @@ pub fn Router(comptime Handler: type) type {
             if (ps.topic_scores.getPtr(topic)) |ts| {
                 ts.in_mesh = false;
             }
+        }
+
+        fn getOrPutPeerTopicScore(self: *Self, peer_score: *PeerScore, topic: []const u8) ?*TopicScore {
+            if (peer_score.topic_scores.getPtr(topic)) |existing| return existing;
+
+            const owned_topic = self.allocator.dupe(u8, topic) catch return null;
+            const gop = peer_score.topic_scores.getOrPut(owned_topic) catch {
+                self.allocator.free(owned_topic);
+                return null;
+            };
+            if (gop.found_existing) {
+                self.allocator.free(owned_topic);
+                return gop.value_ptr;
+            }
+            gop.key_ptr.* = owned_topic;
+            gop.value_ptr.* = .{};
+            return gop.value_ptr;
         }
 
         /// Decay score counters during heartbeat.
@@ -2428,6 +2445,31 @@ test "Router v1.3 extensions only accepted once" {
     // First value should still be in effect
     const peer_ext = router.peer_extensions.get("peer-1").?;
     try std.testing.expect(peer_ext.partial_messages);
+}
+
+test "Router scoring owns topic keys" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.initWithScoring(allocator, .{}, &handler, PeerScoreParams{}, null);
+    defer router.deinit();
+
+    try router.addPeer("peer-1");
+
+    var topic = try allocator.dupe(u8, "topic-a");
+    defer allocator.free(topic);
+
+    router.recordInvalidMessage("peer-1", topic);
+
+    const ps = router.peer_scores.getPtr("peer-1").?;
+    try std.testing.expectEqual(@as(usize, 1), ps.topic_scores.count());
+    try std.testing.expect(ps.topic_scores.getPtr("topic-a") != null);
+
+    topic[0] = 'x';
+
+    try std.testing.expect(ps.topic_scores.getPtr("topic-a") != null);
+    try std.testing.expect(ps.topic_scores.getPtr(topic) == null);
 }
 
 test "Router v1.1 GRAFT rejected for low-score peer" {
