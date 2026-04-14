@@ -127,6 +127,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
         server_engine: ?*QuicEngine = null,
         client_engine: ?*QuicEngine = null,
         connections: std.StringHashMap(*engine_mod.QuicConnection),
+        connections_mu: Io.Mutex,
         inbound_ip_counts: std.AutoHashMap(IpLimitKey, usize),
         active_connection_count: usize,
         background: Io.Group,
@@ -140,6 +141,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 .allocator = allocator,
                 .handlers = handlers,
                 .connections = std.StringHashMap(*engine_mod.QuicConnection).init(allocator),
+                .connections_mu = .init,
                 .inbound_ip_counts = std.AutoHashMap(IpLimitKey, usize).init(allocator),
                 .active_connection_count = 0,
                 .background = .init,
@@ -198,6 +200,47 @@ pub fn Switch(comptime config: SwitchConfig) type {
             return eng.localAddrs();
         }
 
+        fn lockConnections(self: *Self, io: Io) void {
+            self.connections_mu.lockUncancelable(io);
+        }
+
+        fn unlockConnections(self: *Self, io: Io) void {
+            self.connections_mu.unlock(io);
+        }
+
+        pub fn isPeerConnected(self: *Self, io: Io, peer_id: []const u8) bool {
+            self.lockConnections(io);
+            defer self.unlockConnections(io);
+            return self.connections.contains(peer_id);
+        }
+
+        pub fn snapshotConnectedPeerIds(self: *Self, io: Io, allocator: Allocator) ![][]const u8 {
+            self.lockConnections(io);
+            defer self.unlockConnections(io);
+
+            var peer_ids = try allocator.alloc([]const u8, self.connections.count());
+            var copied: usize = 0;
+            errdefer {
+                for (peer_ids[0..copied]) |peer_id| allocator.free(peer_id);
+                allocator.free(peer_ids);
+            }
+
+            var iter = self.connections.iterator();
+            while (iter.next()) |entry| : (copied += 1) {
+                peer_ids[copied] = try allocator.dupe(u8, entry.key_ptr.*);
+            }
+            return peer_ids;
+        }
+
+        pub fn disconnectPeer(self: *Self, io: Io, peer_id: []const u8) bool {
+            self.lockConnections(io);
+            defer self.unlockConnections(io);
+
+            const conn = self.connections.get(peer_id) orelse return false;
+            conn.close(io);
+            return true;
+        }
+
         /// Dial a remote peer via QUIC multiaddr.
         /// Creates the client engine lazily on first call.
         ///
@@ -234,18 +277,24 @@ pub fn Switch(comptime config: SwitchConfig) type {
             var pid_buf: [128]u8 = undefined;
             const raw_peer_id = peer_id.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
 
-            if (self.connections.contains(raw_peer_id)) {
-                return error.AlreadyConnected;
-            }
+            const returned_pid = blk: {
+                self.lockConnections(io);
+                defer self.unlockConnections(io);
 
-            const returned_pid = try self.allocator.dupe(u8, raw_peer_id);
-            errdefer self.allocator.free(returned_pid);
+                if (self.connections.contains(raw_peer_id)) {
+                    return error.AlreadyConnected;
+                }
 
-            // Register connection under a separate heap-owned key so the
-            // returned peer ID remains independent of connection-map lifetime.
-            const owned_pid = try self.allocator.dupe(u8, raw_peer_id);
-            errdefer self.allocator.free(owned_pid);
-            try self.connections.put(owned_pid, conn);
+                const returned_pid = try self.allocator.dupe(u8, raw_peer_id);
+                errdefer self.allocator.free(returned_pid);
+
+                // Register connection under a separate heap-owned key so the
+                // returned peer ID remains independent of connection-map lifetime.
+                const owned_pid = try self.allocator.dupe(u8, raw_peer_id);
+                errdefer self.allocator.free(owned_pid);
+                try self.connections.put(owned_pid, conn);
+                break :blk returned_pid;
+            };
 
             // Spawn connection handler in background
             self.active_connection_count += 1;
@@ -321,27 +370,32 @@ pub fn Switch(comptime config: SwitchConfig) type {
             };
 
             // Register if not already registered (accepted connections from listen)
-            if (self.connections.get(peer_id)) |existing| {
-                if (existing != conn) {
-                    log.info("swarmConnectionTask: rejecting duplicate connection for peer", .{});
-                    conn.close(io);
-                    conn.deinit();
-                    return;
+            {
+                self.lockConnections(io);
+                defer self.unlockConnections(io);
+
+                if (self.connections.get(peer_id)) |existing| {
+                    if (existing != conn) {
+                        log.info("swarmConnectionTask: rejecting duplicate connection for peer", .{});
+                        conn.close(io);
+                        conn.deinit();
+                        return;
+                    }
+                } else {
+                    const owned = self.allocator.dupe(u8, peer_id) catch {
+                        log.warn("swarmConnectionTask: failed to allocate peer id key", .{});
+                        conn.close(io);
+                        conn.deinit();
+                        return;
+                    };
+                    self.connections.put(owned, conn) catch |err| {
+                        log.warn("swarmConnectionTask: failed to register connection: {}", .{err});
+                        self.allocator.free(owned);
+                        conn.close(io);
+                        conn.deinit();
+                        return;
+                    };
                 }
-            } else {
-                const owned = self.allocator.dupe(u8, peer_id) catch {
-                    log.warn("swarmConnectionTask: failed to allocate peer id key", .{});
-                    conn.close(io);
-                    conn.deinit();
-                    return;
-                };
-                self.connections.put(owned, conn) catch |err| {
-                    log.warn("swarmConnectionTask: failed to register connection: {}", .{err});
-                    self.allocator.free(owned);
-                    conn.close(io);
-                    conn.deinit();
-                    return;
-                };
             }
 
             log.info("swarmConnectionTask: peer_id resolved, entering stream accept loop", .{});
@@ -367,16 +421,28 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 });
             }
 
+            const RemovedConnection = struct {
+                key: []const u8,
+                conn: *engine_mod.QuicConnection,
+            };
+            var removed: ?RemovedConnection = null;
+
+            self.lockConnections(io);
             if (self.connections.get(peer_id) == conn) {
                 if (self.connections.fetchRemove(peer_id)) |kv| {
-                    self.notifyPeerDisconnected(io, kv.key);
-                    self.allocator.free(kv.key);
-                    kv.value.deinit();
-                    return;
+                    removed = .{ .key = kv.key, .conn = kv.value };
                 }
-            } else {
-                log.info("swarmConnectionTask: connection closed but map points to a different conn for peer", .{});
             }
+            self.unlockConnections(io);
+
+            if (removed) |kv| {
+                self.notifyPeerDisconnected(io, kv.key);
+                self.allocator.free(kv.key);
+                kv.conn.deinit();
+                return;
+            }
+
+            log.info("swarmConnectionTask: connection closed but map points to a different conn for peer", .{});
 
             conn.deinit();
         }
@@ -404,7 +470,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// Used for protocols that include a request body (e.g., Status).
         pub fn newStreamWithPayload(self: *Self, io: Io, peer_id: []const u8, comptime P: type, ssz_payload: ?[]const u8) !void {
             comptime protocol_mod.assertProtocolInterface(P);
-            const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+            self.lockConnections(io);
+            const conn = self.connections.get(peer_id) orelse {
+                self.unlockConnections(io);
+                return error.PeerNotConnected;
+            };
+            self.unlockConnections(io);
             const s_inner = try conn.openStream(io);
             var s = quic_mod.Stream{ .inner = s_inner };
             defer s.deinit();
@@ -431,7 +502,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// `"/eth2/beacon_chain/req/status/1/ssz_snappy"`. It does NOT need to be
         /// registered in the Switch's protocol list.
         pub fn dialProtocol(self: *Self, io: Io, peer_id: []const u8, protocol_id: []const u8) !quic_mod.Stream {
-            const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+            self.lockConnections(io);
+            const conn = self.connections.get(peer_id) orelse {
+                self.unlockConnections(io);
+                return error.PeerNotConnected;
+            };
+            self.unlockConnections(io);
             const s_inner = try conn.openStream(io);
             var s = quic_mod.Stream{ .inner = s_inner };
             errdefer s.deinit();
@@ -458,6 +534,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
             if (self.client_engine) |eng| eng.stop(io);
 
             // Notify handlers, free connection objects, and free map keys
+            self.lockConnections(io);
+            defer self.unlockConnections(io);
             var it = self.connections.iterator();
             while (it.next()) |entry| {
                 self.notifyPeerDisconnected(io, @as(?[]const u8, entry.key_ptr.*));
