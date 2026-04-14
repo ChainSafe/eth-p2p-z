@@ -470,13 +470,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// Used for protocols that include a request body (e.g., Status).
         pub fn newStreamWithPayload(self: *Self, io: Io, peer_id: []const u8, comptime P: type, ssz_payload: ?[]const u8) !void {
             comptime protocol_mod.assertProtocolInterface(P);
-            self.lockConnections(io);
-            const conn = self.connections.get(peer_id) orelse {
-                self.unlockConnections(io);
-                return error.PeerNotConnected;
+            const s_inner = blk: {
+                self.lockConnections(io);
+                defer self.unlockConnections(io);
+                const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+                break :blk try conn.openStream(io);
             };
-            self.unlockConnections(io);
-            const s_inner = try conn.openStream(io);
             var s = quic_mod.Stream{ .inner = s_inner };
             defer s.deinit();
             _ = try multistream.negotiateOutbound(io, &s, &.{P.id});
@@ -502,13 +501,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// `"/eth2/beacon_chain/req/status/1/ssz_snappy"`. It does NOT need to be
         /// registered in the Switch's protocol list.
         pub fn dialProtocol(self: *Self, io: Io, peer_id: []const u8, protocol_id: []const u8) !quic_mod.Stream {
-            self.lockConnections(io);
-            const conn = self.connections.get(peer_id) orelse {
-                self.unlockConnections(io);
-                return error.PeerNotConnected;
+            const s_inner = blk: {
+                self.lockConnections(io);
+                defer self.unlockConnections(io);
+                const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+                break :blk try conn.openStream(io);
             };
-            self.unlockConnections(io);
-            const s_inner = try conn.openStream(io);
             var s = quic_mod.Stream{ .inner = s_inner };
             errdefer s.deinit();
             _ = try multistream.negotiateOutbound(io, &s, &.{protocol_id});
