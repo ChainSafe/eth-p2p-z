@@ -288,15 +288,16 @@ pub fn Router(comptime Handler: type) type {
                         self.allocator.free(key.*);
                     }
                     inner.deinit();
+                    self.allocator.free(entry.key_ptr.*);
                 }
                 self.peer_idontwant.deinit();
             }
 
             deinitPeerMap(&self.pending_prune, self.allocator);
             deinitPeerMap(&self.pending_graft, self.allocator);
-            self.backoff.deinit();
-            self.peer_iasked.deinit();
-            self.peer_ihave_count.deinit();
+            deinitKeyedMap2(&self.backoff, self.allocator);
+            deinitKeyedMap(&self.peer_iasked, self.allocator);
+            deinitKeyedMap(&self.peer_ihave_count, self.allocator);
 
             self.seen_fifo.deinit(self.allocator);
             deinitKeyedMap2(&self.seen, self.allocator);
@@ -466,8 +467,11 @@ pub fn Router(comptime Handler: type) type {
                 }
             }
 
-            // Remove backoff
-            _ = self.backoff.remove(peer_id);
+            removeOwnedKey(&self.backoff, self.allocator, peer_id);
+            removeOwnedKey(&self.peer_iasked, self.allocator, peer_id);
+            removeOwnedKey(&self.peer_ihave_count, self.allocator, peer_id);
+            removePeerMapEntry(&self.pending_graft, self.allocator, peer_id);
+            removePeerMapEntry(&self.pending_prune, self.allocator, peer_id);
 
             // Remove IDONTWANT tracking
             if (self.peer_idontwant.fetchRemove(peer_id)) |kv| {
@@ -477,6 +481,7 @@ pub fn Router(comptime Handler: type) type {
                     self.allocator.free(key.*);
                 }
                 inner.deinit();
+                self.allocator.free(kv.key);
             }
 
             // Remove extensions
@@ -647,8 +652,8 @@ pub fn Router(comptime Handler: type) type {
             }
 
             // Reset per-heartbeat rate limit counters
-            self.peer_ihave_count.clearRetainingCapacity();
-            self.peer_iasked.clearRetainingCapacity();
+            clearOwnedKeyedMap(&self.peer_ihave_count, self.allocator);
+            clearOwnedKeyedMap(&self.peer_iasked, self.allocator);
 
             // Collect topics to process (avoid iterator invalidation)
             var topic_list: std.ArrayList([]const u8) = .empty;
@@ -924,12 +929,12 @@ pub fn Router(comptime Handler: type) type {
 
         fn handleIHave(self: *Self, from_peer: []const u8, ihave: *const rpc.ControlIHaveReader) !void {
             // Rate limiting
-            const count_gop = try self.peer_ihave_count.getOrPut(from_peer);
+            const count_gop = try getOrPutOwnedKey(&self.peer_ihave_count, self.allocator, from_peer);
             if (!count_gop.found_existing) count_gop.value_ptr.* = 0;
             count_gop.value_ptr.* += 1;
             if (count_gop.value_ptr.* > self.config.max_ihave_messages) return;
 
-            const asked_gop = try self.peer_iasked.getOrPut(from_peer);
+            const asked_gop = try getOrPutOwnedKey(&self.peer_iasked, self.allocator, from_peer);
             if (!asked_gop.found_existing) asked_gop.value_ptr.* = 0;
             if (asked_gop.value_ptr.* >= self.config.max_ihave_length) return;
 
@@ -1060,7 +1065,8 @@ pub fn Router(comptime Handler: type) type {
             // v1.1: apply backoff from PRUNE message
             const backoff_duration = prune.getBackoff();
             const effective_backoff = if (backoff_duration > 0) backoff_duration * 1000 else default_prune_backoff_ms;
-            try self.backoff.put(from_peer, self.handler.currentTimeMs() + effective_backoff);
+            const backoff_gop = try getOrPutOwnedKey(&self.backoff, self.allocator, from_peer);
+            backoff_gop.value_ptr.* = self.handler.currentTimeMs() + effective_backoff;
 
             try self.appendOwnedEvent(.{ .prune = .{
                 .peer_id = from_peer,
@@ -1074,7 +1080,7 @@ pub fn Router(comptime Handler: type) type {
             var idontwant_var = idontwant.*;
             while (idontwant_var.messageIDsNext()) |mid| {
                 if (mid.len == 0) continue;
-                const gop = try self.peer_idontwant.getOrPut(from_peer);
+                const gop = try getOrPutOwnedKey(&self.peer_idontwant, self.allocator, from_peer);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = std.StringHashMap(void).init(self.allocator);
                 }
@@ -1620,7 +1626,7 @@ pub fn Router(comptime Handler: type) type {
             }
 
             for (to_remove.items) |peer| {
-                _ = self.backoff.remove(peer);
+                removeOwnedKey(&self.backoff, self.allocator, peer);
             }
         }
 
@@ -1639,7 +1645,7 @@ pub fn Router(comptime Handler: type) type {
         // --- Internal: Control message sending ---
 
         fn enqueueGraft(self: *Self, peer: []const u8, topic: []const u8) !void {
-            const gop = try self.pending_graft.getOrPut(peer);
+            const gop = try getOrPutOwnedKey(&self.pending_graft, self.allocator, peer);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .empty;
             }
@@ -1648,7 +1654,7 @@ pub fn Router(comptime Handler: type) type {
         }
 
         fn enqueuePrune(self: *Self, peer: []const u8, topic: []const u8) !void {
-            const gop = try self.pending_prune.getOrPut(peer);
+            const gop = try getOrPutOwnedKey(&self.pending_prune, self.allocator, peer);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .empty;
             }
@@ -1665,6 +1671,7 @@ pub fn Router(comptime Handler: type) type {
                     self.allocator.free(topic);
                 }
                 entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
             }
             self.pending_graft.clearRetainingCapacity();
 
@@ -1676,6 +1683,7 @@ pub fn Router(comptime Handler: type) type {
                     self.allocator.free(topic);
                 }
                 entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
             }
             self.pending_prune.clearRetainingCapacity();
         }
@@ -1795,12 +1803,45 @@ pub fn Router(comptime Handler: type) type {
             map.deinit();
         }
 
+        fn clearOwnedKeyedMap(map: anytype, allocator: std.mem.Allocator) void {
+            var iter = map.keyIterator();
+            while (iter.next()) |key| {
+                allocator.free(key.*);
+            }
+            map.clearRetainingCapacity();
+        }
+
         fn deinitKeyedMap2(map: *std.StringHashMap(u64), allocator: std.mem.Allocator) void {
             var iter = map.keyIterator();
             while (iter.next()) |key| {
                 allocator.free(key.*);
             }
             map.deinit();
+        }
+
+        fn getOrPutOwnedKey(map: anytype, allocator: std.mem.Allocator, key: []const u8) @TypeOf(map.getOrPut(key)) {
+            const gop = try map.getOrPut(key);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try allocator.dupe(u8, key);
+            }
+            return gop;
+        }
+
+        fn removeOwnedKey(map: anytype, allocator: std.mem.Allocator, key: []const u8) void {
+            if (map.fetchRemove(key)) |kv| {
+                allocator.free(kv.key);
+            }
+        }
+
+        fn removePeerMapEntry(map: *std.StringHashMap(std.ArrayList([]const u8)), allocator: std.mem.Allocator, peer: []const u8) void {
+            if (map.fetchRemove(peer)) |kv| {
+                for (kv.value.items) |topic| {
+                    allocator.free(topic);
+                }
+                var topics = kv.value;
+                topics.deinit(allocator);
+                allocator.free(kv.key);
+            }
         }
 
         fn deinitPeerMap(map: *std.StringHashMap(std.ArrayList([]const u8)), allocator: std.mem.Allocator) void {
@@ -1810,6 +1851,7 @@ pub fn Router(comptime Handler: type) type {
                     allocator.free(topic);
                 }
                 entry.value_ptr.deinit(allocator);
+                allocator.free(entry.key_ptr.*);
             }
             map.deinit();
         }
@@ -2042,7 +2084,8 @@ test "Router v1.1 PRUNE backoff is respected" {
     }
 
     // Set backoff for peer-1 (far in the future)
-    try router.backoff.put("peer-1", handler.time_ms + 120_000);
+    const backoff_peer = try allocator.dupe(u8, "peer-1");
+    try router.backoff.put(backoff_peer, handler.time_ms + 120_000);
 
     handler.clearSent();
     const events = try router.drainEvents();
@@ -2325,7 +2368,8 @@ test "Router v1.2 IDONTWANT cleared on heartbeat" {
     var inner = std.StringHashMap(void).init(allocator);
     const mid_owned = try allocator.dupe(u8, "some-msg");
     try inner.put(mid_owned, {});
-    try router.peer_idontwant.put("peer-1", inner);
+    const peer_owned = try allocator.dupe(u8, "peer-1");
+    try router.peer_idontwant.put(peer_owned, inner);
 
     try router.heartbeat();
 
