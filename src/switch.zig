@@ -472,8 +472,13 @@ pub fn Switch(comptime config: SwitchConfig) type {
             comptime protocol_mod.assertProtocolInterface(P);
             const s_inner = blk: {
                 self.lockConnections(io);
-                defer self.unlockConnections(io);
-                const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+                const conn = self.connections.get(peer_id) orelse {
+                    self.unlockConnections(io);
+                    return error.PeerNotConnected;
+                };
+                conn.retainBorrow();
+                self.unlockConnections(io);
+                defer conn.releaseBorrow();
                 break :blk try conn.openStream(io);
             };
             var s = quic_mod.Stream{ .inner = s_inner };
@@ -503,8 +508,13 @@ pub fn Switch(comptime config: SwitchConfig) type {
         pub fn dialProtocol(self: *Self, io: Io, peer_id: []const u8, protocol_id: []const u8) !quic_mod.Stream {
             const s_inner = blk: {
                 self.lockConnections(io);
-                defer self.unlockConnections(io);
-                const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+                const conn = self.connections.get(peer_id) orelse {
+                    self.unlockConnections(io);
+                    return error.PeerNotConnected;
+                };
+                conn.retainBorrow();
+                self.unlockConnections(io);
+                defer conn.releaseBorrow();
                 break :blk try conn.openStream(io);
             };
             var s = quic_mod.Stream{ .inner = s_inner };

@@ -407,6 +407,7 @@ pub const QuicConnection = struct {
     hsk_completed: bool,
     closed: bool,
     active_streams: std.atomic.Value(usize),
+    active_borrows: std.atomic.Value(usize),
     destroy_requested: std.atomic.Value(bool),
 
     pub fn init(allocator: Allocator, lc: ?*lsquic.lsquic_conn_t, engine: *QuicEngine) !*QuicConnection {
@@ -426,6 +427,7 @@ pub const QuicConnection = struct {
             .hsk_completed = false,
             .closed = false,
             .active_streams = .init(0),
+            .active_borrows = .init(0),
             .destroy_requested = .init(false),
         };
         self.stream_queue = Io.Queue(StreamEvent).init(&self.stream_queue_buf);
@@ -544,21 +546,34 @@ pub const QuicConnection = struct {
         self.hsk_queue.close(self.io);
         self.destroy_requested.store(true, .release);
         self.drainStreamQueues();
-        if (self.active_streams.load(.acquire) == 0) {
-            self.finalizeDestroy();
-        }
+        self.maybeFinalizeDestroy();
     }
 
     fn retainActiveStream(self: *QuicConnection) void {
         _ = self.active_streams.fetchAdd(1, .acq_rel);
     }
 
+    pub fn retainBorrow(self: *QuicConnection) void {
+        _ = self.active_borrows.fetchAdd(1, .acq_rel);
+    }
+
     fn releaseActiveStream(self: *QuicConnection) void {
         const previous = self.active_streams.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
-        if (previous == 1 and self.destroy_requested.load(.acquire)) {
-            self.finalizeDestroy();
-        }
+        if (previous == 1) self.maybeFinalizeDestroy();
+    }
+
+    pub fn releaseBorrow(self: *QuicConnection) void {
+        const previous = self.active_borrows.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) self.maybeFinalizeDestroy();
+    }
+
+    fn maybeFinalizeDestroy(self: *QuicConnection) void {
+        if (!self.destroy_requested.load(.acquire)) return;
+        if (self.active_streams.load(.acquire) != 0) return;
+        if (self.active_borrows.load(.acquire) != 0) return;
+        self.finalizeDestroy();
     }
 
     fn finalizeDestroy(self: *QuicConnection) void {
