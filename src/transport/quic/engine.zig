@@ -438,12 +438,25 @@ pub const QuicConnection = struct {
     }
 
     pub fn openStream(self: *QuicConnection, io: Io) !*QuicStream {
-        if (self.closed) return error.ConnectionClosed;
-        const lc = self.lsquic_conn orelse return error.ConnectionClosed;
         self.engine.lockLsquic();
-        lsquic.lsquic_conn_make_stream(lc);
-        self.engine.requestProcessWake();
+        const queued_open = blk: {
+            // Re-read connection state under the lsquic lock so a concurrent
+            // onConnClosed callback cannot leave us with a stale conn pointer.
+            if (self.closed) break :blk false;
+            const lc = self.lsquic_conn orelse break :blk false;
+
+            const status = lsquic.lsquic_conn_status(lc, null, 0);
+            switch (status) {
+                lsquic.LSCONN_ST_CONNECTED => {},
+                else => break :blk false,
+            }
+
+            lsquic.lsquic_conn_make_stream(lc);
+            self.engine.requestProcessWake();
+            break :blk true;
+        };
         self.engine.unlockLsquic();
+        if (!queued_open) return error.ConnectionClosed;
         // Let the background timer loop call processEngine to create the stream
         // via onNewStream. Calling processEngine synchronously here can crash
         // inside lsquic's SSL post-handshake processing when the crypto stream
