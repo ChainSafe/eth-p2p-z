@@ -435,7 +435,6 @@ pub fn Switch(comptime config: SwitchConfig) type {
                     stream.deinit();
                     continue;
                 };
-                s_inner.retainTaskRef();
                 self.background.async(io, Self.swarmStreamTask, .{
                     self, io, conn, s_inner, SwarmStreamCtx{ .peer_id = stream_peer_id },
                 });
@@ -471,21 +470,17 @@ pub fn Switch(comptime config: SwitchConfig) type {
         fn swarmStreamTask(
             self: *Self,
             io: Io,
-            conn: *engine_mod.QuicConnection,
+            _: *engine_mod.QuicConnection,
             s_inner: *engine_mod.QuicStream,
             ctx: SwarmStreamCtx,
         ) void {
             log.info("swarmStreamTask: dispatching stream", .{});
-            var mutable_stream = quic_mod.Stream{ .inner = s_inner, .owns_inner = false };
+            var task_stream = quic_mod.InboundTaskStream.init(s_inner);
             defer {
                 if (ctx.peer_id) |peer_id| self.allocator.free(peer_id);
             }
-            defer {
-                _ = conn;
-                s_inner.finishTask();
-                s_inner.releaseTaskRef();
-            }
-            self.dispatchStream(io, &mutable_stream, ctx) catch return;
+            defer task_stream.deinit();
+            self.dispatchStream(io, &task_stream, ctx) catch return;
         }
 
         /// Open a new outbound stream to a connected peer.

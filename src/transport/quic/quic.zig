@@ -23,45 +23,99 @@ const transport_mod = @import("../transport.zig");
 
 /// Transport-level QUIC stream satisfying the Stream interface.
 pub const Stream = struct {
-    inner: *QuicStreamInner,
-    owns_inner: bool = true,
+    inner: ?*QuicStreamInner,
 
     pub fn read(self: *Stream, io: Io, buf: []u8) anyerror!usize {
-        return self.inner.read(io, buf);
+        return self.borrowInner().read(io, buf);
     }
 
     pub fn write(self: *Stream, io: Io, data: []const u8) anyerror!usize {
-        return self.inner.write(io, data);
+        return self.borrowInner().write(io, data);
     }
 
     pub fn closeRead(self: *Stream, io: Io) void {
-        self.inner.closeRead(io);
+        self.borrowInner().closeRead(io);
     }
 
     pub fn closeWrite(self: *Stream, io: Io) void {
-        self.inner.closeWrite(io);
+        self.borrowInner().closeWrite(io);
     }
 
     pub fn close(self: *Stream, io: Io) void {
-        self.inner.close(io);
+        self.borrowInner().close(io);
     }
 
     pub fn deinit(self: *Stream) void {
-        if (!self.owns_inner) return;
-        self.inner.deinit();
-        self.owns_inner = false;
+        const inner = self.takeInner() orelse return;
+        inner.deinit();
     }
 
-    pub fn retainManagedRef(self: *Stream) void {
-        self.inner.retainTaskRef();
+    /// Consume this wrapper and return a movable owned stream value.
+    pub fn detachOwnedStream(self: *Stream) Stream {
+        return .{ .inner = self.takeInner() orelse unreachable };
     }
 
-    pub fn releaseManagedRef(self: *Stream) void {
-        self.inner.releaseTaskRef();
+    fn borrowInner(self: *Stream) *QuicStreamInner {
+        return self.inner orelse unreachable;
     }
 
-    pub fn transferOwnership(self: *Stream) void {
-        self.owns_inner = false;
+    fn takeInner(self: *Stream) ?*QuicStreamInner {
+        const inner = self.inner;
+        self.inner = null;
+        return inner;
+    }
+};
+
+/// Inbound stream view bound to a single swarm task.
+///
+/// The task keeps a liveness lease for as long as it may read or write the
+/// stream. Ownership of final cleanup can be detached exactly once and handed
+/// to longer-lived peer state.
+pub const InboundTaskStream = struct {
+    lease: engine_mod.StreamTaskLease,
+    owned: ?Stream,
+
+    pub fn init(inner: *QuicStreamInner) InboundTaskStream {
+        return .{
+            .lease = .init(inner),
+            .owned = .{ .inner = inner },
+        };
+    }
+
+    pub fn read(self: *InboundTaskStream, io: Io, buf: []u8) anyerror!usize {
+        return self.lease.read(io, buf);
+    }
+
+    pub fn write(self: *InboundTaskStream, io: Io, data: []const u8) anyerror!usize {
+        return self.lease.write(io, data);
+    }
+
+    pub fn closeRead(self: *InboundTaskStream, io: Io) void {
+        self.lease.closeRead(io);
+    }
+
+    pub fn closeWrite(self: *InboundTaskStream, io: Io) void {
+        self.lease.closeWrite(io);
+    }
+
+    pub fn close(self: *InboundTaskStream, io: Io) void {
+        self.lease.close(io);
+    }
+
+    pub fn deinit(self: *InboundTaskStream) void {
+        if (self.owned) |*owned| {
+            owned.deinit();
+            self.owned = null;
+        }
+        self.lease.deinit();
+    }
+
+    /// Move cleanup ownership out of the inbound task while leaving the task's
+    /// lease intact so the handler can continue reading until it returns.
+    pub fn detachOwnedStream(self: *InboundTaskStream) Stream {
+        const owned = self.owned orelse unreachable;
+        self.owned = null;
+        return owned;
     }
 };
 
@@ -69,23 +123,24 @@ pub const Stream = struct {
 
 /// Transport-level QUIC connection satisfying the Connection interface.
 pub const Connection = struct {
-    inner: *QuicConnectionInner,
+    inner: ?*QuicConnectionInner,
     /// Engine owned by this connection (client-side dial). null for server-side connections.
     owned_engine: ?*QuicEngine = null,
-    owns_inner: bool = true,
 
     pub fn openStream(self: *Connection, io: Io) !Stream {
-        const s = try self.inner.openStream(io);
+        const s = try self.borrowInner().openStream(io);
         return .{ .inner = s };
     }
 
     pub fn acceptStream(self: *Connection, io: Io) !Stream {
-        const s = try self.inner.acceptStream(io);
+        const s = try self.borrowInner().acceptStream(io);
         return .{ .inner = s };
     }
 
     pub fn close(self: *Connection, io: Io) void {
-        self.inner.close(io);
+        if (self.inner) |inner| {
+            inner.close(io);
+        }
         // If this connection owns the engine (client-side), stop its runtime.
         // Memory is released in deinit().
         if (self.owned_engine) |eng| {
@@ -95,9 +150,8 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection, io: Io) void {
         self.close(io);
-        if (self.owns_inner) {
-            self.inner.deinit();
-            self.owns_inner = false;
+        if (self.takeInner()) |inner| {
+            inner.deinit();
         }
         if (self.owned_engine) |eng| {
             eng.deinit();
@@ -106,13 +160,24 @@ pub const Connection = struct {
     }
 
     pub fn remotePeerId(self: *const Connection) ?PeerId {
-        return self.inner.remotePeerId();
+        const inner = self.inner orelse return null;
+        return inner.remotePeerId();
     }
 
     pub fn remoteAddr(self: *const Connection) ?Multiaddr {
         // TODO: build multiaddr from lsquic_conn_get_sockaddr
         _ = self;
         return null;
+    }
+
+    fn borrowInner(self: *const Connection) *QuicConnectionInner {
+        return self.inner orelse unreachable;
+    }
+
+    fn takeInner(self: *Connection) ?*QuicConnectionInner {
+        const inner = self.inner;
+        self.inner = null;
+        return inner;
     }
 };
 
@@ -448,11 +513,11 @@ test "QUIC engine client connect initiates handshake" {
 
 test "QUIC connection ownership in dial" {
     // Verify Connection.owned_engine works correctly
-    const conn = quic.Connection{ .inner = undefined, .owned_engine = null };
+    const conn = quic.Connection{ .inner = null, .owned_engine = null };
     try std.testing.expect(conn.owned_engine == null);
 
     // Server-side connections don't own an engine
-    const server_conn = quic.Connection{ .inner = undefined };
+    const server_conn = quic.Connection{ .inner = null };
     try std.testing.expect(server_conn.owned_engine == null);
 }
 
@@ -880,10 +945,10 @@ const TestContext = struct {
         self.client_conn.close(io);
         self.server_eng.stop(io);
         self.client_eng.stop(io);
-        self.server_eng.deinit();
-        self.client_eng.deinit();
         self.server_conn.deinit();
         self.client_conn.deinit();
+        self.server_eng.deinit();
+        self.client_eng.deinit();
         self.server_host_identity.deinit();
         self.client_host_identity.deinit();
     }

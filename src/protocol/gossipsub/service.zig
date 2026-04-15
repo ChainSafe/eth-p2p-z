@@ -59,7 +59,7 @@ pub const Service = struct {
     /// Current time in milliseconds, set externally via setTime.
     time_ms: u64,
     /// Outbound streams keyed by peer ID (owned keys).
-    outbound_streams: std.StringHashMap(*ManagedStream),
+    outbound_streams: std.StringHashMap(*InstalledPeerStream),
     /// Topics we are subscribed to (owned keys), for announcing to new peers.
     tracked_subscriptions: std.StringHashMap(void),
     /// Serializes router and stream state across concurrent service fibers.
@@ -88,15 +88,15 @@ pub const Service = struct {
         }
     };
 
-    const ManagedStream = struct {
+    const InstalledPeerStream = struct {
         owned: OwnedStream,
         ref_count: std.atomic.Value(usize) = .init(1),
 
-        fn retain(self: *ManagedStream) void {
+        fn retain(self: *InstalledPeerStream) void {
             _ = self.ref_count.fetchAdd(1, .monotonic);
         }
 
-        fn release(self: *ManagedStream, alloc: Allocator) void {
+        fn release(self: *InstalledPeerStream, alloc: Allocator) void {
             var current = self.ref_count.load(.acquire);
             while (true) {
                 if (current == 0) {
@@ -115,64 +115,55 @@ pub const Service = struct {
             }
         }
 
-        fn close(self: *ManagedStream, io: Io) void {
+        fn close(self: *InstalledPeerStream, io: Io) void {
             self.owned.close(io);
         }
 
-        fn write(self: *ManagedStream, io: Io, data: []const u8) anyerror!usize {
+        fn write(self: *InstalledPeerStream, io: Io, data: []const u8) anyerror!usize {
             return self.owned.write(io, data);
         }
     };
 
-    fn installPeerStream(self: *Self, peer_id: []const u8, stream: anytype) !?*ManagedStream {
+    fn installPeerStream(self: *Self, peer_id: []const u8, stream: anytype) !?*InstalledPeerStream {
         if (self.outbound_streams.contains(peer_id)) return null;
 
         const StreamT = @TypeOf(stream.*);
-        const heap_stream = try self.allocator.create(StreamT);
+        if (!@hasDecl(StreamT, "detachOwnedStream")) {
+            @compileError("gossipsub peer streams must support detachOwnedStream()");
+        }
+
+        const detached_stream = stream.detachOwnedStream();
+        const DetachedStreamT = @TypeOf(detached_stream);
+        const heap_stream = try self.allocator.create(DetachedStreamT);
         errdefer self.allocator.destroy(heap_stream);
 
-        heap_stream.* = stream.*;
-        if (@hasDecl(StreamT, "retainManagedRef")) {
-            heap_stream.retainManagedRef();
-            // Streams that expose explicit managed refs should be kept alive by
-            // that ref alone. The wrapper must not also own the inner handle,
-            // or disconnect teardown can double-release the same stream.
-            if (@hasDecl(StreamT, "transferOwnership")) {
-                heap_stream.transferOwnership();
-            }
-        }
-        if (@hasDecl(StreamT, "transferOwnership")) {
-            stream.transferOwnership();
-        }
+        heap_stream.* = detached_stream;
 
-        const managed = try self.allocator.create(ManagedStream);
-        errdefer self.allocator.destroy(managed);
+        const installed = try self.allocator.create(InstalledPeerStream);
+        errdefer self.allocator.destroy(installed);
 
-        managed.* = .{
+        installed.* = .{
             .owned = .{
-                .stream = AnyStream.wrap(StreamT, heap_stream),
+                .stream = AnyStream.wrap(DetachedStreamT, heap_stream),
                 .backing_ptr = @ptrCast(heap_stream),
                 .destroy_fn = struct {
                     fn destroy(alloc: Allocator, ptr: *anyopaque) void {
-                        const p: *StreamT = @ptrCast(@alignCast(ptr));
-                        if (@hasDecl(StreamT, "deinit")) {
+                        const p: *DetachedStreamT = @ptrCast(@alignCast(ptr));
+                        if (@hasDecl(DetachedStreamT, "deinit")) {
                             p.deinit();
-                        }
-                        if (@hasDecl(StreamT, "releaseManagedRef")) {
-                            p.releaseManagedRef();
                         }
                         alloc.destroy(p);
                     }
                 }.destroy,
             },
         };
-        errdefer managed.owned.destroyBacking(self.allocator);
+        errdefer installed.owned.destroyBacking(self.allocator);
 
         const peer_copy = try self.allocator.dupe(u8, peer_id);
         errdefer self.allocator.free(peer_copy);
 
-        try self.outbound_streams.put(peer_copy, managed);
-        return managed;
+        try self.outbound_streams.put(peer_copy, installed);
+        return installed;
     }
 
     /// A pending outbound RPC message to a specific peer.
@@ -199,7 +190,7 @@ pub const Service = struct {
             .pending_send_bytes = 0,
             .rng_state = 12345,
             .time_ms = 0,
-            .outbound_streams = std.StringHashMap(*ManagedStream).init(allocator),
+            .outbound_streams = std.StringHashMap(*InstalledPeerStream).init(allocator),
             .tracked_subscriptions = std.StringHashMap(void).init(allocator),
             .state_mu = .init,
             .active_io = null,
@@ -271,8 +262,8 @@ pub const Service = struct {
         else
             return;
 
-        var installed_stream: ?*ManagedStream = null;
-        defer if (installed_stream) |managed| managed.release(self.allocator);
+        var installed_stream: ?*InstalledPeerStream = null;
+        defer if (installed_stream) |installed| installed.release(self.allocator);
 
         {
             self.lock(io);
@@ -281,9 +272,9 @@ pub const Service = struct {
             defer self.deactivateIo();
 
             self.router.addPeer(peer_id) catch {};
-            if (try self.installPeerStream(peer_id, stream)) |managed| {
-                managed.retain();
-                installed_stream = managed;
+            if (try self.installPeerStream(peer_id, stream)) |installed| {
+                installed.retain();
+                installed_stream = installed;
             } else {
                 log.info("gossipsub: keeping existing peer stream for duplicate inbound stream", .{});
             }
@@ -759,8 +750,7 @@ test "duplicate inbound peer stream keeps original installed stream" {
         const Self = @This();
 
         id: u8,
-        deinit_count: *usize,
-        owns_inner: bool = true,
+        deinit_count: ?*usize,
 
         pub fn read(_: *Self, _: Io, _: []u8) !usize {
             return 0;
@@ -775,13 +765,15 @@ test "duplicate inbound peer stream keeps original installed stream" {
         pub fn close(_: *Self, _: Io) void {}
 
         pub fn deinit(self: *Self) void {
-            if (!self.owns_inner) return;
-            self.deinit_count.* += 1;
-            self.owns_inner = false;
+            const counter = self.deinit_count orelse return;
+            counter.* += 1;
+            self.deinit_count = null;
         }
 
-        pub fn transferOwnership(self: *Self) void {
-            self.owns_inner = false;
+        pub fn detachOwnedStream(self: *Self) Self {
+            const detached = self.*;
+            self.deinit_count = null;
+            return detached;
         }
     };
 
@@ -819,11 +811,10 @@ test "removePeer defers stream destruction until active inbound handler exits" {
         const Self = @This();
 
         close_count: *usize,
-        deinit_count: *usize,
+        deinit_count: ?*usize,
         started: *Io.Event,
         finish: *Io.Event,
         started_once: bool = false,
-        owns_inner: bool = true,
 
         pub fn read(self: *Self, read_io: Io, _: []u8) !usize {
             if (!self.started_once) {
@@ -846,13 +837,15 @@ test "removePeer defers stream destruction until active inbound handler exits" {
         }
 
         pub fn deinit(self: *Self) void {
-            if (!self.owns_inner) return;
-            self.deinit_count.* += 1;
-            self.owns_inner = false;
+            const counter = self.deinit_count orelse return;
+            counter.* += 1;
+            self.deinit_count = null;
         }
 
-        pub fn transferOwnership(self: *Self) void {
-            self.owns_inner = false;
+        pub fn detachOwnedStream(self: *Self) Self {
+            const detached = self.*;
+            self.deinit_count = null;
+            return detached;
         }
     };
 

@@ -195,11 +195,11 @@ pub const QuicStream = struct {
         // Arm the lsquic read callback — tells lsquic to call onRead when
         // data is available. Must be done lazily (not in onNewStream) to avoid
         // false EOF when onRead fires before STREAM frames are processed.
+        self.conn.engine.lockLsquic();
         if (self.lsquic_stream) |ls| {
-            self.conn.engine.lockLsquic();
             _ = lsquic.lsquic_stream_wantread(ls, 1);
-            self.conn.engine.unlockLsquic();
         }
+        self.conn.engine.unlockLsquic();
         const event = self.read_queue.getOne(io) catch |err| switch (err) {
             error.Closed => return 0, // EOF — peer closed the stream
             error.Canceled => return error.StreamClosed,
@@ -222,8 +222,11 @@ pub const QuicStream = struct {
         if (data.len == 0) return 0;
 
         while (true) {
-            const ls = self.lsquic_stream orelse return error.StreamClosed;
             self.conn.engine.lockLsquic();
+            const ls = self.lsquic_stream orelse {
+                self.conn.engine.unlockLsquic();
+                return error.StreamClosed;
+            };
             const written = lsquic.lsquic_stream_write(ls, data.ptr, data.len);
             if (written > 0) {
                 _ = lsquic.lsquic_stream_flush(ls);
@@ -260,45 +263,45 @@ pub const QuicStream = struct {
     pub fn closeRead(self: *QuicStream, _: Io) void {
         if (self.read_closed) return;
         self.read_closed = true;
+        self.conn.engine.lockLsquic();
         if (self.lsquic_stream) |ls| {
             if (!self.conn.closed) {
-                self.conn.engine.lockLsquic();
                 _ = lsquic.lsquic_stream_shutdown(ls, 0);
                 _ = lsquic.lsquic_stream_wantread(ls, 0);
                 self.conn.engine.requestProcessWake();
-                self.conn.engine.unlockLsquic();
             }
         }
+        self.conn.engine.unlockLsquic();
         self.read_queue.close(self.io);
     }
 
     pub fn closeWrite(self: *QuicStream, _: Io) void {
         if (self.write_closed) return;
         self.write_closed = true;
+        self.conn.engine.lockLsquic();
         if (self.lsquic_stream) |ls| {
             if (!self.conn.closed) {
-                self.conn.engine.lockLsquic();
                 _ = lsquic.lsquic_stream_shutdown(ls, 1);
                 self.conn.engine.requestProcessWake();
-                self.conn.engine.unlockLsquic();
             }
         }
+        self.conn.engine.unlockLsquic();
         self.write_queue.close(self.io);
     }
 
     pub fn close(self: *QuicStream, _: Io) void {
         if (self.shutdown_started.load(.acquire)) return;
         self.beginShutdown();
+        self.conn.engine.lockLsquic();
         if (self.lsquic_stream) |ls| {
             // Tell lsquic to close the stream. Ownership remains with the caller,
             // which must later call deinit() once it is done with the wrapper.
             if (!self.conn.closed) {
-                self.conn.engine.lockLsquic();
                 _ = lsquic.lsquic_stream_close(ls);
                 self.conn.engine.requestProcessWake();
-                self.conn.engine.unlockLsquic();
             }
         }
+        self.conn.engine.unlockLsquic();
         self.read_queue.close(self.io);
         self.write_queue.close(self.io);
     }
@@ -308,47 +311,19 @@ pub const QuicStream = struct {
         defer self.releaseRef();
         // Only for manual cleanup when onStreamClose won't fire (e.g. error paths before lsquic knows about the stream)
         self.beginShutdown();
+        var released_lsquic_ref = false;
+        self.conn.engine.lockLsquic();
         if (self.lsquic_stream) |ls| {
-            self.conn.engine.lockLsquic();
             lsquic.lsquic_stream_set_ctx(ls, null);
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_close(ls);
                 self.conn.engine.requestProcessWake();
             }
-            self.conn.engine.unlockLsquic();
             self.lsquic_stream = null;
-            self.releaseRef();
+            released_lsquic_ref = true;
         }
-        if (self.user_ref_active.swap(false, .acq_rel)) {
-            self.releaseRef();
-        }
-        if (self.queued_ref_active.swap(false, .acq_rel)) {
-            self.releaseRef();
-        }
-    }
-
-    pub fn retainTaskRef(self: *QuicStream) void {
-        self.retainRef();
-    }
-
-    pub fn releaseTaskRef(self: *QuicStream) void {
-        self.releaseRef();
-    }
-
-    pub fn finishTask(self: *QuicStream) void {
-        // Task-dispatched streams already hold an explicit task ref. Release the
-        // wrapper/user ownership here without freeing the stream out from under
-        // the task epilogue; the final release happens via releaseTaskRef().
-        self.beginShutdown();
-        if (self.lsquic_stream) |ls| {
-            self.conn.engine.lockLsquic();
-            lsquic.lsquic_stream_set_ctx(ls, null);
-            if (!self.conn.closed) {
-                _ = lsquic.lsquic_stream_close(ls);
-                self.conn.engine.requestProcessWake();
-            }
-            self.conn.engine.unlockLsquic();
-            self.lsquic_stream = null;
+        self.conn.engine.unlockLsquic();
+        if (released_lsquic_ref) {
             self.releaseRef();
         }
         if (self.user_ref_active.swap(false, .acq_rel)) {
@@ -362,9 +337,11 @@ pub const QuicStream = struct {
     fn markActive(self: *QuicStream) void {
         if (self.counted_on_conn) return;
         self.counted_on_conn = true;
-        self.user_ref_active.store(true, .release);
-        if (!self.queued_ref_active.swap(false, .acq_rel)) {
+        if (!self.user_ref_active.swap(true, .acq_rel)) {
             self.retainRef();
+        }
+        if (self.queued_ref_active.swap(false, .acq_rel)) {
+            self.releaseRef();
         }
         self.conn.retainActiveStream();
     }
@@ -466,6 +443,52 @@ pub const QuicStream = struct {
     }
 };
 
+/// Keeps a QUIC stream alive for the duration of an inbound task even after
+/// ownership of the cleanup path has been promoted elsewhere.
+pub const StreamTaskLease = struct {
+    inner: ?*QuicStream,
+
+    pub fn init(inner: *QuicStream) StreamTaskLease {
+        inner.retainRef();
+        return .{ .inner = inner };
+    }
+
+    pub fn read(self: *StreamTaskLease, io: Io, buf: []u8) anyerror!usize {
+        return self.borrowInner().read(io, buf);
+    }
+
+    pub fn write(self: *StreamTaskLease, io: Io, data: []const u8) anyerror!usize {
+        return self.borrowInner().write(io, data);
+    }
+
+    pub fn closeRead(self: *StreamTaskLease, io: Io) void {
+        self.borrowInner().closeRead(io);
+    }
+
+    pub fn closeWrite(self: *StreamTaskLease, io: Io) void {
+        self.borrowInner().closeWrite(io);
+    }
+
+    pub fn close(self: *StreamTaskLease, io: Io) void {
+        self.borrowInner().close(io);
+    }
+
+    pub fn deinit(self: *StreamTaskLease) void {
+        const inner = self.takeInner() orelse return;
+        inner.releaseRef();
+    }
+
+    fn borrowInner(self: *StreamTaskLease) *QuicStream {
+        return self.inner orelse unreachable;
+    }
+
+    fn takeInner(self: *StreamTaskLease) ?*QuicStream {
+        const inner = self.inner;
+        self.inner = null;
+        return inner;
+    }
+};
+
 // ── QuicConnection ─────────────────────────────────────────────────────
 
 /// Signal pushed by `onHskDone` to wake up `waitHandshake`.
@@ -486,9 +509,7 @@ pub const QuicConnection = struct {
     peer_id: ?PeerId,
     hsk_completed: bool,
     closed: bool,
-    active_streams: std.atomic.Value(usize),
-    active_borrows: std.atomic.Value(usize),
-    destroy_requested: std.atomic.Value(bool),
+    ref_count: std.atomic.Value(usize),
 
     pub fn init(allocator: Allocator, lc: ?*lsquic.lsquic_conn_t, engine: *QuicEngine) !*QuicConnection {
         const self = try allocator.create(QuicConnection);
@@ -506,9 +527,7 @@ pub const QuicConnection = struct {
             .peer_id = null,
             .hsk_completed = false,
             .closed = false,
-            .active_streams = .init(0),
-            .active_borrows = .init(0),
-            .destroy_requested = .init(false),
+            .ref_count = .init(1),
         };
         self.stream_queue = Io.Queue(StreamEvent).init(&self.stream_queue_buf);
         self.outbound_stream_queue = Io.Queue(StreamEvent).init(&self.outbound_stream_queue_buf);
@@ -563,15 +582,15 @@ pub const QuicConnection = struct {
 
     pub fn close(self: *QuicConnection, io: Io) void {
         _ = io;
+        self.engine.lockLsquic();
         if (self.lsquic_conn) |lc| {
             // Clear conn context before closing so lsquic doesn't assert on destroy
-            self.engine.lockLsquic();
             lsquic.lsquic_conn_set_ctx(lc, null);
             lsquic.lsquic_conn_close(lc);
             self.lsquic_conn = null;
             self.engine.requestProcessWake();
-            self.engine.unlockLsquic();
         }
+        self.engine.unlockLsquic();
         self.closed = true;
         self.stream_queue.close(self.io);
         self.outbound_stream_queue.close(self.io);
@@ -583,9 +602,9 @@ pub const QuicConnection = struct {
     }
 
     pub fn remoteIpAddress(self: *const QuicConnection) ?net.IpAddress {
-        const lc = self.lsquic_conn orelse return null;
         self.engine.lockLsquic();
         defer self.engine.unlockLsquic();
+        const lc = self.lsquic_conn orelse return null;
         var local_sa: ?*const std.c.sockaddr = null;
         var peer_sa: ?*const std.c.sockaddr = null;
         if (lsquic.lsquic_conn_get_sockaddr(lc, @ptrCast(&local_sa), @ptrCast(&peer_sa)) != 0) {
@@ -596,9 +615,9 @@ pub const QuicConnection = struct {
     }
 
     pub fn localIpAddress(self: *const QuicConnection) ?net.IpAddress {
-        const lc = self.lsquic_conn orelse return null;
         self.engine.lockLsquic();
         defer self.engine.unlockLsquic();
+        const lc = self.lsquic_conn orelse return null;
         var local_sa: ?*const std.c.sockaddr = null;
         var peer_sa: ?*const std.c.sockaddr = null;
         if (lsquic.lsquic_conn_get_sockaddr(lc, @ptrCast(&local_sa), @ptrCast(&peer_sa)) != 0) {
@@ -626,73 +645,59 @@ pub const QuicConnection = struct {
     }
 
     pub fn deinit(self: *QuicConnection) void {
+        self.engine.lockLsquic();
         if (self.lsquic_conn) |lc| {
-            self.engine.lockLsquic();
             lsquic.lsquic_conn_set_ctx(lc, null);
             lsquic.lsquic_conn_close(lc);
             self.lsquic_conn = null;
-            self.engine.unlockLsquic();
         }
+        self.engine.unlockLsquic();
         self.closed = true;
         self.stream_queue.close(self.io);
         self.outbound_stream_queue.close(self.io);
         self.hsk_queue.close(self.io);
-        self.destroy_requested.store(true, .release);
-        self.maybeFinalizeDestroy();
+        self.releaseRef();
     }
 
     fn retainActiveStream(self: *QuicConnection) void {
-        _ = self.active_streams.fetchAdd(1, .acq_rel);
+        self.retainRef();
     }
 
     pub fn retainBorrow(self: *QuicConnection) void {
-        _ = self.active_borrows.fetchAdd(1, .acq_rel);
+        self.retainRef();
     }
 
     fn releaseActiveStream(self: *QuicConnection) void {
-        var current = self.active_streams.load(.acquire);
-        while (true) {
-            if (current == 0) {
-                log.err("releaseActiveStream underflow", .{});
-                return;
-            }
-            if (self.active_streams.cmpxchgWeak(current, current - 1, .acq_rel, .acquire)) |observed| {
-                current = observed;
-                continue;
-            }
-            if (current == 1) self.maybeFinalizeDestroy();
-            return;
-        }
+        self.releaseRef();
     }
 
     pub fn releaseBorrow(self: *QuicConnection) void {
-        var current = self.active_borrows.load(.acquire);
+        self.releaseRef();
+    }
+
+    fn retainRef(self: *QuicConnection) void {
+        _ = self.ref_count.fetchAdd(1, .acq_rel);
+    }
+
+    fn releaseRef(self: *QuicConnection) void {
+        var current = self.ref_count.load(.acquire);
         while (true) {
             if (current == 0) {
-                log.err("releaseBorrow underflow", .{});
+                log.err("QuicConnection releaseRef underflow", .{});
                 return;
             }
-            if (self.active_borrows.cmpxchgWeak(current, current - 1, .acq_rel, .acquire)) |observed| {
+            if (self.ref_count.cmpxchgWeak(current, current - 1, .acq_rel, .acquire)) |observed| {
                 current = observed;
                 continue;
             }
-            if (current == 1) self.maybeFinalizeDestroy();
+            if (current == 1) self.finalizeDestroy();
             return;
         }
     }
 
-    fn maybeFinalizeDestroy(self: *QuicConnection) void {
-        if (!self.destroy_requested.load(.acquire)) return;
-        if (self.active_streams.load(.acquire) != 0) return;
-        if (self.active_borrows.load(.acquire) != 0) return;
-        self.finalizeDestroy();
-    }
-
     fn finalizeDestroy(self: *QuicConnection) void {
-        _ = self;
-        // Connection shutdown still has in-flight callback/task lifetime gaps.
-        // Leaking the wrapper is safer than freeing it out from under a late
-        // stream callback or borrow release during node soak/debugging.
+        self.drainStreamQueues();
+        self.allocator.destroy(self);
     }
 
     fn drainStreamQueues(self: *QuicConnection) void {
@@ -1369,6 +1374,8 @@ pub const QuicEngine = struct {
                 const conn_ctx = lsquic.lsquic_conn_get_ctx(c);
                 if (conn_ctx) |ctx| {
                     const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
+                    conn.retainRef();
+                    defer conn.releaseRef();
                     const queued = tryQueueOneUncancelable(HandshakeResult, &conn.hsk_queue, conn.engine.io, .failed) catch {
                         lsquic.lsquic_conn_close(c);
                         return;
@@ -1385,6 +1392,8 @@ pub const QuicEngine = struct {
         const conn_ctx = lsquic.lsquic_conn_get_ctx(lc);
         if (conn_ctx) |ctx| {
             const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
+            conn.retainRef();
+            defer conn.releaseRef();
             conn.hsk_completed = true;
 
             // Extract peer identity stored by customVerifyCallback for this
@@ -1475,6 +1484,8 @@ pub const QuicEngine = struct {
         const ctx = lsquic.lsquic_conn_get_ctx(lc);
         if (ctx) |raw| {
             const conn: *QuicConnection = @ptrCast(@alignCast(raw));
+            conn.retainRef();
+            defer conn.releaseRef();
             conn.closed = true;
             conn.lsquic_conn = null;
             conn.engine.cert_verify_ctx.discardVerified(ctx);
@@ -1504,6 +1515,8 @@ pub const QuicEngine = struct {
         if (conn_ctx == null) return null;
 
         const conn: *QuicConnection = @ptrCast(@alignCast(conn_ctx));
+        conn.retainRef();
+        defer conn.releaseRef();
 
         // Create stream wrapper
         const stream = QuicStream.init(engine.allocator, s, conn) catch return null;
@@ -1553,6 +1566,8 @@ pub const QuicEngine = struct {
         const s = ls orelse return;
         const raw = lsquic.lsquic_stream_get_ctx(s) orelse return;
         const stream: *QuicStream = @ptrCast(@alignCast(raw));
+        stream.retainRef();
+        defer stream.releaseRef();
 
         const stream_id = lsquic.lsquic_stream_id(s);
         var buf: [4096]u8 = undefined;
@@ -1618,6 +1633,8 @@ pub const QuicEngine = struct {
         if (ls) |s| {
             const raw = lsquic.lsquic_stream_get_ctx(s) orelse return;
             const stream: *QuicStream = @ptrCast(@alignCast(raw));
+            stream.retainRef();
+            defer stream.releaseRef();
             stream.signalWriteReady();
             _ = lsquic.lsquic_stream_wantwrite(s, 0);
         }

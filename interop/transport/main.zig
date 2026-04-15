@@ -394,7 +394,7 @@ pub fn main() !void {
     log.info("local peer ID: {s}", .{local_peer_b58});
 
     // Init Switch
-    var sw = AppSwitch.init(allocator, .{ .host_key = host_key }, .{
+    var sw = AppSwitch.init(allocator, .{ .host_identity = &kp }, .{
         ping_mod.Handler{},
     });
     defer sw.deinit(io);
@@ -459,11 +459,12 @@ fn runListener(
     };
 
     // Get bound address (for port 0 auto-assignment)
-    const bound = sw.listenAddrs() orelse {
+    const bound_addrs = sw.listenAddrs();
+    if (bound_addrs.len == 0) {
         log.err("no listen address after listen()", .{});
         return error.NoListenAddress;
-    };
-    const bound_port = switch (bound) {
+    }
+    const bound_port = switch (bound_addrs[0]) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
