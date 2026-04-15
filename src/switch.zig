@@ -480,11 +480,16 @@ pub fn Switch(comptime config: SwitchConfig) type {
             defer {
                 if (ctx.peer_id) |peer_id| self.allocator.free(peer_id);
             }
-            defer s_inner.releaseTaskRef();
-            defer if (conn.closed) {
-                mutable_stream.transferOwnership();
-            } else {
+            defer {
+                if (conn.closed) {
+                    // During connection teardown, late stream-close callbacks can
+                    // still race the task epilogue. Leaking the task-held ref is
+                    // safer than touching a potentially freed inner pointer.
+                    mutable_stream.transferOwnership();
+                    return;
+                }
                 mutable_stream.deinit();
+                s_inner.releaseTaskRef();
             };
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
