@@ -486,11 +486,11 @@ pub fn Switch(comptime config: SwitchConfig) type {
                     // still race the task epilogue. Leaking the task-held ref is
                     // safer than touching a potentially freed inner pointer.
                     mutable_stream.transferOwnership();
-                    return;
+                } else {
+                    mutable_stream.deinit();
+                    s_inner.releaseTaskRef();
                 }
-                mutable_stream.deinit();
-                s_inner.releaseTaskRef();
-            };
+            }
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
 
