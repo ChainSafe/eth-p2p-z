@@ -278,6 +278,7 @@ pub const Service = struct {
             } else {
                 log.info("gossipsub: keeping existing peer stream for duplicate inbound stream", .{});
             }
+            self.flushPendingSendsForPeer(io, peer_id);
             self.sendSubscriptionAnnouncement(peer_id);
             log.info("gossipsub: announced {d} subscriptions to inbound peer", .{self.tracked_subscriptions.count()});
         }
@@ -337,6 +338,7 @@ pub const Service = struct {
             log.info("gossipsub: keeping existing peer stream for duplicate outbound stream", .{});
         }
 
+        self.flushPendingSendsForPeer(io, peer_id);
         self.router.addPeer(peer_id) catch {};
         self.sendSubscriptionAnnouncement(peer_id);
     }
@@ -411,6 +413,46 @@ pub const Service = struct {
         };
         self.pending_send_bytes += queued_bytes;
         return true;
+    }
+
+    fn flushPendingSendsForPeer(self: *Self, io: Io, peer_id: []const u8) void {
+        const managed_stream = self.outbound_streams.get(peer_id) orelse return;
+
+        managed_stream.retain();
+        defer managed_stream.release(self.allocator);
+
+        var i: usize = 0;
+        while (i < self.pending_sends.items.len) {
+            const pending = self.pending_sends.items[i];
+            if (!std.mem.eql(u8, pending.peer, peer_id)) {
+                i += 1;
+                continue;
+            }
+
+            var total: usize = 0;
+            var ok = true;
+            while (total < pending.data.len) {
+                const n = managed_stream.write(io, pending.data[total..]) catch {
+                    ok = false;
+                    break;
+                };
+                if (n == 0) {
+                    ok = false;
+                    break;
+                }
+                total += n;
+            }
+
+            if (!ok) {
+                i += 1;
+                continue;
+            }
+
+            const removed = self.pending_sends.orderedRemove(i);
+            self.pending_send_bytes -= removed.peer.len + removed.data.len;
+            self.allocator.free(removed.peer);
+            self.allocator.free(removed.data);
+        }
     }
 
     /// Return a pseudo-random u64 using xorshift64.
@@ -661,6 +703,51 @@ test "Service sendRpc enforces pending queue limits" {
     }
     try std.testing.expectEqual(@as(usize, 1), sends.len);
     try std.testing.expectEqual(@as(usize, 0), svc.pending_send_bytes);
+}
+
+test "Service flushes queued RPCs when a peer stream is installed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const TestStream = struct {
+        const Self = @This();
+
+        writes: *std.ArrayList(u8),
+
+        pub fn read(_: *Self, _: Io, _: []u8) !usize {
+            return 0;
+        }
+
+        pub fn write(self: *Self, _: Io, data: []const u8) !usize {
+            try self.writes.appendSlice(std.testing.allocator, data);
+            return data.len;
+        }
+
+        pub fn closeRead(_: *Self, _: Io) void {}
+        pub fn closeWrite(_: *Self, _: Io) void {}
+        pub fn close(_: *Self, _: Io) void {}
+        pub fn deinit(_: *Self) void {}
+
+        pub fn detachOwnedStream(self: *Self) Self {
+            return self.*;
+        }
+    };
+
+    const svc = try Service.init(allocator, .{});
+    defer svc.deinit(io);
+
+    try std.testing.expect(svc.sendRpc("peer-1", "queued-rpc"));
+    try std.testing.expectEqual(@as(usize, 1), svc.pending_sends.items.len);
+
+    var writes: std.ArrayList(u8) = .empty;
+    defer writes.deinit(allocator);
+    var stream = TestStream{ .writes = &writes };
+
+    try svc.handleOutbound(io, &stream, .{ .peer_id = @as(?[]const u8, "peer-1") });
+
+    try std.testing.expectEqual(@as(usize, 0), svc.pending_sends.items.len);
+    try std.testing.expectEqual(@as(usize, 0), svc.pending_send_bytes);
+    try std.testing.expectEqualStrings("queued-rpc", writes.items);
 }
 
 test "Service setTime and setSeed" {
