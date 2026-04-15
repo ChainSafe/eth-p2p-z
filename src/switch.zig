@@ -30,9 +30,13 @@ pub const EngineConfig = struct {
     max_connections: usize = 256,
     /// Maximum concurrent inbound connections allowed from a single IP.
     max_inbound_connections_per_ip: usize = 16,
+    /// Maximum time to wait for an outbound QUIC/TLS handshake to complete.
+    ///
+    /// WAN handshakes can regularly exceed a few seconds under peer churn or
+    /// packet loss, so production callers should not rely on an aggressive
+    /// fixed timeout here.
+    dial_handshake_timeout_ms: u64 = 20_000,
 };
-
-const dial_handshake_timeout_ms: u64 = 5_000;
 
 const TimerResult = enum {
     fired,
@@ -292,7 +296,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
             // Wait for TLS handshake with an explicit dial timeout so a peer
             // that never completes the handshake cannot pin the caller forever.
-            const peer_id = try waitForDialHandshakeWithTimeout(io, conn, dial_handshake_timeout_ms);
+            const peer_id = try waitForDialHandshakeWithTimeout(io, conn, self.engine_config.dial_handshake_timeout_ms);
             var pid_buf: [128]u8 = undefined;
             const raw_peer_id = peer_id.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
 
