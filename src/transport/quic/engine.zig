@@ -415,7 +415,10 @@ pub const QuicStream = struct {
         if (self.counted_on_conn) {
             self.conn.releaseActiveStream();
         }
-        self.allocator.destroy(self);
+        // Stream shutdown still has late callback/task lifetime gaps.
+        // Releasing queues and buffers is safe, but freeing the wrapper can
+        // race a trailing swarm task ref release after lsquic close callbacks.
+        // Leak the wrapper until the underlying lifetime model is tightened.
     }
 
     fn drainReadQueue(self: *QuicStream) void {
