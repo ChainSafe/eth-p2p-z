@@ -134,6 +134,12 @@ pub const Service = struct {
         heap_stream.* = stream.*;
         if (@hasDecl(StreamT, "retainManagedRef")) {
             heap_stream.retainManagedRef();
+            // Streams that expose explicit managed refs should be kept alive by
+            // that ref alone. The wrapper must not also own the inner handle,
+            // or disconnect teardown can double-release the same stream.
+            if (@hasDecl(StreamT, "transferOwnership")) {
+                heap_stream.transferOwnership();
+            }
         }
         if (@hasDecl(StreamT, "transferOwnership")) {
             stream.transferOwnership();
