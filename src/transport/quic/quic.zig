@@ -52,6 +52,14 @@ pub const Stream = struct {
         self.owns_inner = false;
     }
 
+    pub fn retainManagedRef(self: *Stream) void {
+        self.inner.retainTaskRef();
+    }
+
+    pub fn releaseManagedRef(self: *Stream) void {
+        self.inner.releaseTaskRef();
+    }
+
     pub fn transferOwnership(self: *Stream) void {
         self.owns_inner = false;
     }

@@ -435,8 +435,9 @@ pub fn Switch(comptime config: SwitchConfig) type {
                     stream.deinit();
                     continue;
                 };
+                s_inner.retainTaskRef();
                 self.background.async(io, Self.swarmStreamTask, .{
-                    self, io, quic_mod.Stream{ .inner = s_inner }, SwarmStreamCtx{ .peer_id = stream_peer_id },
+                    self, io, conn, s_inner, SwarmStreamCtx{ .peer_id = stream_peer_id },
                 });
             }
 
@@ -467,13 +468,24 @@ pub fn Switch(comptime config: SwitchConfig) type {
         }
 
         /// Handles a single inbound stream: multistream-negotiate then dispatch.
-        fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: SwarmStreamCtx) void {
+        fn swarmStreamTask(
+            self: *Self,
+            io: Io,
+            conn: *engine_mod.QuicConnection,
+            s_inner: *engine_mod.QuicStream,
+            ctx: SwarmStreamCtx,
+        ) void {
             log.info("swarmStreamTask: dispatching stream", .{});
-            var mutable_stream = s;
+            var mutable_stream = quic_mod.Stream{ .inner = s_inner };
             defer {
                 if (ctx.peer_id) |peer_id| self.allocator.free(peer_id);
             }
-            defer mutable_stream.deinit();
+            defer s_inner.releaseTaskRef();
+            defer if (conn.closed) {
+                mutable_stream.transferOwnership();
+            } else {
+                mutable_stream.deinit();
+            };
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
 

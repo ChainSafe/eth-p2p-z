@@ -97,11 +97,21 @@ pub const Service = struct {
         }
 
         fn release(self: *ManagedStream, alloc: Allocator) void {
-            const previous = self.ref_count.fetchSub(1, .acq_rel);
-            std.debug.assert(previous > 0);
-            if (previous == 1) {
-                self.owned.destroyBacking(alloc);
-                alloc.destroy(self);
+            var current = self.ref_count.load(.acquire);
+            while (true) {
+                if (current == 0) {
+                    log.err("gossipsub managed stream release underflow", .{});
+                    return;
+                }
+                if (self.ref_count.cmpxchgWeak(current, current - 1, .acq_rel, .acquire)) |observed| {
+                    current = observed;
+                    continue;
+                }
+                if (current == 1) {
+                    self.owned.destroyBacking(alloc);
+                    alloc.destroy(self);
+                }
+                return;
             }
         }
 
@@ -122,6 +132,9 @@ pub const Service = struct {
         errdefer self.allocator.destroy(heap_stream);
 
         heap_stream.* = stream.*;
+        if (@hasDecl(StreamT, "retainManagedRef")) {
+            heap_stream.retainManagedRef();
+        }
         if (@hasDecl(StreamT, "transferOwnership")) {
             stream.transferOwnership();
         }
@@ -138,6 +151,9 @@ pub const Service = struct {
                         const p: *StreamT = @ptrCast(@alignCast(ptr));
                         if (@hasDecl(StreamT, "deinit")) {
                             p.deinit();
+                        }
+                        if (@hasDecl(StreamT, "releaseManagedRef")) {
+                            p.releaseManagedRef();
                         }
                         alloc.destroy(p);
                     }
