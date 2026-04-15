@@ -335,6 +335,30 @@ pub const QuicStream = struct {
         self.releaseRef();
     }
 
+    pub fn finishTask(self: *QuicStream) void {
+        // Task-dispatched streams already hold an explicit task ref. Release the
+        // wrapper/user ownership here without freeing the stream out from under
+        // the task epilogue; the final release happens via releaseTaskRef().
+        self.beginShutdown();
+        if (self.lsquic_stream) |ls| {
+            self.conn.engine.lockLsquic();
+            lsquic.lsquic_stream_set_ctx(ls, null);
+            if (!self.conn.closed) {
+                _ = lsquic.lsquic_stream_close(ls);
+                self.conn.engine.requestProcessWake();
+            }
+            self.conn.engine.unlockLsquic();
+            self.lsquic_stream = null;
+            self.releaseRef();
+        }
+        if (self.user_ref_active.swap(false, .acq_rel)) {
+            self.releaseRef();
+        }
+        if (self.queued_ref_active.swap(false, .acq_rel)) {
+            self.releaseRef();
+        }
+    }
+
     fn markActive(self: *QuicStream) void {
         if (self.counted_on_conn) return;
         self.counted_on_conn = true;
@@ -415,10 +439,7 @@ pub const QuicStream = struct {
         if (self.counted_on_conn) {
             self.conn.releaseActiveStream();
         }
-        // Stream shutdown still has late callback/task lifetime gaps.
-        // Releasing queues and buffers is safe, but freeing the wrapper can
-        // race a trailing swarm task ref release after lsquic close callbacks.
-        // Leak the wrapper until the underlying lifetime model is tightened.
+        self.allocator.destroy(self);
     }
 
     fn drainReadQueue(self: *QuicStream) void {

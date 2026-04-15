@@ -476,20 +476,14 @@ pub fn Switch(comptime config: SwitchConfig) type {
             ctx: SwarmStreamCtx,
         ) void {
             log.info("swarmStreamTask: dispatching stream", .{});
-            var mutable_stream = quic_mod.Stream{ .inner = s_inner };
+            var mutable_stream = quic_mod.Stream{ .inner = s_inner, .owns_inner = false };
             defer {
                 if (ctx.peer_id) |peer_id| self.allocator.free(peer_id);
             }
             defer {
-                if (conn.closed) {
-                    // During connection teardown, late stream-close callbacks can
-                    // still race the task epilogue. Leaking the task-held ref is
-                    // safer than touching a potentially freed inner pointer.
-                    mutable_stream.transferOwnership();
-                } else {
-                    mutable_stream.deinit();
-                    s_inner.releaseTaskRef();
-                }
+                _ = conn;
+                s_inner.finishTask();
+                s_inner.releaseTaskRef();
             }
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
