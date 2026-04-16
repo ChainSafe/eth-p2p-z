@@ -38,67 +38,6 @@ pub const EngineConfig = struct {
     dial_handshake_timeout_ms: u64 = 20_000,
 };
 
-const TimerResult = enum {
-    fired,
-    canceled,
-};
-
-const DialHandshakeResult = union(enum) {
-    success: PeerId,
-    failure: anyerror,
-};
-
-fn timeoutFromMilliseconds(ms: u64) Io.Timeout {
-    return .{ .duration = .{
-        .raw = Io.Duration.fromMilliseconds(@intCast(ms)),
-        .clock = .awake,
-    } };
-}
-
-fn waitTimeout(io: Io, timeout: Io.Timeout) TimerResult {
-    timeout.sleep(io) catch |err| switch (err) {
-        error.Canceled => return .canceled,
-    };
-    return .fired;
-}
-
-fn waitForDialHandshakeWithTimeout(io: Io, conn: anytype, timeout_ms: u64) !PeerId {
-    const Conn = @TypeOf(conn);
-    const Waiter = struct {
-        fn run(wait_conn: Conn, wait_io: Io) DialHandshakeResult {
-            const peer_id = wait_conn.waitHandshake(wait_io) catch |err| {
-                return .{ .failure = err };
-            };
-            return .{ .success = peer_id };
-        }
-    };
-
-    var events_buf: [2]union(enum) {
-        handshake: DialHandshakeResult,
-        timeout: TimerResult,
-    } = undefined;
-    var select = Io.Select(@TypeOf(events_buf[0])).init(io, &events_buf);
-
-    select.async(.handshake, Waiter.run, .{ conn, io });
-    select.async(.timeout, waitTimeout, .{ io, timeoutFromMilliseconds(timeout_ms) });
-
-    defer select.cancelDiscard();
-
-    while (true) {
-        const event = try select.await();
-        switch (event) {
-            .handshake => |result| switch (result) {
-                .success => |peer_id| return peer_id,
-                .failure => |err| return err,
-            },
-            .timeout => |result| switch (result) {
-                .fired => return error.HandshakeTimeout,
-                .canceled => {},
-            },
-        }
-    }
-}
-
 /// Comptime-composed libp2p Switch.
 ///
 /// Validates transports and protocols at compile time, dispatches inbound
@@ -278,6 +217,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
             if (self.client_engine == null) {
                 const eng = try QuicEngine.init(self.allocator, io, .{
                     .is_server = false,
+                    .handshake_timeout_ms = self.engine_config.dial_handshake_timeout_ms,
                     .host_identity = self.engine_config.host_identity,
                 });
                 self.client_engine = eng;
@@ -294,9 +234,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 conn.deinit();
             }
 
-            // Wait for TLS handshake with an explicit dial timeout so a peer
-            // that never completes the handshake cannot pin the caller forever.
-            const peer_id = try waitForDialHandshakeWithTimeout(io, conn, self.engine_config.dial_handshake_timeout_ms);
+            const peer_id = try conn.waitHandshake(io);
             var pid_buf: [128]u8 = undefined;
             const raw_peer_id = peer_id.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
 
@@ -725,47 +663,6 @@ test "Switch comptime validation accepts valid config" {
 
     // Verify protocol IDs are correct
     try std.testing.expectEqualStrings("/test/mock/1.0.0", TestSwitch.supported_protocol_ids[0]);
-}
-
-test "waitForDialHandshakeWithTimeout returns handshake result" {
-    const MockConn = struct {
-        peer_id: PeerId,
-
-        pub fn waitHandshake(self: *@This(), _: Io) !PeerId {
-            return self.peer_id;
-        }
-    };
-
-    const expected = std.mem.zeroes(PeerId);
-    var conn = MockConn{ .peer_id = expected };
-    const actual = try waitForDialHandshakeWithTimeout(std.testing.io, &conn, 10);
-    try std.testing.expectEqualDeep(expected, actual);
-}
-
-test "waitForDialHandshakeWithTimeout forwards handshake failure" {
-    const MockConn = struct {
-        pub fn waitHandshake(_: *@This(), _: Io) !PeerId {
-            return error.HandshakeFailed;
-        }
-    };
-
-    var conn = MockConn{};
-    try std.testing.expectError(error.HandshakeFailed, waitForDialHandshakeWithTimeout(std.testing.io, &conn, 10));
-}
-
-test "waitForDialHandshakeWithTimeout times out blocked handshake" {
-    const MockConn = struct {
-        gate: *Io.Event,
-
-        pub fn waitHandshake(self: *@This(), io: Io) !PeerId {
-            try self.gate.wait(io);
-            return std.mem.zeroes(PeerId);
-        }
-    };
-
-    var gate: Io.Event = .unset;
-    var conn = MockConn{ .gate = &gate };
-    try std.testing.expectError(error.HandshakeTimeout, waitForDialHandshakeWithTimeout(std.testing.io, &conn, 5));
 }
 
 test "Swarm ping over QUIC" {

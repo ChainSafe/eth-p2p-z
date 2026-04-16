@@ -511,6 +511,54 @@ test "QUIC engine client connect initiates handshake" {
     eng.deinit();
 }
 
+test "QUIC client handshake timeout fails against blackholed UDP peer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client_host_identity = try identity.KeyPair.generate(.ECDSA);
+    defer client_host_identity.deinit();
+
+    // Bind a UDP socket and intentionally never read from it. This keeps the
+    // remote port open so the client cannot fast-fail with ICMP unreachable,
+    // while still blackholing the QUIC handshake.
+    var blackhole_bind_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    const blackhole_socket = try net.IpAddress.bind(&blackhole_bind_addr, io, .{ .mode = .dgram });
+    defer blackhole_socket.close(io);
+
+    const client_eng = try QuicEngine.init(allocator, io, .{
+        .is_server = false,
+        .host_identity = &client_host_identity,
+        .handshake_timeout_ms = 1_500,
+    });
+    defer {
+        client_eng.stop(io);
+        client_eng.deinit();
+    }
+
+    _ = try client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
+
+    var remote_sa = engine_mod.ipAddressToSockaddr(blackhole_socket.address);
+    const local_bound = (client_eng.socket orelse unreachable).address;
+    var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
+
+    const conn = try client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa));
+    defer {
+        conn.close(io);
+        conn.deinit();
+    }
+
+    client_eng.startBackgroundLoops(io);
+
+    const start = Io.Clock.Timestamp.now(io, .awake);
+    const handshake_result = conn.waitHandshake(io);
+    const end = Io.Clock.Timestamp.now(io, .awake);
+    const elapsed_ms = start.durationTo(end).raw.toMilliseconds();
+
+    try std.testing.expectError(error.HandshakeFailed, handshake_result);
+    try std.testing.expect(elapsed_ms >= 1_000);
+    try std.testing.expect(elapsed_ms < 8_000);
+}
+
 test "QUIC connection ownership in dial" {
     // Verify Connection.owned_engine works correctly
     const conn = quic.Connection{ .inner = null, .owned_engine = null };

@@ -877,6 +877,10 @@ pub const QuicEngine = struct {
         alpn: [:0]const u8 = "libp2p",
         max_streams_per_conn: u32 = 100,
         idle_timeout_secs: u32 = 30,
+        /// Optional QUIC/TLS handshake timeout for client connections.
+        /// lsquic expects this value in microseconds; `null` keeps lsquic's
+        /// default transport-level timeout.
+        handshake_timeout_ms: ?u64 = null,
         /// libp2p host identity used to sign the libp2p TLS extension.
         /// The engine always generates its own TLS subject key internally.
         host_identity: ?*const identity.KeyPair = null,
@@ -1018,6 +1022,9 @@ pub const QuicEngine = struct {
         // 0 for the client, which means the server can't send any data on
         // streams it opens (Status, Ping, Metadata requests). Set to 1 MB.
         settings.es_init_max_stream_data_bidi_remote = 1 * 1024 * 1024;
+        if (config.handshake_timeout_ms) |timeout_ms| {
+            settings.es_handshake_to = timeout_ms * std.time.us_per_ms;
+        }
 
         // Build engine API
         var engine_api: lsquic.lsquic_engine_api = std.mem.zeroes(lsquic.lsquic_engine_api);
