@@ -40,7 +40,7 @@ pub const Handler = struct {
     allocator: std.mem.Allocator,
     config: Config,
     /// Per-peer identify results. Keys are owned copies of peer_id bytes.
-    peer_results: std.StringArrayHashMap(IdentifyResult),
+    peer_results: std.array_hash_map.String(IdentifyResult),
 
     /// Protocol identifier for libp2p identify.
     pub const id = "/ipfs/id/1.0.0";
@@ -55,7 +55,7 @@ pub const Handler = struct {
             result.deinit(self.allocator);
             self.allocator.free(key);
         }
-        self.peer_results.deinit();
+        self.peer_results.deinit(self.allocator);
     }
 
     /// Called by Switch when a peer disconnects. Frees stored identify result.
@@ -178,7 +178,7 @@ pub const Handler = struct {
                 result.deinit(allocator);
                 return Error.UnexpectedEof;
             };
-            self.peer_results.put(key, result) catch {
+            self.peer_results.put(self.allocator, key, result) catch {
                 allocator.free(key);
                 result.deinit(allocator);
                 return Error.UnexpectedEof;
@@ -260,7 +260,7 @@ test "handleInbound encodes and writes identify message" {
             .protocol_version = "test/1.0.0",
             .agent_version = "zig-libp2p/0.1.0",
         },
-        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
+        .peer_results = .empty,
     };
     defer handler.deinit();
     try handler.handleInbound(undefined, &stream, .{});
@@ -298,7 +298,7 @@ test "handleOutbound reads and decodes identify message" {
     var handler: Handler = .{
         .allocator = allocator,
         .config = .{},
-        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
+        .peer_results = .empty,
     };
     defer handler.deinit();
 
@@ -322,7 +322,7 @@ test "handleOutbound rejects empty stream" {
     var handler: Handler = .{
         .allocator = allocator,
         .config = .{},
-        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
+        .peer_results = .empty,
     };
     defer handler.deinit();
     const result = handler.handleOutbound(undefined, &stream, .{});
@@ -348,7 +348,7 @@ test "handleOutbound evicts oldest peer result when cache is full" {
     var handler: Handler = .{
         .allocator = allocator,
         .config = .{ .max_peer_results = 1 },
-        .peer_results = std.StringArrayHashMap(IdentifyResult).init(allocator),
+        .peer_results = .empty,
     };
     defer handler.deinit();
 
