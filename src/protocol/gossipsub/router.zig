@@ -57,7 +57,6 @@ pub fn Router(comptime Handler: type) type {
             backing: []u8,
 
             fn deinit(self: *PendingValidationEntry, allocator: std.mem.Allocator) void {
-                allocator.free(self.source_peer);
                 allocator.free(self.backing);
                 self.* = undefined;
             }
