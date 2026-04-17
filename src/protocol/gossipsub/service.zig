@@ -11,6 +11,7 @@ const AnyStream = transport_mod.AnyStream;
 
 const Config = config_mod.Config;
 const Event = config_mod.Event;
+const ValidationResult = config_mod.ValidationResult;
 const FrameDecoder = codec_mod.FrameDecoder;
 
 const log = std.log.scoped(.gossipsub_service);
@@ -455,6 +456,22 @@ pub const Service = struct {
         }
     }
 
+    fn dropPendingSendsForPeer(self: *Self, peer_id: []const u8) void {
+        var i: usize = 0;
+        while (i < self.pending_sends.items.len) {
+            const pending = self.pending_sends.items[i];
+            if (!std.mem.eql(u8, pending.peer, peer_id)) {
+                i += 1;
+                continue;
+            }
+
+            const removed = self.pending_sends.orderedRemove(i);
+            self.pending_send_bytes -= removed.peer.len + removed.data.len;
+            self.allocator.free(removed.peer);
+            self.allocator.free(removed.data);
+        }
+    }
+
     /// Return a pseudo-random u64 using xorshift64.
     pub fn randomU64(self: *Self) u64 {
         var x = self.rng_state;
@@ -534,6 +551,7 @@ pub const Service = struct {
             entry.value.release(self.allocator);
             self.allocator.free(entry.key);
         }
+        self.dropPendingSendsForPeer(peer_id);
         self.router.removePeer(peer_id);
     }
 
@@ -554,6 +572,20 @@ pub const Service = struct {
         self.lock(io);
         defer self.unlock(io);
         return try self.router.drainEvents();
+    }
+
+    /// Report the consumer's validation result for a pending inbound message.
+    pub fn reportValidationResult(
+        self: *Self,
+        io: Io,
+        msg_id: []const u8,
+        result: ValidationResult,
+    ) bool {
+        self.lock(io);
+        defer self.unlock(io);
+        self.activateIo(io);
+        defer self.deactivateIo();
+        return self.router.reportValidationResult(msg_id, result);
     }
 
     /// Pass a received RPC (protobuf bytes, without varint length prefix) to
@@ -748,6 +780,21 @@ test "Service flushes queued RPCs when a peer stream is installed" {
     try std.testing.expectEqual(@as(usize, 0), svc.pending_sends.items.len);
     try std.testing.expectEqual(@as(usize, 0), svc.pending_send_bytes);
     try std.testing.expectEqualStrings("queued-rpc", writes.items);
+}
+
+test "Service removePeer drops queued RPCs for that peer" {
+    const svc = try Service.init(std.testing.allocator, .{});
+    defer svc.deinit(std.testing.io);
+
+    try std.testing.expect(svc.sendRpc("peer-1", "queued-a"));
+    try std.testing.expect(svc.sendRpc("peer-2", "queued-b"));
+    try std.testing.expectEqual(@as(usize, 2), svc.pending_sends.items.len);
+
+    svc.removePeer(std.testing.io, "peer-1");
+
+    try std.testing.expectEqual(@as(usize, 1), svc.pending_sends.items.len);
+    try std.testing.expectEqualStrings("peer-2", svc.pending_sends.items[0].peer);
+    try std.testing.expectEqual(@as(usize, "peer-2".len + "queued-b".len), svc.pending_send_bytes);
 }
 
 test "Service setTime and setSeed" {

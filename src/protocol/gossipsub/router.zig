@@ -10,6 +10,8 @@ const Event = config_mod.Event;
 const SignaturePolicy = config_mod.SignaturePolicy;
 const PeerScoreParams = config_mod.PeerScoreParams;
 const TopicScoreParams = config_mod.TopicScoreParams;
+const ValidationMode = config_mod.ValidationMode;
+const ValidationResult = config_mod.ValidationResult;
 
 const log = std.log.scoped(.gossipsub);
 
@@ -47,6 +49,18 @@ pub fn Router(comptime Handler: type) type {
         const SeenEntry = struct {
             mid: []const u8,
             expires_at_ms: u64,
+        };
+
+        const PendingValidationEntry = struct {
+            source_peer: []const u8,
+            message: rpc.Message,
+            backing: []u8,
+
+            fn deinit(self: *PendingValidationEntry, allocator: std.mem.Allocator) void {
+                allocator.free(self.source_peer);
+                allocator.free(self.backing);
+                self.* = undefined;
+            }
         };
 
         allocator: std.mem.Allocator,
@@ -100,6 +114,8 @@ pub fn Router(comptime Handler: type) type {
 
         // Events buffer
         events: std.ArrayList(Event),
+        // Inbound messages waiting on application validation.
+        pending_validations: std.StringHashMap(PendingValidationEntry),
 
         // Heartbeat counter
         heartbeat_ticks: u64,
@@ -253,6 +269,7 @@ pub fn Router(comptime Handler: type) type {
                 .score_params = score_params,
                 .topic_score_params = topic_params orelse std.StringHashMap(TopicScoreParams).init(allocator),
                 .events = .empty,
+                .pending_validations = std.StringHashMap(PendingValidationEntry).init(allocator),
                 .heartbeat_ticks = 0,
             };
         }
@@ -262,6 +279,15 @@ pub fn Router(comptime Handler: type) type {
                 event.deinit(self.allocator);
             }
             self.events.deinit(self.allocator);
+
+            {
+                var iter = self.pending_validations.iterator();
+                while (iter.next()) |entry| {
+                    self.allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.deinit(self.allocator);
+                }
+                self.pending_validations.deinit();
+            }
 
             // Peer scoring
             {
@@ -384,6 +410,8 @@ pub fn Router(comptime Handler: type) type {
                 try self.appendOwnedEvent(.{ .message = .{
                     .topic = topic,
                     .data = data,
+                    .peer_id = "",
+                    .msg_id = mid,
                     .from = null,
                     .seqno = null,
                 } });
@@ -516,6 +544,37 @@ pub fn Router(comptime Handler: type) type {
             return result;
         }
 
+        /// Report the application validation outcome for a pending inbound
+        /// message. Returns false when the message is no longer pending.
+        pub fn reportValidationResult(self: *Self, msg_id: []const u8, result: ValidationResult) bool {
+            const removed = self.pending_validations.fetchRemove(msg_id) orelse return false;
+            defer {
+                self.allocator.free(removed.key);
+                var entry = removed.value;
+                entry.deinit(self.allocator);
+            }
+
+            switch (result) {
+                .accept => {
+                    self.mcache.putWithId(removed.key, &removed.value.message) catch return true;
+
+                    const topic = removed.value.message.topic orelse return true;
+                    self.recordFirstDelivery(removed.value.source_peer, topic);
+                    self.recordMeshDelivery(removed.value.source_peer, topic);
+
+                    const data_len = if (removed.value.message.data) |d| d.len else 0;
+                    if (data_len >= self.config.idontwant_min_message_size) {
+                        self.sendIDontWantExcluding(topic, removed.key, removed.value.source_peer) catch {};
+                    }
+
+                    self.forwardMessage(removed.value.source_peer, topic, removed.key, &removed.value.message);
+                },
+                .ignore, .reject => {},
+            }
+
+            return true;
+        }
+
         fn dupeOptionalBytes(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
             return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
         }
@@ -525,6 +584,8 @@ pub fn Router(comptime Handler: type) type {
                 .message => |msg| .{ .message = .{
                     .topic = try self.allocator.dupe(u8, msg.topic),
                     .data = try self.allocator.dupe(u8, msg.data),
+                    .peer_id = try self.allocator.dupe(u8, msg.peer_id),
+                    .msg_id = try self.allocator.dupe(u8, msg.msg_id),
                     .from = try dupeOptionalBytes(self.allocator, msg.from),
                     .seqno = try dupeOptionalBytes(self.allocator, msg.seqno),
                 } },
@@ -550,6 +611,54 @@ pub fn Router(comptime Handler: type) type {
                     .partial_messages = ext.partial_messages,
                 } },
             };
+        }
+
+        fn clonePendingValidationMessage(
+            allocator: std.mem.Allocator,
+            msg: *const rpc.Message,
+            source_peer: []const u8,
+        ) error{OutOfMemory}!PendingValidationEntry {
+            var total_len: usize = source_peer.len;
+            if (msg.from) |f| total_len += f.len;
+            if (msg.seqno) |s| total_len += s.len;
+            if (msg.topic) |t| total_len += t.len;
+            if (msg.data) |d| total_len += d.len;
+            if (msg.signature) |s| total_len += s.len;
+            if (msg.key) |k| total_len += k.len;
+
+            const backing = try allocator.alloc(u8, total_len);
+            errdefer allocator.free(backing);
+
+            var offset: usize = 0;
+            const copied_source_peer = copyField(backing, &offset, source_peer);
+            const from = if (msg.from) |f| copyField(backing, &offset, f) else null;
+            const seqno = if (msg.seqno) |s| copyField(backing, &offset, s) else null;
+            const topic = if (msg.topic) |t| copyField(backing, &offset, t) else null;
+            const data = if (msg.data) |d| copyField(backing, &offset, d) else null;
+            const signature = if (msg.signature) |s| copyField(backing, &offset, s) else null;
+            const key = if (msg.key) |k| copyField(backing, &offset, k) else null;
+
+            std.debug.assert(offset == total_len);
+
+            return .{
+                .source_peer = copied_source_peer,
+                .message = .{
+                    .from = from,
+                    .seqno = seqno,
+                    .topic = topic,
+                    .data = data,
+                    .signature = signature,
+                    .key = key,
+                },
+                .backing = backing,
+            };
+        }
+
+        inline fn copyField(backing: []u8, offset: *usize, source: []const u8) []const u8 {
+            const start = offset.*;
+            @memcpy(backing[start..][0..source.len], source);
+            offset.* = start + source.len;
+            return backing[start..][0..source.len];
         }
 
         fn appendOwnedEvent(self: *Self, event: Event) !void {
@@ -807,6 +916,44 @@ pub fn Router(comptime Handler: type) type {
             log.info("handleIncomingMessage: DEDUP MISS (new msg) mid_len={d}", .{mid.len});
             try self.rememberSeen(mid);
 
+            const uses_manual_validation =
+                self.config.validation_mode == .manual and self.subscriptions.contains(topic);
+
+            if (uses_manual_validation) {
+                if (!self.pending_validations.contains(mid) and
+                    self.pending_validations.count() >= self.config.max_pending_validations)
+                {
+                    log.warn("dropping inbound message because pending validation limits were reached", .{});
+                    return;
+                }
+
+                const pending = clonePendingValidationMessage(self.allocator, &msg, from_peer) catch return;
+                errdefer {
+                    var owned = pending;
+                    owned.deinit(self.allocator);
+                }
+
+                const gop = try self.pending_validations.getOrPut(mid);
+                if (gop.found_existing) return;
+                const owned_mid = try self.allocator.dupe(u8, mid);
+                errdefer {
+                    _ = self.pending_validations.fetchRemove(mid);
+                    self.allocator.free(owned_mid);
+                }
+                gop.key_ptr.* = owned_mid;
+                gop.value_ptr.* = pending;
+
+                try self.appendOwnedEvent(.{ .message = .{
+                    .topic = topic,
+                    .data = msg.data orelse "",
+                    .peer_id = from_peer,
+                    .msg_id = mid,
+                    .from = msg.from,
+                    .seqno = msg.seqno,
+                } });
+                return;
+            }
+
             // Cache the message
             self.mcache.put(&msg) catch {};
 
@@ -829,6 +976,8 @@ pub fn Router(comptime Handler: type) type {
                 try self.appendOwnedEvent(.{ .message = .{
                     .topic = topic,
                     .data = msg.data orelse "",
+                    .peer_id = from_peer,
+                    .msg_id = mid,
                     .from = msg.from,
                     .seqno = msg.seqno,
                 } });
@@ -2031,6 +2180,106 @@ test "Router handleRpc processes subscriptions" {
     defer freeEvents(allocator, events);
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expect(events[0] == .subscription_changed);
+}
+
+test "Router manual validation defers forwarding until accept" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+    }, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    for ([_][]const u8{ "peer-1", "peer-2" }) |peer| {
+        try handler.markConnected(peer);
+        try router.addPeer(peer);
+        try addPeerSubscription(&router, peer, "topic-a");
+    }
+
+    try router.heartbeat();
+    handler.clearSent();
+    freeEvents(allocator, try router.drainEvents());
+
+    var pub_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "hello",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var rpc_msg = rpc.RPC{ .publish = &pub_msgs };
+    const encoded = rpc_msg.encode(allocator) catch unreachable;
+    defer allocator.free(encoded);
+    try router.handleRpc("peer-1", encoded);
+
+    const events = try router.drainEvents();
+    defer freeEvents(allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0] == .message);
+    try std.testing.expectEqualStrings("peer-1", events[0].message.peer_id);
+    try std.testing.expectEqualStrings("topic-ahello", events[0].message.msg_id);
+    try std.testing.expectEqual(@as(usize, 0), handler.sent.items.len);
+    try std.testing.expect(router.mcache.get(events[0].message.msg_id) == null);
+    try std.testing.expectEqual(@as(usize, 1), router.pending_validations.count());
+
+    try std.testing.expect(router.reportValidationResult(events[0].message.msg_id, .accept));
+    try std.testing.expectEqual(@as(usize, 1), handler.sent.items.len);
+    try std.testing.expectEqualStrings("peer-2", handler.sent.items[0].peer);
+    try std.testing.expect(router.mcache.get("topic-ahello") != null);
+    try std.testing.expectEqual(@as(usize, 0), router.pending_validations.count());
+}
+
+test "Router manual validation ignore does not cache or forward" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+    }, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    for ([_][]const u8{ "peer-1", "peer-2" }) |peer| {
+        try handler.markConnected(peer);
+        try router.addPeer(peer);
+        try addPeerSubscription(&router, peer, "topic-a");
+    }
+
+    try router.heartbeat();
+    handler.clearSent();
+    freeEvents(allocator, try router.drainEvents());
+
+    var pub_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "ignored",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var rpc_msg = rpc.RPC{ .publish = &pub_msgs };
+    const encoded = rpc_msg.encode(allocator) catch unreachable;
+    defer allocator.free(encoded);
+    try router.handleRpc("peer-1", encoded);
+
+    const events = try router.drainEvents();
+    defer freeEvents(allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(router.reportValidationResult(events[0].message.msg_id, .ignore));
+    try std.testing.expectEqual(@as(usize, 0), handler.sent.items.len);
+    try std.testing.expect(router.mcache.get(events[0].message.msg_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), router.pending_validations.count());
 }
 
 test "Router heartbeat with peers" {

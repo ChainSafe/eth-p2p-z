@@ -34,6 +34,22 @@ pub const PublishPolicy = enum {
     anonymous,
 };
 
+/// How inbound published messages should move through the router.
+pub const ValidationMode = enum {
+    /// Cache and forward immediately after structural validation.
+    eager,
+    /// Emit to the consumer first and wait for an explicit validation result
+    /// before caching / forwarding.
+    manual,
+};
+
+/// Application validation outcome for an inbound message.
+pub const ValidationResult = enum {
+    accept,
+    ignore,
+    reject,
+};
+
 /// Gossipsub router configuration.
 ///
 /// Default values follow the GossipSub v1.1 spec recommendation.
@@ -96,6 +112,11 @@ pub const Config = struct {
     max_pending_send_bytes: usize = 8 * 1024 * 1024,
     /// Maximum number of undrained events buffered in memory.
     max_event_queue: usize = 1_024,
+    /// Whether inbound published messages are forwarded eagerly or only after
+    /// the consumer reports a validation result.
+    validation_mode: ValidationMode = .eager,
+    /// Maximum number of inbound messages waiting on application validation.
+    max_pending_validations: usize = 4_096,
 };
 
 /// v1.3: Extension capabilities declared on stream open.
@@ -201,6 +222,8 @@ pub const Event = union(enum) {
             .message => |*event| {
                 allocator.free(event.topic);
                 allocator.free(event.data);
+                allocator.free(event.peer_id);
+                allocator.free(event.msg_id);
                 if (event.from) |from| allocator.free(from);
                 if (event.seqno) |seqno| allocator.free(seqno);
             },
@@ -232,6 +255,10 @@ pub const MessageEvent = struct {
     topic: []const u8,
     /// The raw message data.
     data: []const u8,
+    /// The transport peer that propagated this message to us.
+    peer_id: []const u8,
+    /// The computed gossip message ID for this message.
+    msg_id: []const u8,
     /// The sender's peer ID (if available from the message).
     from: ?[]const u8,
     /// The message sequence number (if available).
@@ -280,6 +307,8 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(usize, 1_024), cfg.max_pending_sends);
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), cfg.max_pending_send_bytes);
     try std.testing.expectEqual(@as(usize, 1_024), cfg.max_event_queue);
+    try std.testing.expectEqual(ValidationMode.eager, cfg.validation_mode);
+    try std.testing.expectEqual(@as(usize, 4_096), cfg.max_pending_validations);
     try std.testing.expectEqual(SignaturePolicy.strict_sign, cfg.signature_policy);
     try std.testing.expectEqual(PublishPolicy.signing, cfg.publish_policy);
 }
@@ -305,6 +334,8 @@ test "Event union tag" {
     const event: Event = .{ .message = .{
         .topic = "test",
         .data = "hello",
+        .peer_id = "peer-1",
+        .msg_id = "mid-1",
         .from = null,
         .seqno = null,
     } };
