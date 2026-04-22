@@ -349,19 +349,24 @@ pub const Service = struct {
         const count = self.tracked_subscriptions.count();
         if (count == 0) return;
 
-        // Build subscription list from tracked_subscriptions
-        // Use a stack buffer for SubOpts (up to 64 topics)
         var sub_opts: [64]?rpc.RPC.SubOpts = undefined;
         var i: usize = 0;
         var iter = self.tracked_subscriptions.keyIterator();
         while (iter.next()) |key| {
-            if (i >= 64) break;
             sub_opts[i] = .{ .subscribe = true, .topicid = key.* };
             i += 1;
+            if (i == sub_opts.len) {
+                self.sendSubscriptionAnnouncementChunk(peer_id, sub_opts[0..i]);
+                i = 0;
+            }
         }
-        if (i == 0) return;
+        if (i != 0) {
+            self.sendSubscriptionAnnouncementChunk(peer_id, sub_opts[0..i]);
+        }
+    }
 
-        var rpc_msg = rpc.RPC{ .subscriptions = sub_opts[0..i] };
+    fn sendSubscriptionAnnouncementChunk(self: *Self, peer_id: []const u8, subscriptions: []const ?rpc.RPC.SubOpts) void {
+        var rpc_msg = rpc.RPC{ .subscriptions = subscriptions };
         const frame = codec_mod.encodeRpc(self.allocator, &rpc_msg) catch return;
         defer self.allocator.free(frame);
         _ = self.sendRpc(peer_id, frame);
@@ -780,6 +785,67 @@ test "Service flushes queued RPCs when a peer stream is installed" {
     try std.testing.expectEqual(@as(usize, 0), svc.pending_sends.items.len);
     try std.testing.expectEqual(@as(usize, 0), svc.pending_send_bytes);
     try std.testing.expectEqualStrings("queued-rpc", writes.items);
+}
+
+test "Service announces more than 64 tracked subscriptions to newly connected peers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const TestStream = struct {
+        const Self = @This();
+
+        writes: *std.ArrayList(u8),
+
+        pub fn read(_: *Self, _: Io, _: []u8) !usize {
+            return 0;
+        }
+
+        pub fn write(self: *Self, _: Io, data: []const u8) !usize {
+            try self.writes.appendSlice(std.testing.allocator, data);
+            return data.len;
+        }
+
+        pub fn closeRead(_: *Self, _: Io) void {}
+        pub fn closeWrite(_: *Self, _: Io) void {}
+        pub fn close(_: *Self, _: Io) void {}
+        pub fn deinit(_: *Self) void {}
+
+        pub fn detachOwnedStream(self: *Self) Self {
+            return self.*;
+        }
+    };
+
+    const svc = try Service.init(allocator, .{});
+    defer svc.deinit(io);
+
+    for (0..65) |i| {
+        const topic = try std.fmt.allocPrint(allocator, "topic-{d}", .{i});
+        defer allocator.free(topic);
+        try svc.subscribe(io, topic);
+    }
+
+    var writes: std.ArrayList(u8) = .empty;
+    defer writes.deinit(allocator);
+    var stream = TestStream{ .writes = &writes };
+    try svc.handleOutbound(io, &stream, .{ .peer_id = @as(?[]const u8, "peer-1") });
+
+    var decoder = FrameDecoder.init(allocator);
+    defer decoder.deinit();
+    try decoder.feed(writes.items);
+
+    var topic_count: usize = 0;
+    var frame_count: usize = 0;
+    while (try decoder.next()) |frame| {
+        defer allocator.free(frame);
+        frame_count += 1;
+        var reader = try rpc.RPCReader.init(frame);
+        while (reader.subscriptionsNext()) |_| {
+            topic_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), frame_count);
+    try std.testing.expectEqual(@as(usize, 65), topic_count);
 }
 
 test "Service removePeer drops queued RPCs for that peer" {
