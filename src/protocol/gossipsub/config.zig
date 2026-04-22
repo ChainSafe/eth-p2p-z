@@ -39,7 +39,7 @@ pub const ValidationMode = enum {
     /// Cache and forward immediately after structural validation.
     eager,
     /// Emit to the consumer first and wait for an explicit validation result
-    /// before caching / forwarding.
+    /// before the retained cache entry is marked validated and forwarded.
     manual,
 };
 
