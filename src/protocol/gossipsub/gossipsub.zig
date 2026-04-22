@@ -7,6 +7,8 @@ pub const service = @import("service.zig");
 // Re-export key types
 pub const MessageCache = mcache.MessageCache;
 pub const MessageIdFn = mcache.MessageIdFn;
+pub const EntryState = mcache.EntryState;
+pub const PendingValidationStats = mcache.PendingValidationStats;
 pub const defaultMsgId = mcache.defaultMsgId;
 
 pub const FrameDecoder = codec.FrameDecoder;

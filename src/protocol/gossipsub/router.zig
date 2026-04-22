@@ -51,17 +51,6 @@ pub fn Router(comptime Handler: type) type {
             expires_at_ms: u64,
         };
 
-        const PendingValidationEntry = struct {
-            source_peer: []const u8,
-            message: rpc.Message,
-            backing: []u8,
-
-            fn deinit(self: *PendingValidationEntry, allocator: std.mem.Allocator) void {
-                allocator.free(self.backing);
-                self.* = undefined;
-            }
-        };
-
         allocator: std.mem.Allocator,
         config: Config,
         handler: *Handler,
@@ -113,8 +102,6 @@ pub fn Router(comptime Handler: type) type {
 
         // Events buffer
         events: std.ArrayList(Event),
-        // Inbound messages waiting on application validation.
-        pending_validations: std.StringHashMap(PendingValidationEntry),
 
         // Heartbeat counter
         heartbeat_ticks: u64,
@@ -268,7 +255,6 @@ pub fn Router(comptime Handler: type) type {
                 .score_params = score_params,
                 .topic_score_params = topic_params orelse std.StringHashMap(TopicScoreParams).init(allocator),
                 .events = .empty,
-                .pending_validations = std.StringHashMap(PendingValidationEntry).init(allocator),
                 .heartbeat_ticks = 0,
             };
         }
@@ -278,15 +264,6 @@ pub fn Router(comptime Handler: type) type {
                 event.deinit(self.allocator);
             }
             self.events.deinit(self.allocator);
-
-            {
-                var iter = self.pending_validations.iterator();
-                while (iter.next()) |entry| {
-                    self.allocator.free(entry.key_ptr.*);
-                    entry.value_ptr.deinit(self.allocator);
-                }
-                self.pending_validations.deinit();
-            }
 
             // Peer scoring
             {
@@ -342,9 +319,8 @@ pub fn Router(comptime Handler: type) type {
 
         /// Subscribe to a topic. Joins the mesh and sends GRAFT to mesh peers.
         pub fn subscribe(self: *Self, topic: []const u8) !void {
-            const gop = try self.subscriptions.getOrPut(topic);
+            const gop = try getOrPutOwnedKey(&self.subscriptions, self.allocator, topic);
             if (gop.found_existing) return;
-            gop.key_ptr.* = try self.allocator.dupe(u8, topic);
 
             try self.joinMesh(topic);
         }
@@ -376,10 +352,17 @@ pub fn Router(comptime Handler: type) type {
 
             // Dedup
             if (self.hasSeen(mid)) return 0;
+            self.mcache.putWithId(mid, &msg) catch |err| switch (err) {
+                error.DuplicateMessage, error.MissingTopic => return 0,
+                else => return err,
+            };
+            var publish_seen_recorded = false;
+            errdefer {
+                _ = self.mcache.remove(mid);
+                if (publish_seen_recorded) self.forgetSeen(mid);
+            }
             try self.rememberSeen(mid);
-
-            // Store in mcache, ignore duplicate or missing topic
-            self.mcache.put(&msg) catch {};
+            publish_seen_recorded = true;
 
             // Select peers and send
             const peers = try self.selectPeersToPublish(topic);
@@ -543,35 +526,46 @@ pub fn Router(comptime Handler: type) type {
             return result;
         }
 
+        pub fn pendingValidationStats(self: *Self) mcache_mod.PendingValidationStats {
+            return self.mcache.pendingValidationStats(self.handler.currentTimeMs());
+        }
+
         /// Report the application validation outcome for a pending inbound
         /// message. Returns false when the message is no longer pending.
         pub fn reportValidationResult(self: *Self, msg_id: []const u8, result: ValidationResult) bool {
-            const removed = self.pending_validations.fetchRemove(msg_id) orelse return false;
-            defer {
-                self.allocator.free(removed.key);
-                var entry = removed.value;
-                entry.deinit(self.allocator);
-            }
+            const source_peer = self.mcache.sourcePeer(msg_id) orelse return false;
+            const msg = self.mcache.get(msg_id) orelse return false;
+            const topic = msg.topic orelse return false;
 
             switch (result) {
                 .accept => {
-                    self.mcache.putWithId(removed.key, &removed.value.message) catch return true;
+                    self.recordFirstDelivery(source_peer, topic);
+                    self.recordMeshDelivery(source_peer, topic);
 
-                    const topic = removed.value.message.topic orelse return true;
-                    self.recordFirstDelivery(removed.value.source_peer, topic);
-                    self.recordMeshDelivery(removed.value.source_peer, topic);
-
-                    const data_len = if (removed.value.message.data) |d| d.len else 0;
+                    const data_len = if (msg.data) |d| d.len else 0;
                     if (data_len >= self.config.idontwant_min_message_size) {
-                        self.sendIDontWantExcluding(topic, removed.key, removed.value.source_peer) catch {};
+                        self.sendIDontWantExcludingPendingPeers(topic, msg_id) catch {};
                     }
 
-                    self.forwardMessage(removed.value.source_peer, topic, removed.key, &removed.value.message);
+                    self.forwardMessageExcludingPendingPeers(topic, msg_id, msg);
+                    return self.mcache.markValidated(msg_id);
                 },
-                .ignore, .reject => {},
-            }
+                .ignore => return self.mcache.discard(msg_id),
+                .reject => {
+                    const RejectContext = struct {
+                        router: *Self,
+                        topic: []const u8,
 
-            return true;
+                        fn visit(ctx: *@This(), peer_id: []const u8) void {
+                            ctx.router.recordInvalidMessage(peer_id, ctx.topic);
+                        }
+                    };
+
+                    var ctx = RejectContext{ .router = self, .topic = topic };
+                    if (!self.mcache.visitPendingOriginatingPeers(msg_id, &ctx, RejectContext.visit)) return false;
+                    return self.mcache.discard(msg_id);
+                },
+            }
         }
 
         fn dupeOptionalBytes(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
@@ -610,54 +604,6 @@ pub fn Router(comptime Handler: type) type {
                     .partial_messages = ext.partial_messages,
                 } },
             };
-        }
-
-        fn clonePendingValidationMessage(
-            allocator: std.mem.Allocator,
-            msg: *const rpc.Message,
-            source_peer: []const u8,
-        ) error{OutOfMemory}!PendingValidationEntry {
-            var total_len: usize = source_peer.len;
-            if (msg.from) |f| total_len += f.len;
-            if (msg.seqno) |s| total_len += s.len;
-            if (msg.topic) |t| total_len += t.len;
-            if (msg.data) |d| total_len += d.len;
-            if (msg.signature) |s| total_len += s.len;
-            if (msg.key) |k| total_len += k.len;
-
-            const backing = try allocator.alloc(u8, total_len);
-            errdefer allocator.free(backing);
-
-            var offset: usize = 0;
-            const copied_source_peer = copyField(backing, &offset, source_peer);
-            const from = if (msg.from) |f| copyField(backing, &offset, f) else null;
-            const seqno = if (msg.seqno) |s| copyField(backing, &offset, s) else null;
-            const topic = if (msg.topic) |t| copyField(backing, &offset, t) else null;
-            const data = if (msg.data) |d| copyField(backing, &offset, d) else null;
-            const signature = if (msg.signature) |s| copyField(backing, &offset, s) else null;
-            const key = if (msg.key) |k| copyField(backing, &offset, k) else null;
-
-            std.debug.assert(offset == total_len);
-
-            return .{
-                .source_peer = copied_source_peer,
-                .message = .{
-                    .from = from,
-                    .seqno = seqno,
-                    .topic = topic,
-                    .data = data,
-                    .signature = signature,
-                    .key = key,
-                },
-                .backing = backing,
-            };
-        }
-
-        inline fn copyField(backing: []u8, offset: *usize, source: []const u8) []const u8 {
-            const start = offset.*;
-            @memcpy(backing[start..][0..source.len], source);
-            offset.* = start + source.len;
-            return backing[start..][0..source.len];
         }
 
         fn appendOwnedEvent(self: *Self, event: Event) !void {
@@ -748,6 +694,21 @@ pub fn Router(comptime Handler: type) type {
                 .mid = mid_owned,
                 .expires_at_ms = expires_at,
             });
+        }
+
+        fn forgetSeen(self: *Self, mid: []const u8) void {
+            if (self.config.max_seen_entries == 0 or self.config.seen_ttl_seconds == 0) {
+                return;
+            }
+            if (self.seen.fetchRemove(mid)) |kv| {
+                for (self.seen_fifo.items[self.seen_fifo_head..]) |*entry| {
+                    if (std.mem.eql(u8, entry.mid, mid)) {
+                        entry.mid = &[_]u8{};
+                        entry.expires_at_ms = 0;
+                    }
+                }
+                self.allocator.free(kv.key);
+            }
         }
 
         /// Execute one heartbeat tick. Should be called periodically.
@@ -852,15 +813,12 @@ pub fn Router(comptime Handler: type) type {
 
         fn handleSubscription(self: *Self, peer_id: []const u8, topic: []const u8, is_subscribe: bool) !void {
             if (is_subscribe) {
-                const topic_gop = try self.topics.getOrPut(topic);
+                const topic_gop = try getOrPutOwnedKey(&self.topics, self.allocator, topic);
                 if (!topic_gop.found_existing) {
-                    topic_gop.key_ptr.* = try self.allocator.dupe(u8, topic);
                     topic_gop.value_ptr.* = PeerSet.init(self.allocator);
                 }
-                const peer_gop = try topic_gop.value_ptr.getOrPut(peer_id);
-                if (!peer_gop.found_existing) {
-                    peer_gop.key_ptr.* = try self.allocator.dupe(u8, peer_id);
-                }
+                const peer_gop = try getOrPutOwnedKey(topic_gop.value_ptr, self.allocator, peer_id);
+                _ = peer_gop;
             } else {
                 if (self.topics.getPtr(topic)) |peer_set| {
                     if (peer_set.fetchRemove(peer_id)) |kv| {
@@ -908,39 +866,40 @@ pub fn Router(comptime Handler: type) type {
             defer self.allocator.free(mid);
 
             // Dedup check
+            switch (self.mcache.entryState(mid)) {
+                .pending => {
+                    _ = self.mcache.notePendingOriginatingPeer(mid, from_peer) catch {};
+                    return;
+                },
+                .validated, .discarded => {
+                    log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
+                    return;
+                },
+                .missing => {},
+            }
             if (self.hasSeen(mid)) {
                 log.info("handleIncomingMessage: DEDUP HIT mid_len={d}", .{mid.len});
                 return;
             }
             log.info("handleIncomingMessage: DEDUP MISS (new msg) mid_len={d}", .{mid.len});
-            try self.rememberSeen(mid);
 
             const uses_manual_validation =
                 self.config.validation_mode == .manual and self.subscriptions.contains(topic);
 
             if (uses_manual_validation) {
-                if (!self.pending_validations.contains(mid) and
-                    self.pending_validations.count() >= self.config.max_pending_validations)
-                {
+                if (self.mcache.pendingCount() >= self.config.max_pending_validations) {
                     log.warn("dropping inbound message because pending validation limits were reached", .{});
                     return;
                 }
 
-                const pending = clonePendingValidationMessage(self.allocator, &msg, from_peer) catch return;
+                try self.mcache.putPendingWithId(mid, &msg, from_peer, self.handler.currentTimeMs());
+                var manual_seen_recorded = false;
                 errdefer {
-                    var owned = pending;
-                    owned.deinit(self.allocator);
+                    _ = self.mcache.remove(mid);
+                    if (manual_seen_recorded) self.forgetSeen(mid);
                 }
-
-                const gop = try self.pending_validations.getOrPut(mid);
-                if (gop.found_existing) return;
-                const owned_mid = try self.allocator.dupe(u8, mid);
-                errdefer {
-                    _ = self.pending_validations.fetchRemove(mid);
-                    self.allocator.free(owned_mid);
-                }
-                gop.key_ptr.* = owned_mid;
-                gop.value_ptr.* = pending;
+                try self.rememberSeen(mid);
+                manual_seen_recorded = true;
 
                 try self.appendOwnedEvent(.{ .message = .{
                     .topic = topic,
@@ -954,7 +913,17 @@ pub fn Router(comptime Handler: type) type {
             }
 
             // Cache the message
-            self.mcache.put(&msg) catch {};
+            self.mcache.putWithId(mid, &msg) catch |err| switch (err) {
+                error.DuplicateMessage, error.MissingTopic => return,
+                else => return err,
+            };
+            var eager_seen_recorded = false;
+            errdefer {
+                _ = self.mcache.remove(mid);
+                if (eager_seen_recorded) self.forgetSeen(mid);
+            }
+            try self.rememberSeen(mid);
+            eager_seen_recorded = true;
 
             // v1.1: Record first delivery for scoring
             self.recordFirstDelivery(from_peer, topic);
@@ -963,7 +932,8 @@ pub fn Router(comptime Handler: type) type {
             // v1.2: send IDONTWANT to mesh peers for large messages
             const data_len = if (msg.data) |d| d.len else 0;
             if (data_len >= self.config.idontwant_min_message_size) {
-                self.sendIDontWantExcluding(topic, mid, from_peer) catch {};
+                const exclude_peers = [_][]const u8{from_peer};
+                self.sendIDontWantExcludingPeers(topic, mid, &exclude_peers) catch {};
             }
 
             // Emit event if we are subscribed to this topic
@@ -983,7 +953,8 @@ pub fn Router(comptime Handler: type) type {
             }
 
             // Forward to mesh peers (excluding source)
-            self.forwardMessage(from_peer, topic, mid, &msg);
+            const exclude_peers = [_][]const u8{from_peer};
+            self.forwardMessageExcludingPeers(topic, mid, &msg, &exclude_peers);
         }
 
         fn validateIncomingMessagePolicy(
@@ -1018,7 +989,7 @@ pub fn Router(comptime Handler: type) type {
             }
         }
 
-        fn forwardMessage(self: *Self, from_peer: []const u8, topic: []const u8, mid: []const u8, msg: *const rpc.Message) void {
+        fn forwardMessageExcludingPeers(self: *Self, topic: []const u8, mid: []const u8, msg: *const rpc.Message, exclude_peers: []const []const u8) void {
             const mesh_peers = self.mesh.getPtr(topic) orelse return;
 
             var rpc_msg = rpc.RPC{};
@@ -1031,8 +1002,29 @@ pub fn Router(comptime Handler: type) type {
             var iter = mesh_peers.iterator();
             while (iter.next()) |entry| {
                 const peer = entry.key_ptr.*;
-                if (std.mem.eql(u8, peer, from_peer)) continue;
+                if (peerInSlice(exclude_peers, peer)) continue;
                 // v1.2: skip peers that sent IDONTWANT for this message
+                if (self.peer_idontwant.getPtr(peer)) |idw| {
+                    if (idw.contains(mid)) continue;
+                }
+                _ = self.handler.sendRpc(peer, frame);
+            }
+        }
+
+        fn forwardMessageExcludingPendingPeers(self: *Self, topic: []const u8, mid: []const u8, msg: *const rpc.Message) void {
+            const mesh_peers = self.mesh.getPtr(topic) orelse return;
+
+            var rpc_msg = rpc.RPC{};
+            var pub_msgs = [_]?rpc.Message{msg.*};
+            rpc_msg.publish = &pub_msgs;
+
+            const frame = codec.encodeRpc(self.allocator, &rpc_msg) catch return;
+            defer self.allocator.free(frame);
+
+            var iter = mesh_peers.iterator();
+            while (iter.next()) |entry| {
+                const peer = entry.key_ptr.*;
+                if (self.mcache.pendingContainsOriginatingPeer(mid, peer)) continue;
                 if (self.peer_idontwant.getPtr(peer)) |idw| {
                     if (idw.contains(mid)) continue;
                 }
@@ -1092,7 +1084,7 @@ pub fn Router(comptime Handler: type) type {
 
             var ihave_var = ihave.*;
             while (ihave_var.messageIDsNext()) |mid| {
-                if (!self.hasSeen(mid)) {
+                if (self.mcache.entryState(mid) == .missing and !self.hasSeen(mid)) {
                     try iwant_ids.append(self.allocator, mid);
                 }
             }
@@ -1611,9 +1603,8 @@ pub fn Router(comptime Handler: type) type {
             }
 
             // Use fanout
-            const fanout_gop = try self.fanout.getOrPut(topic);
+            const fanout_gop = try getOrPutOwnedKey(&self.fanout, self.allocator, topic);
             if (!fanout_gop.found_existing) {
-                fanout_gop.key_ptr.* = try self.allocator.dupe(u8, topic);
                 fanout_gop.value_ptr.* = PeerSet.init(self.allocator);
                 try self.fillFromTopicPeers(topic, fanout_gop.value_ptr, self.config.mesh_degree);
 
@@ -1679,7 +1670,7 @@ pub fn Router(comptime Handler: type) type {
             }
         }
 
-        fn sendIDontWantExcluding(self: *Self, topic: []const u8, mid: []const u8, exclude_peer: []const u8) !void {
+        fn sendIDontWantExcludingPeers(self: *Self, topic: []const u8, mid: []const u8, exclude_peers: []const []const u8) !void {
             const mesh_peers = self.mesh.getPtr(topic) orelse return;
 
             var optionals = [_]?[]const u8{mid};
@@ -1699,8 +1690,38 @@ pub fn Router(comptime Handler: type) type {
 
             var iter = mesh_peers.keyIterator();
             while (iter.next()) |peer_key| {
-                if (std.mem.eql(u8, peer_key.*, exclude_peer)) continue;
+                if (peerInSlice(exclude_peers, peer_key.*)) continue;
                 // v1.2+: only send to peers that support v1.2 or later
+                if (@hasDecl(Handler, "peerProtocol")) {
+                    if (self.handler.peerProtocol(peer_key.*)) |proto| {
+                        if (!peerSupportsIDontWant(proto)) continue;
+                    } else continue;
+                }
+                _ = self.handler.sendRpc(peer_key.*, frame);
+            }
+        }
+
+        fn sendIDontWantExcludingPendingPeers(self: *Self, topic: []const u8, mid: []const u8) !void {
+            const mesh_peers = self.mesh.getPtr(topic) orelse return;
+
+            var optionals = [_]?[]const u8{mid};
+            const idontwant_msg = rpc.ControlIDontWant{
+                .message_i_ds = &optionals,
+            };
+
+            var ctrl = rpc.ControlMessage{};
+            var idontwant_arr = [_]?rpc.ControlIDontWant{idontwant_msg};
+            ctrl.idontwant = &idontwant_arr;
+
+            var rpc_msg = rpc.RPC{};
+            rpc_msg.control = ctrl;
+
+            const frame = codec.encodeRpc(self.allocator, &rpc_msg) catch return;
+            defer self.allocator.free(frame);
+
+            var iter = mesh_peers.keyIterator();
+            while (iter.next()) |peer_key| {
+                if (self.mcache.pendingContainsOriginatingPeer(mid, peer_key.*)) continue;
                 if (@hasDecl(Handler, "peerProtocol")) {
                     if (self.handler.peerProtocol(peer_key.*)) |proto| {
                         if (!peerSupportsIDontWant(proto)) continue;
@@ -1919,6 +1940,13 @@ pub fn Router(comptime Handler: type) type {
             return result.toOwnedSlice(allocator);
         }
 
+        fn peerInSlice(peers: []const []const u8, peer: []const u8) bool {
+            for (peers) |candidate| {
+                if (std.mem.eql(u8, candidate, peer)) return true;
+            }
+            return false;
+        }
+
         fn shuffleSlice(comptime T: type, items: []T, handler: *Handler) void {
             if (items.len <= 1) return;
             var i: usize = items.len - 1;
@@ -1968,9 +1996,14 @@ pub fn Router(comptime Handler: type) type {
         }
 
         fn getOrPutOwnedKey(map: anytype, allocator: std.mem.Allocator, key: []const u8) @TypeOf(map.getOrPut(key)) {
+            const owned_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(owned_key);
+
             const gop = try map.getOrPut(key);
             if (!gop.found_existing) {
-                gop.key_ptr.* = try allocator.dupe(u8, key);
+                gop.key_ptr.* = owned_key;
+            } else {
+                allocator.free(owned_key);
             }
             return gop;
         }
@@ -2225,14 +2258,16 @@ test "Router manual validation defers forwarding until accept" {
     try std.testing.expectEqualStrings("peer-1", events[0].message.peer_id);
     try std.testing.expectEqualStrings("topic-ahello", events[0].message.msg_id);
     try std.testing.expectEqual(@as(usize, 0), handler.sent.items.len);
-    try std.testing.expect(router.mcache.get(events[0].message.msg_id) == null);
-    try std.testing.expectEqual(@as(usize, 1), router.pending_validations.count());
+    try std.testing.expect(router.mcache.get(events[0].message.msg_id) != null);
+    try std.testing.expectEqual(mcache_mod.EntryState.pending, router.mcache.entryState(events[0].message.msg_id));
+    try std.testing.expectEqual(@as(usize, 1), router.pendingValidationStats().count);
 
     try std.testing.expect(router.reportValidationResult(events[0].message.msg_id, .accept));
     try std.testing.expectEqual(@as(usize, 1), handler.sent.items.len);
     try std.testing.expectEqualStrings("peer-2", handler.sent.items[0].peer);
     try std.testing.expect(router.mcache.get("topic-ahello") != null);
-    try std.testing.expectEqual(@as(usize, 0), router.pending_validations.count());
+    try std.testing.expectEqual(mcache_mod.EntryState.validated, router.mcache.entryState("topic-ahello"));
+    try std.testing.expectEqual(@as(usize, 0), router.pendingValidationStats().count);
 }
 
 test "Router manual validation ignore does not cache or forward" {
@@ -2275,10 +2310,186 @@ test "Router manual validation ignore does not cache or forward" {
     const events = try router.drainEvents();
     defer freeEvents(allocator, events);
     try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(mcache_mod.EntryState.pending, router.mcache.entryState(events[0].message.msg_id));
+    try std.testing.expectEqual(@as(usize, 1), router.pendingValidationStats().count);
     try std.testing.expect(router.reportValidationResult(events[0].message.msg_id, .ignore));
     try std.testing.expectEqual(@as(usize, 0), handler.sent.items.len);
     try std.testing.expect(router.mcache.get(events[0].message.msg_id) == null);
-    try std.testing.expectEqual(@as(usize, 0), router.pending_validations.count());
+    try std.testing.expectEqual(mcache_mod.EntryState.discarded, router.mcache.entryState(events[0].message.msg_id));
+    try std.testing.expectEqual(@as(usize, 0), router.pendingValidationStats().count);
+}
+
+test "Router manual validation saturation does not poison seen dedup" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+        .max_pending_validations = 1,
+    }, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    for ([_][]const u8{ "peer-1", "peer-2", "peer-3" }) |peer| {
+        try handler.markConnected(peer);
+        try router.addPeer(peer);
+        try addPeerSubscription(&router, peer, "topic-a");
+    }
+
+    try router.heartbeat();
+    freeEvents(allocator, try router.drainEvents());
+
+    var first_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "first",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var first_rpc = rpc.RPC{ .publish = &first_msgs };
+    const first_encoded = first_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(first_encoded);
+    try router.handleRpc("peer-1", first_encoded);
+
+    const first_events = try router.drainEvents();
+    defer freeEvents(allocator, first_events);
+    try std.testing.expectEqual(@as(usize, 1), first_events.len);
+    try std.testing.expectEqual(@as(usize, 1), router.pendingValidationStats().count);
+
+    var second_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "second",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var second_rpc = rpc.RPC{ .publish = &second_msgs };
+    const second_encoded = second_rpc.encode(allocator) catch unreachable;
+    defer allocator.free(second_encoded);
+    try router.handleRpc("peer-2", second_encoded);
+
+    const dropped_events = try router.drainEvents();
+    defer freeEvents(allocator, dropped_events);
+    try std.testing.expectEqual(@as(usize, 0), dropped_events.len);
+    try std.testing.expectEqual(@as(usize, 1), router.pendingValidationStats().count);
+    try std.testing.expect(!router.hasSeen("topic-asecond"));
+
+    try std.testing.expect(router.reportValidationResult(first_events[0].message.msg_id, .ignore));
+    try std.testing.expectEqual(@as(usize, 0), router.pendingValidationStats().count);
+
+    try router.handleRpc("peer-2", second_encoded);
+    const retried_events = try router.drainEvents();
+    defer freeEvents(allocator, retried_events);
+    try std.testing.expectEqual(@as(usize, 1), retried_events.len);
+    try std.testing.expectEqualStrings("topic-asecond", retried_events[0].message.msg_id);
+}
+
+test "Router manual validation accept excludes all propagators seen while pending" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.init(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+    }, &handler);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    for ([_][]const u8{ "peer-1", "peer-2", "peer-3" }) |peer| {
+        try handler.markConnected(peer);
+        try router.addPeer(peer);
+        try addPeerSubscription(&router, peer, "topic-a");
+    }
+
+    try router.heartbeat();
+    handler.clearSent();
+    freeEvents(allocator, try router.drainEvents());
+
+    var pub_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "hello",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var rpc_msg = rpc.RPC{ .publish = &pub_msgs };
+    const encoded = rpc_msg.encode(allocator) catch unreachable;
+    defer allocator.free(encoded);
+
+    try router.handleRpc("peer-1", encoded);
+    const initial_events = try router.drainEvents();
+    defer freeEvents(allocator, initial_events);
+    try std.testing.expectEqual(@as(usize, 1), initial_events.len);
+    try std.testing.expectEqual(@as(usize, 1), router.pendingValidationStats().count);
+
+    try router.handleRpc("peer-2", encoded);
+    const duplicate_events = try router.drainEvents();
+    defer freeEvents(allocator, duplicate_events);
+    try std.testing.expectEqual(@as(usize, 0), duplicate_events.len);
+    try std.testing.expectEqual(@as(usize, 1), router.pendingValidationStats().count);
+
+    try std.testing.expect(router.reportValidationResult(initial_events[0].message.msg_id, .accept));
+    try std.testing.expectEqual(@as(usize, 1), handler.sent.items.len);
+    try std.testing.expectEqualStrings("peer-3", handler.sent.items[0].peer);
+}
+
+test "Router manual validation reject records invalid deliveries for all pending propagators" {
+    const allocator = std.testing.allocator;
+    var handler = TestHandler.init(allocator);
+    defer handler.deinit();
+
+    var router = try TestRouter.initWithScoring(allocator, Config{
+        .signature_policy = .strict_no_sign,
+        .publish_policy = .anonymous,
+        .msg_id_fn = noSignMsgId,
+        .validation_mode = .manual,
+    }, &handler, PeerScoreParams{}, null);
+    defer router.deinit();
+
+    try router.subscribe("topic-a");
+    for ([_][]const u8{ "peer-1", "peer-2", "peer-3" }) |peer| {
+        try handler.markConnected(peer);
+        try router.addPeer(peer);
+        try addPeerSubscription(&router, peer, "topic-a");
+    }
+
+    try router.heartbeat();
+    freeEvents(allocator, try router.drainEvents());
+
+    var pub_msgs = [_]?rpc.Message{.{
+        .from = null,
+        .data = "bad",
+        .seqno = null,
+        .topic = "topic-a",
+        .signature = null,
+        .key = null,
+    }};
+    var rpc_msg = rpc.RPC{ .publish = &pub_msgs };
+    const encoded = rpc_msg.encode(allocator) catch unreachable;
+    defer allocator.free(encoded);
+
+    try router.handleRpc("peer-1", encoded);
+    const initial_events = try router.drainEvents();
+    defer freeEvents(allocator, initial_events);
+    try std.testing.expectEqual(@as(usize, 1), initial_events.len);
+
+    try router.handleRpc("peer-2", encoded);
+    freeEvents(allocator, try router.drainEvents());
+
+    try std.testing.expect(router.reportValidationResult(initial_events[0].message.msg_id, .reject));
+    try std.testing.expectEqual(@as(f64, 1), router.peer_scores.getPtr("peer-1").?.topic_scores.getPtr("topic-a").?.invalid_message_deliveries);
+    try std.testing.expectEqual(@as(f64, 1), router.peer_scores.getPtr("peer-2").?.topic_scores.getPtr("topic-a").?.invalid_message_deliveries);
+    try std.testing.expect(router.peer_scores.getPtr("peer-3").?.topic_scores.getPtr("topic-a") == null);
 }
 
 test "Router heartbeat with peers" {
