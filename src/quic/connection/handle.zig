@@ -48,6 +48,12 @@ const Impl = struct {
     state: ?*SharedState,
     // Teardown-only ownership. Normal handle methods must go through `state`.
     spawned_actor: *ConnectionActor,
+    /// Guards only the `state` POINTER (methods read it atomically; deinit nulls
+    /// it once). It deliberately does NOT make `deinit` safe against concurrent
+    /// method calls: `deinit` frees the Impl — including this lock — so a fiber
+    /// still inside a method would touch freed memory, and no refcount fixes
+    /// that (a caller entering after the free corrupts the count). Keeping the
+    /// handle's MEMORY alive until all users are done is the OWNER's job.
     handle_lock: std.atomic.Value(u8) = .init(0),
 
     fn lockHandle(self: *Impl) void {
@@ -102,6 +108,12 @@ pub const Connection = opaque {
         return @ptrCast(@alignCast(self));
     }
 
+    /// Destroy the handle. CONTRACT — external synchronization required: no
+    /// other fiber may be inside, or later enter, ANY method once deinit starts;
+    /// the memory is freed here, so a racing call is a use-after-free (the
+    /// internal lock only serializes the state-pointer swap — see `handle_lock`).
+    /// deinit also JOINS the actor fiber, so it can take as long as a full
+    /// connection teardown.
     pub fn deinit(self: *Connection) void {
         self.impl().deinit();
     }
@@ -182,13 +194,17 @@ pub const Connection = opaque {
         return state.currentStats();
     }
 
-    /// Returns the verified libp2p public key extracted from the peer's TLS
-    /// certificate. The returned value borrows memory owned by the
-    /// connection; do not free its `data` slice.
-    ///
-    /// A `*Connection` returned by `dial()` or `accept()` has a published
-    /// public key by construction (both call `waitHandshake` before
-    /// returning); calling this method on such a handle always succeeds.
+    /// Structured reason the handshake failed, derived from the published stats
+    /// snapshot. Meaningful after `waitHandshake` returns an error; on a healthy
+    /// or established connection it reports `.none`/`.unknown`.
+    pub fn failReason(self: *const Connection) conn_stats.HandshakeFailure {
+        return conn_stats.classifyHandshakeFailure(self.stats());
+    }
+
+    /// Verified libp2p public key from the peer's TLS certificate. Borrows
+    /// connection-owned memory; do not free its `data` slice. Always succeeds on
+    /// a handle from `dial()`/`accept()` — both `waitHandshake` before returning,
+    /// so the key is published by construction.
     pub fn remotePublicKey(self: *const Connection) keys.PublicKey {
         const state = @constCast(self).impl().liveRetained().?;
         defer state.release();
@@ -266,11 +282,18 @@ fn acceptStreamFromState(state: *SharedState, io: std.Io, opts: AcceptStreamOpti
         }
         if (state.isClosed()) return error.ConnectionClosed;
         if (opts.timeout != .none and io_time.timeoutExpired(io, deadline)) return error.Timeout;
+        // Park on the signal EPOCH (an edge), not the readiness bits: this
+        // handle-side waiter never clears the bits (only the owning actor does,
+        // via `take`), so level-triggered `wait` would return on the actor's
+        // routinely-set, not-yet-taken bits (inbound packets, control commands)
+        // and spin — starving the actor that would push a stream or close, a
+        // livelock. The edge wakes us only on a pushed stream or shutdown;
+        // `isClosed()` is re-checked each wake so a close reliably unblocks us.
         if (opts.timeout == .none) {
-            try state.waitset.wait(io, observed);
+            try state.waitset.waitEpoch(io, observed);
             continue;
         }
-        try state.waitset.waitTimeout(io, observed, deadline);
+        try state.waitset.waitEpochTimeout(io, observed, deadline);
     }
 }
 

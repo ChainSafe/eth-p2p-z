@@ -1,4 +1,8 @@
 const std = @import("std");
+// Imported as a named module (not a relative path) so this file also compiles
+// under the zio-io-test target, whose module is rooted at src/quic/ and so
+// cannot reach src/ref_count.zig via `../../`.
+const AtomicRc = @import("ref_count").AtomicRc;
 
 pub const Signal = struct {
     epoch: std.atomic.Value(u32) = .init(0),
@@ -25,6 +29,22 @@ pub const Signal = struct {
     }
 };
 
+/// Atomically decrement `counter` by one iff it is > 0, returning whether a
+/// decrement happened (non-blocking admission: `false` means reject, not park).
+/// The cmpxchg is the only synchronizing op; the initial load is just its
+/// expected-value hint, so a stale read is harmless (the loop retries).
+pub fn tryDecrementToFloor(counter: *std.atomic.Value(usize)) bool {
+    var cur = counter.load(.acquire);
+    while (cur > 0) {
+        if (counter.cmpxchgWeak(cur, cur - 1, .acq_rel, .acquire)) |actual| {
+            cur = actual; // contended or spurious CAS; retry with the fresh value
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn Bounded(
     comptime T: type,
     // When present, failed sends consume the item and discardQueued/release drop queued items.
@@ -38,13 +58,17 @@ pub fn Bounded(
             io: std.Io,
             slots: []T,
             queue: std.Io.Queue(T),
+            /// Pulsed when an item becomes available; consumers wait on it (the
+            /// waitset-integration path; `recv` uses the queue's own blocking get).
             ready: Signal = .{},
+            /// Pulsed when byte budget is freed; senders blocked in
+            /// `reserveBlocking` wait on it. Distinct from `ready`.
             writable: Signal = .{},
             meta_mutex: std.Io.Mutex = .init,
             closed: bool = false,
             byte_capacity: usize = 0,
             used_bytes: usize = 0,
-            refs: std.atomic.Value(usize) = .init(1),
+            rc: AtomicRc = .{},
 
             pub fn init(allocator: std.mem.Allocator, io: std.Io, capacity: usize, byte_capacity: usize) std.mem.Allocator.Error!*State {
                 const state = try allocator.create(State);
@@ -88,14 +112,11 @@ pub fn Bounded(
             }
 
             pub fn retain(s: *State) void {
-                const previous = s.refs.fetchAdd(1, .acq_rel);
-                std.debug.assert(previous > 0);
+                s.rc.retainChecked();
             }
 
             pub fn release(s: *State) void {
-                const previous = s.refs.fetchSub(1, .acq_rel);
-                std.debug.assert(previous > 0);
-                if (previous != 1) return;
+                if (!s.rc.releaseChecked()) return;
 
                 const allocator = s.allocator;
                 s.discardQueued(s.io);
@@ -140,10 +161,7 @@ pub fn Bounded(
                 try s.reserveBlocking(io, item_cost);
                 errdefer s.releaseCost(io, item_cost);
 
-                s.queue.putOne(io, item) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    error.Closed => return error.Closed,
-                };
+                try s.queue.putOne(io, item);
                 s.notify(io);
             }
 
@@ -157,9 +175,7 @@ pub fn Bounded(
                 try s.reserveBlockingUncancelable(io, item_cost);
                 errdefer s.releaseCost(io, item_cost);
 
-                s.queue.putOneUncancelable(io, item) catch |err| switch (err) {
-                    error.Closed => return error.Closed,
-                };
+                try s.queue.putOneUncancelable(io, item);
                 s.notify(io);
             }
 
@@ -341,7 +357,7 @@ pub fn Unbounded(
             tail: ?*Node = null,
             ready: Signal = .{},
             closed: bool = false,
-            refs: std.atomic.Value(usize) = .init(1),
+            rc: AtomicRc = .{},
 
             const Node = struct {
                 item: T,
@@ -390,14 +406,11 @@ pub fn Unbounded(
             }
 
             pub fn retain(s: *State) void {
-                const previous = s.refs.fetchAdd(1, .acq_rel);
-                std.debug.assert(previous > 0);
+                s.rc.retainChecked();
             }
 
             pub fn release(s: *State) void {
-                const previous = s.refs.fetchSub(1, .acq_rel);
-                std.debug.assert(previous > 0);
-                if (previous != 1) return;
+                if (!s.rc.releaseChecked()) return;
 
                 const allocator = s.allocator;
                 s.freeList(s.head, s.io);

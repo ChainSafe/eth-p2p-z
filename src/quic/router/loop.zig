@@ -12,7 +12,7 @@ const io_time = @import("../io/time.zig");
 const packet_route = @import("../io/packet_route.zig");
 const transport_mod = @import("../io/transport.zig");
 const accept_queue = @import("accept_queue.zig");
-const route_commands = @import("route_commands.zig");
+const route_table_mod = @import("route_table.zig");
 const retry_token = @import("retry_token.zig");
 
 const retry_token_max_age_ns: u64 = 60 * std.time.ns_per_s;
@@ -21,8 +21,8 @@ const CidKey = cid_mod.CidKey;
 const Connection = connection_mod.Connection;
 const IncomingPacketChannel = packet_route.IncomingPacketChannel;
 const RoutedPacket = packet_route.RoutedPacket;
-
-pub const CidMap = std.AutoHashMap(CidKey, *IncomingPacketChannel);
+const RouteTable = route_table_mod.RouteTable;
+pub const SlabPool = packet_route.SlabPool;
 pub const AcceptChannel = accept_queue.Channel;
 pub const ListenError = error{AlreadyBound} || std.Io.net.IpAddress.BindError || socket_control.ConfigureError || std.mem.Allocator.Error || std.Io.ConcurrentError;
 const packet_buf_len = packet_route.max_udp_payload_len;
@@ -33,6 +33,17 @@ const quiche_packet_type_initial: u8 = 1;
 // must drop shorter Initials. We use the same threshold to gate any reply that is
 // reflectable (e.g., Version Negotiation) so we never amplify a short/spoofed input.
 const min_initial_packet_len: usize = 1200;
+
+// Scratch for the token quiche_header_info() extracts. Sized well above our
+// minted retry tokens so a foreign/oversized token still parses (then fails
+// validation), rather than failing header parsing before we can route.
+const header_info_token_buf_len: usize = 256;
+
+const version_negotiation_buf_len: usize = 1500;
+
+// Upper bound on a fresh connection's initial source CIDs copied for the
+// accept-path route rollback (a new connection registers one or two).
+const max_accept_route_cids: usize = 16;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -45,19 +56,22 @@ pub const Context = struct {
     /// `acceptInitial` and by accepted-but-undelivered connections sitting in
     /// `accept_queue_slot`. Set to `connection_accept_queue_len` on `bind`.
     accept_available: *std.atomic.Value(usize),
-    /// Slot for the router's main socket-reader fiber. Owned by the
-    /// endpoint handle. Filled on `bind`, cleared (after cancel) by
-    /// `closeListener`. We use a `Future` (not a `Group`) for the main
-    /// router loop because the surrounding endpoint memory is freed
-    /// shortly after `closeListener` returns; `Future.cancel` blocks
-    /// until the runtime has fully torn down the fiber, eliminating the
-    /// race the old `Group`-based scheme was vulnerable to.
+    /// Slot for the router's main socket-reader fiber. A `Future` (not a
+    /// `Group`) so `closeListener` can `await` full teardown before the
+    /// endpoint memory is freed. Stopped via `stopping`, not cancellation.
     router_future_slot: *?std.Io.Future(RouterLoopError!void),
-    /// Group for short-lived "handshake waiter" tasks spawned when the router
-    /// promotes an Initial packet to a Connection. Lives alongside the main
-    /// router future; cancellation is initiated from `closeListener` after the
-    /// main router loop exits.
+    /// Group for short-lived "handshake waiter" tasks the router spawns when
+    /// promoting an Initial to a Connection. Cancelled by `closeListener`
+    /// after the main router loop exits.
     handshake_waiters: *std.Io.Group,
+    /// Cooperative teardown flag (persistent, unlike the one-shot
+    /// `Future.cancel`): `closeListener` sets it and wakes the recv fiber with
+    /// a zero-length loopback datagram; the loop observes it and returns.
+    stopping: *std.atomic.Value(bool),
+    /// Slot for the recv fiber's slab pool (zero-copy packet views). Endpoint
+    /// reference dropped by `closeListener`; in-flight views keep their slabs
+    /// (and the pool) alive past that. Null = every packet is heap-copied.
+    slab_pool_slot: *?*packet_route.SlabPool,
     raw: endpoint_raw.Context,
 
     pub fn addStat(ctx: Context, comptime field: []const u8, value: u64) void {
@@ -78,37 +92,43 @@ pub const Context = struct {
     }
 };
 
-const RouterSelectResult = union(enum) {
-    packet: std.Io.Cancelable!?RoutedPacket,
-    route_command: std.Io.Cancelable!void,
-};
-const RouterSelect = std.Io.Select(RouterSelectResult);
 pub const RouterLoopError = std.Io.Cancelable || std.Io.ConcurrentError;
 
 pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAddress {
-    // Endpoints accept exactly one bound listener. Re-binding silently would orphan
-    // any in-flight actors and accepted-but-unyielded connections; force the caller
-    // to close the previous listener explicitly via QuicEndpoint.deinit.
+    // Exactly one bound listener per endpoint. Re-binding silently would orphan
+    // in-flight actors and accepted-but-unyielded connections; force an explicit
+    // close via QuicEndpoint.deinit.
     if (ep.socket_slot.* != null) return error.AlreadyBound;
     const io = ep.io;
     var bind_addr = addr;
-    // std.Io backends in 0.15.x apply IPV6_V6ONLY=0 (dual-stack) when this flag is
-    // set, which is the inverse of the field's name but matches the implementation
-    // across Threaded/Kqueue/Uring. We want dual-stack for IPv6 binds so peers can
-    // arrive over IPv4-mapped addresses.
+    // `ip6_only` stays UNSET: the two backends disagree on its meaning
+    // (std.Io.Threaded inverts it, zio is literal), so any value is wrong on
+    // one. We want the AF_INET6 default (dual-stack, IPv4 peers v4-mapped);
+    // V6ONLY is only settable before bind, so we verify the default after.
     const bind_options: std.Io.net.IpAddress.BindOptions = .{
         .mode = .dgram,
-        .ip6_only = bind_addr == .ip6,
     };
     const socket = try std.Io.net.IpAddress.bind(&bind_addr, io, bind_options);
     var socket_owned = true;
     errdefer if (socket_owned) socket.close(io);
+    if (bind_addr == .ip6) {
+        // A v6-only listener silently drops all IPv4 peers; only a non-default
+        // kernel policy reaches here. IPv6 still works, so warn, don't fail.
+        if (socket_control.dualStackEnabled(&socket)) |dual_stack| {
+            if (!dual_stack) std.log.warn(
+                "ipv6 listener is v6-only (IPV6_V6ONLY=1, non-default kernel policy): IPv4 peers cannot reach it",
+                .{},
+            );
+        }
+    }
     const caps = try socket_control.configureUdpSocket(&socket, .{
         .enable_udp_gro = ep.options.endpoint.enable_udp_gro,
+        .enable_udp_gso = ep.options.endpoint.enable_udp_gso,
         .enable_pktinfo = ep.options.endpoint.enable_pktinfo,
         .enable_orig_dst = ep.options.endpoint.enable_orig_dst,
         .enable_rx_timestamps = ep.options.endpoint.enable_rx_timestamps,
         .socket_mark = ep.options.endpoint.socket_mark,
+        .shadow_compatible = ep.options.endpoint.shadow_compatible,
     });
     const shared_socket = try transport_mod.SharedUdpSocket.init(ep.allocator, io, socket, caps);
     socket_owned = false;
@@ -128,43 +148,78 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
         ep.accept_available.store(0, .release);
     }
     ep.setStat("cid_map_entries", 0);
-    ep.core.route_commands.open(io);
-    errdefer {
-        ep.core.route_commands.close(io);
-        ep.core.route_commands.discardQueued(io);
+    if (ep.options.endpoint.recv_slab_slots > 0) {
+        ep.slab_pool_slot.* = try packet_route.SlabPool.init(
+            ep.allocator,
+            ep.options.endpoint.recv_slab_slots,
+            ep.options.endpoint.recv_slab_slot_bytes,
+        );
     }
+    errdefer if (ep.slab_pool_slot.*) |pool| {
+        pool.release();
+        ep.slab_pool_slot.* = null;
+    };
+    // Clear any stop signal from a previous listener before (re-)spawning.
+    ep.stopping.store(false, .release);
     ep.router_future_slot.* = try std.Io.concurrent(io, routerSocketLoop, .{ep});
     return shared_socket.address();
 }
 
-pub fn accept(ep: Context) std.Io.Cancelable!*Connection {
+pub const AcceptError = error{ListenerClosed} || std.Io.Cancelable;
+
+pub fn accept(ep: Context) AcceptError!*Connection {
     const io = ep.io;
-    const ch = ep.accept_queue_slot.* orelse return error.Canceled;
+    // Null slot (never bound / fully torn down) and closed-but-present channel
+    // (`stopAccepting`/`closeListener` asked accepting to stop) both surface as
+    // `ListenerClosed`, distinct from the caller's own `Canceled`.
+    const ch = ep.accept_queue_slot.* orelse return error.ListenerClosed;
     const conn = ch.receiver().recv(io) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        error.Closed => return error.Canceled,
+        error.Closed => return error.ListenerClosed,
     };
     _ = ep.accept_available.fetchAdd(1, .acq_rel);
     return conn;
 }
 
+/// Unblock a fiber parked in `accept` WITHOUT tearing the listener down: closes
+/// the accept channel so a blocked `recv` returns `ListenerClosed`; the router
+/// fiber, socket, and CID map stay live until `closeListener`. Idempotent (the
+/// channel's `close` self-guards) and safe on an unbound endpoint.
+pub fn stopAccepting(ep: Context) void {
+    if (ep.accept_queue_slot.*) |state| state.close(ep.io);
+}
+
 pub fn closeListener(ep: Context) void {
     const io = ep.io;
-    // Cancel the main router fiber first so it stops dereferencing
-    // socket/accept_queue before we tear them down. `Future.cancel`
-    // blocks until the runtime has fully torn down the spawned fiber,
-    // including the post-call cleanup that would have raced with
-    // destroying our own memory under the old `Group`-based scheme.
+    // Stop cooperatively: the persistent flag is the truth; the recv fiber is
+    // woken by TWO independent backstop wakers because the loop re-checks
+    // `stopping` only when its blocking `recvmsg` returns. Either alone
+    // suffices (the loop maps `Canceled` to a `stopping` re-check):
+    //   (a) a zero-length loopback datagram (dropped by the loop) — but a wake
+    //       can be sent yet never delivered (env dropping self-addressed UDP),
+    //       and awaiting a fire-and-forget datagram could hang forever; so
+    //   (b) the one-shot `cancel` ALWAYS follows — idempotent and result-cached,
+    //       so the await below re-reads it without double-consuming the future.
+    ep.stopping.store(true, .release);
     if (ep.router_future_slot.*) |*future| {
+        _ = sendWakeDatagram(ep);
         future.cancel(io) catch {};
+        // Exits cleanly (void) on `stopping`; surface, don't swallow, any error.
+        future.await(io) catch |err| switch (err) {
+            error.Canceled => {}, // the backstop fired first: a clean stop
+            else => std.log.warn("router teardown: loop exited with error {}", .{err}),
+        };
         ep.router_future_slot.* = null;
     }
-    // Then drain any handshake waiters spawned by the router accept path. These are
-    // self-clearing on success and tracked in a Group; `cancel` blocks
-    // until each finishes its post-call cleanup.
+    // Drain the accept-path handshake waiters; `cancel` blocks until each
+    // finishes its post-call cleanup.
     ep.handshake_waiters.cancel(io);
-    ep.core.route_commands.close(io);
-    ep.core.route_commands.discardQueued(io);
+    // Drop the endpoint's pool reference; slabs pinned by in-flight packet
+    // views (sitting in connection inboxes) free themselves on last release.
+    if (ep.slab_pool_slot.*) |pool| {
+        pool.release();
+        ep.slab_pool_slot.* = null;
+    }
     if (ep.accept_queue_slot.*) |state| {
         state.close(io);
         state.discardQueued(io);
@@ -185,137 +240,115 @@ pub fn localAddr(ep: Context) ?std.Io.net.IpAddress {
 
 fn routerSocketLoop(ep: Context) RouterLoopError!void {
     const io = ep.io;
-    var cid_map = CidMap.init(ep.allocator);
-    defer clearRouterCidMap(ep, &cid_map);
+    // Routes die with the listener: release every held channel retain on exit.
+    // (Actors unmapping their own CIDs afterwards is a harmless no-op overlap.)
+    defer {
+        const removed = ep.core.route_table.clear(io);
+        if (removed > 0) ep.subStat("cid_map_entries", @intCast(removed));
+    }
 
-    while (ep.socket_slot.* != null) {
-        try std.Io.checkCancel(io);
-        _ = drainRouteCommands(ep, &cid_map);
-        const observed_commands = ep.core.route_commands.observe();
-        if (drainRouteCommands(ep, &cid_map)) continue;
-
-        var select_buffer: [2]RouterSelectResult = undefined;
-        var select: RouterSelect = .init(io, &select_buffer);
-        defer discardPendingRouterSelect(ep, &select);
-
-        try select.concurrent(.packet, waitRouterPacket, .{ep});
-        try select.concurrent(.route_command, waitRouteCommand, .{ ep, observed_commands });
-
-        const result = try select.await();
-        var command_ready = false;
-        var packet: ?RoutedPacket = null;
-        try collectRouterSelectResult(ep, result, &command_ready, &packet, true);
-        while (select.cancel()) |extra| try collectRouterSelectResult(ep, extra, &command_ready, &packet, false);
-
-        if (command_ready) _ = drainRouteCommands(ep, &cid_map);
-        if (packet) |*value| {
-            defer value.deinit();
-            _ = drainRouteCommands(ep, &cid_map);
-            try processRouterPacket(ep, &cid_map, value);
-        }
+    // ONE persistent fiber owning the blocking recv — no per-datagram Select,
+    // task spawns, or cancel/join. Route-table writers mutate the shared table
+    // directly, so the only wake this loop needs is a datagram: real traffic or
+    // closeListener's loopback wake.
+    var recv_slab = RecvSlab{ .pool = ep.slab_pool_slot.* };
+    defer recv_slab.retire();
+    while (true) {
+        if (ep.stopping.load(.acquire)) break;
+        var packet = (receiveRouterPacket(ep, &recv_slab, .none) catch |err| switch (err) {
+            // Teardown backstop or a stray cancel; the loop-top `stopping`
+            // check decides whether to exit.
+            error.Canceled => continue,
+            error.Timeout => unreachable, // .none timeout never fires
+        }) orelse continue;
+        defer packet.deinit();
+        processRouterPacket(ep, &packet) catch |err| switch (err) {
+            error.Canceled => continue,
+        };
     }
 }
 
-fn waitRouterPacket(ep: Context) std.Io.Cancelable!?RoutedPacket {
-    return receiveRouterPacket(ep, .none) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        error.Timeout => unreachable,
-    };
+/// The recv fiber's bump cursor over the current receive slab: datagrams land
+/// in the slab's tail and become zero-copy views; the slab is retired to a
+/// fresh one when the tail can no longer hold a max-size datagram. Single-fiber
+/// state — only the recv loop touches it.
+const RecvSlab = struct {
+    pool: ?*packet_route.SlabPool,
+    current: ?*packet_route.SlabPool.Slab = null,
+    fill: usize = 0,
+
+    /// The writable tail (≥ one max datagram), or null when the pool is
+    /// absent/exhausted and the caller must fall back to a heap copy.
+    fn tail(rs: *RecvSlab) ?[]u8 {
+        const pool = rs.pool orelse return null;
+        if (rs.current) |slab| {
+            if (slab.buf.len - rs.fill >= packet_buf_len) return slab.buf[rs.fill..];
+            slab.release(); // drop the cursor hold; views keep it pinned
+            rs.current = null;
+        }
+        rs.current = pool.acquire() orelse return null;
+        rs.fill = 0;
+        return rs.current.?.buf;
+    }
+
+    /// Bump past `len` bytes the kernel just filled at the tail's front.
+    fn consume(rs: *RecvSlab, len: usize) void {
+        rs.fill += len;
+    }
+
+    fn retire(rs: *RecvSlab) void {
+        if (rs.current) |slab| {
+            slab.release();
+            rs.current = null;
+        }
+    }
+};
+
+/// Wake the recv fiber out of its blocking `recvmsg` for teardown with a
+/// zero-length datagram to the bound socket. The loop drops empty payloads, so
+/// the wake is invisible to connections. Returns false on send failure (caller
+/// must fall back to `cancel`).
+fn sendWakeDatagram(ep: Context) bool {
+    const socket = ep.socket_slot.* orelse return false;
+    var dest = wakeAddress(socket.address());
+    var messages = [_]std.Io.net.OutgoingMessage{.{
+        .address = &dest,
+        .data_ptr = "".ptr,
+        .data_len = 0,
+    }};
+    socket.sendMany(ep.io, messages[0..], .{}) catch return false;
+    return true;
 }
 
-fn waitRouteCommand(ep: Context, observed_epoch: u32) std.Io.Cancelable!void {
-    return ep.core.route_commands.wait(ep.io, observed_epoch);
-}
-
-fn discardPendingRouterSelect(ep: Context, select: *RouterSelect) void {
-    while (select.cancel()) |result| switch (result) {
-        .route_command => {},
-        .packet => |packet_result| {
-            var packet = packet_result catch return;
-            if (packet) |*value| {
-                value.deinit();
-                ep.addStat("router_packet_drops", 1);
+/// The address the teardown wake datagram is sent to: the bound address with a
+/// wildcard host replaced by loopback (a datagram to 0.0.0.0/:: is not
+/// reliably deliverable; loopback to the bound port always is).
+fn wakeAddress(bound: std.Io.net.IpAddress) std.Io.net.IpAddress {
+    switch (bound) {
+        .ip4 => |a| {
+            if (std.mem.allEqual(u8, &a.bytes, 0)) return .{ .ip4 = .loopback(a.port) };
+            return bound;
+        },
+        .ip6 => |a| {
+            if (std.mem.allEqual(u8, &a.bytes, 0)) {
+                var loop6 = a;
+                loop6.bytes = [_]u8{0} ** 15 ++ [_]u8{1};
+                return .{ .ip6 = loop6 };
             }
-        },
-    };
-}
-
-fn collectRouterSelectResult(
-    ep: Context,
-    result: RouterSelectResult,
-    command_ready: *bool,
-    packet: *?RoutedPacket,
-    canceled_is_error: bool,
-) std.Io.Cancelable!void {
-    switch (result) {
-        .route_command => |command_result| {
-            command_result catch |err| switch (err) {
-                error.Canceled => if (canceled_is_error) return error.Canceled,
-            };
-            command_ready.* = true;
-        },
-        .packet => |packet_result| {
-            const maybe_packet = packet_result catch |err| switch (err) {
-                error.Canceled => {
-                    if (canceled_is_error) return error.Canceled;
-                    return;
-                },
-            };
-            const value = maybe_packet orelse return;
-            if (packet.* != null) {
-                var duplicate = value;
-                duplicate.deinit();
-                ep.addStat("router_packet_drops", 1);
-                return;
-            }
-            packet.* = value;
+            return bound;
         },
     }
-}
-
-fn drainRouteCommands(ep: Context, cid_map: *CidMap) bool {
-    var drained = false;
-    while (ep.core.route_commands.receiver().tryRecv(ep.io)) |command| {
-        drained = true;
-        switch (command) {
-            .map_cid => |cmd| mapCidFromExisting(ep, cid_map, cmd.existing_cid, cmd.new_cid),
-            .unmap_cid => |cid| unmapRoute(ep, cid_map, cid),
-            .register_route => |req| registerDialedRoute(ep, cid_map, req),
-        }
-    }
-    return drained;
-}
-
-fn registerDialedRoute(ep: Context, cid_map: *CidMap, req: *route_commands.RegisterRouteRequest) void {
-    const route = req.route;
-    var registered: usize = 0;
-    var rollback = false;
-    for (req.cids.items) |cid| {
-        // Each successful map acquires a router-owned retain. Rollback only
-        // needs to unmap the entries already committed.
-        if (!mapRoute(ep, cid_map, cid, route)) {
-            rollback = true;
-            break;
-        }
-        registered += 1;
-    }
-    if (rollback) {
-        for (req.cids.items[0..registered]) |cid| unmapRoute(ep, cid_map, cid);
-        req.success = false;
-    } else {
-        req.success = true;
-    }
-    req.ack.set(ep.io);
 }
 
 /// Narrow capability handed to the dialer: just enough to register a
-/// freshly-dialed connection's CIDs with the router fiber. The dialer never
-/// needs the listener-side bits in `Context` (accept queue, router future,
-/// handshake waiters).
+/// freshly-dialed connection's CIDs in the shared route table, without the
+/// listener-side bits in `Context`. Registration is a direct, synchronous table
+/// write — a CID is routable before it returns, so the dialer's first packet
+/// can never race its own registration.
 pub const RouteRegistrar = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    route_updates: *route_commands.Queue.State,
+    core: *endpoint_core.EndpointCore,
 
     pub const RegisterError = error{ RegistrationFailed, OutOfMemory };
     pub const Registration = struct {
@@ -325,11 +358,11 @@ pub const RouteRegistrar = struct {
 
         pub fn deinit(registration: *Registration) void {
             if (registration.active) {
+                const reg = registration.registrar;
                 for (registration.cids.items) |cid| {
-                    _ = registration.registrar.route_updates.sender().trySend(
-                        registration.registrar.io,
-                        .{ .unmap_cid = cid },
-                    ) catch false;
+                    if (reg.core.route_table.unmap(reg.io, cid)) {
+                        reg.core.subStat("cid_map_entries", 1);
+                    }
                 }
             }
             registration.disarm();
@@ -342,95 +375,75 @@ pub const RouteRegistrar = struct {
         }
     };
 
-    /// Synchronously register the dialed connection's initial source CIDs with
-    /// the router so inbound packets can be delivered to its actor. Caller
-    /// retains ownership of `route` for the duration of this call; on success
-    /// the cid_map holds its own retains acquired via `mapRoute`. The returned
-    /// registration must be disarmed after the connection is fully handed to
-    /// its actor; otherwise `deinit` rolls the route mapping back.
+    /// Register the dialed connection's initial source CIDs (all-or-nothing).
+    /// Caller retains ownership of `route`; on success the table holds one retain
+    /// per mapped CID. Disarm the returned registration once the connection is
+    /// handed to its actor; otherwise `deinit` rolls the mapping back.
     pub fn register(reg: RouteRegistrar, cids: []const CidKey, route: *IncomingPacketChannel) RegisterError!Registration {
         var owned_cids: std.ArrayList(CidKey) = .empty;
         errdefer owned_cids.deinit(reg.allocator);
         try owned_cids.appendSlice(reg.allocator, cids);
 
-        const req = try reg.allocator.create(route_commands.RegisterRouteRequest);
-        var req_owned = true;
-        errdefer if (req_owned) {
-            req.cids.deinit(reg.allocator);
-            reg.allocator.destroy(req);
-        };
-
-        req.* = .{
-            .allocator = reg.allocator,
-            .cids = .empty,
-            .route = route,
-        };
-        try req.cids.appendSlice(reg.allocator, cids);
-
-        const sent = try reg.route_updates.sender().trySend(reg.io, .{ .register_route = req });
-        if (!sent) return error.RegistrationFailed;
-        req_owned = false;
-
-        req.ack.waitUncancelable(reg.io);
-        const ok = req.success;
-        req.destroy();
-        if (!ok) return error.RegistrationFailed;
+        const newly = reg.core.route_table.registerMany(reg.io, cids, route) orelse
+            return error.RegistrationFailed;
+        reg.core.addStat("cid_map_entries", @intCast(newly));
         return .{ .registrar = reg, .cids = owned_cids };
     }
 };
 
-fn mapCidFromExisting(ep: Context, cid_map: *CidMap, existing_cid: CidKey, new_cid: CidKey) void {
-    const sender = cid_map.get(existing_cid) orelse {
-        ep.addStat("cid_map_unknown_existing", 1);
-        return;
-    };
-    _ = mapRoute(ep, cid_map, new_cid, sender);
-}
-
-/// Insert `cid → sender` into the live router-thread `CidMap`. Only callers
-/// with a live `*CidMap` should use this — i.e. the router socket loop and
-/// the server accept path running under it. Cross-thread requests should go through
-/// `RouteRegistrar.register`, which posts a `register_route` command.
-pub fn mapRoute(ep: Context, cid_map: *CidMap, cid: CidKey, sender: *IncomingPacketChannel) bool {
-    if (cid_map.get(cid)) |existing_sender| return existing_sender == sender;
-
-    sender.retain();
-    cid_map.putNoClobber(cid, sender) catch {
-        sender.release();
-        ep.addStat("cid_map_command_drops", 1);
-        return false;
-    };
-    ep.addStat("cid_map_entries", 1);
-    return true;
-}
-
-fn unmapRoute(ep: Context, cid_map: *CidMap, cid: CidKey) void {
-    if (cid_map.fetchRemove(cid)) |kv| {
-        kv.value.release();
-        ep.subStat("cid_map_entries", 1);
+/// Insert `cid → channel` into the shared route table, with the endpoint's
+/// gauge accounting. Used by the server accept path; the dialer goes through
+/// `RouteRegistrar.register` and actors write the table directly.
+pub fn mapRoute(ep: Context, cid: CidKey, channel: *IncomingPacketChannel) bool {
+    switch (ep.core.route_table.map(ep.io, cid, channel)) {
+        .mapped => {
+            ep.addStat("cid_map_entries", 1);
+            return true;
+        },
+        .already_mapped => return true,
+        .failed => {
+            ep.addStat("cid_map_command_drops", 1);
+            return false;
+        },
     }
 }
 
-fn clearRouterCidMap(ep: Context, cid_map: *CidMap) void {
-    var values = cid_map.valueIterator();
-    while (values.next()) |sender| sender.*.release();
-    cid_map.deinit();
-    ep.setStat("cid_map_entries", 0);
+fn unmapRoute(ep: Context, cid: CidKey) void {
+    if (ep.core.route_table.unmap(ep.io, cid)) ep.subStat("cid_map_entries", 1);
 }
 
-fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || std.Io.Cancelable)!?RoutedPacket {
+fn receiveRouterPacket(ep: Context, rs: *RecvSlab, timeout: std.Io.Timeout) (error{Timeout} || std.Io.Cancelable)!?RoutedPacket {
     const io = ep.io;
     const socket = ep.socket_slot.* orelse return error.Canceled;
     const local_addr = socket.address();
-    var buf: [packet_buf_len]u8 = undefined;
-    var control: [socket_control.recv_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
-    const msg = socket.receiveWithControlTimeout(io, &buf, &control, timeout) catch |err| switch (err) {
-        error.Timeout => return error.Timeout,
-        error.Canceled => return error.Canceled,
-        else => {
-            ep.addStat("router_recv_errors", 1);
-            return null;
-        },
+    // Receive straight into the current slab's tail (the packet then becomes a
+    // zero-copy VIEW); when the pool is dry, degrade to a stack buffer + a
+    // per-packet heap copy.
+    var fallback_buf: [packet_buf_len]u8 = undefined;
+    const slab_tail = rs.tail();
+    const buf: []u8 = if (slab_tail) |t| t[0..packet_buf_len] else fallback_buf[0..];
+    // Shadow mode: a plain `recvmsg` with NO control buffer (zio maps an empty
+    // control slice to msg_control=null), the only form the Shadow simulator
+    // supports. Teardown still works via the loopback wake datagram, so dropping
+    // the timed-control receive does not change the loop's liveness.
+    const msg = if (ep.options.endpoint.shadow_compatible)
+        socket.receive(io, buf) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                ep.addStat("router_recv_errors", 1);
+                return null;
+            },
+        }
+    else recv: {
+        var control: [socket_control.recv_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
+        break :recv socket.receiveWithControlTimeout(io, buf, &control, timeout) catch |err| switch (err) {
+            error.Timeout => return error.Timeout,
+            error.Canceled => return error.Canceled,
+            else => {
+                ep.addStat("router_recv_errors", 1);
+                return null;
+            },
+        };
     };
     const meta = socket_control.parseIncomingControl(&msg, local_addr) catch |err| switch (err) {
         error.PayloadTruncated => {
@@ -444,11 +457,23 @@ fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || 
             return null;
         },
     };
-    return (RoutedPacket.initWithMeta(ep.allocator, msg.data, msg.from, controlDestination(meta, local_addr), .{
+    const packet_meta = RoutedPacket.Meta{
         .rx_mono_ns = rxMonoNs(io),
         .rx_system_ns = meta.rx_system_ns,
         .gro_segment_size = meta.gro_segment_size,
-    }) catch {
+    };
+    if (slab_tail != null) {
+        // `msg.data` is the kernel-filled front of the slab tail: wrap it as a
+        // view (one slab retain) and bump the cursor past it. Zero copies.
+        const slab = rs.current.?;
+        const packet = RoutedPacket.initView(slab, msg.data, msg.from, controlDestination(meta, local_addr), packet_meta) orelse {
+            ep.addStat("router_packet_drops", 1);
+            return null;
+        };
+        rs.consume(msg.data.len);
+        return packet;
+    }
+    return (RoutedPacket.initWithMeta(ep.allocator, msg.data, msg.from, controlDestination(meta, local_addr), packet_meta) catch {
         ep.addStat("router_packet_drops", 1);
         return null;
     }) orelse {
@@ -457,47 +482,61 @@ fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || 
     };
 }
 
+// The local address a packet was actually delivered to, used as our reply
+// source. Precedence: IP_ORIGDSTADDR/IPV6_ORIGDSTADDR (survives
+// transparent-proxy / dual-stack rewrites), then IP_PKTINFO, then the bound
+// address when neither control message is present.
 fn controlDestination(meta: socket_control.ParsedControl, fallback_to: std.Io.net.IpAddress) std.Io.net.IpAddress {
     return meta.orig_dst_to orelse meta.pktinfo_to orelse fallback_to;
 }
 
-fn processRouterPacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacket) std.Io.Cancelable!void {
+fn processRouterPacket(ep: Context, packet: *RoutedPacket) std.Io.Cancelable!void {
     if (packet.gro_segment_size) |segment_size| {
         if (segment_size > 0 and packet.data.len > segment_size) {
-            return processRouterGroPacket(ep, cid_map, packet, segment_size);
+            return processRouterGroPacket(ep, packet, segment_size);
         }
     }
-    return processRouterSinglePacket(ep, cid_map, packet);
+    return processRouterSinglePacket(ep, packet);
 }
 
-fn processRouterGroPacket(ep: Context, cid_map: *CidMap, packet: *const RoutedPacket, segment_size: u16) std.Io.Cancelable!void {
+fn processRouterGroPacket(ep: Context, packet: *const RoutedPacket, segment_size: u16) std.Io.Cancelable!void {
     var offset: usize = 0;
     while (offset < packet.data.len) {
         const end = @min(offset + @as(usize, segment_size), packet.data.len);
-        var segment = (RoutedPacket.initWithMeta(
-            ep.allocator,
-            packet.data[offset..end],
-            packet.from,
-            packet.to,
-            .{
-                .rx_mono_ns = packet.rx_mono_ns,
-                .rx_system_ns = packet.rx_system_ns,
-            },
-        ) catch {
-            ep.addStat("router_packet_drops", 1);
-            return;
-        }) orelse {
-            ep.addStat("router_packet_drops", 1);
-            return;
+        const segment_meta = RoutedPacket.Meta{
+            .rx_mono_ns = packet.rx_mono_ns,
+            .rx_system_ns = packet.rx_system_ns,
         };
+        // A slab-backed super-datagram splits into sibling VIEWS of the same
+        // bytes (one retain each, zero copies); the heap-copy fallback dupes
+        // per segment.
+        var segment = if (packet.slab) |slab|
+            (RoutedPacket.initView(slab, packet.data[offset..end], packet.from, packet.to, segment_meta) orelse {
+                ep.addStat("router_packet_drops", 1);
+                return;
+            })
+        else
+            ((RoutedPacket.initWithMeta(
+                ep.allocator,
+                packet.data[offset..end],
+                packet.from,
+                packet.to,
+                segment_meta,
+            ) catch {
+                ep.addStat("router_packet_drops", 1);
+                return;
+            }) orelse {
+                ep.addStat("router_packet_drops", 1);
+                return;
+            });
         errdefer segment.deinit();
-        try processRouterSinglePacket(ep, cid_map, &segment);
+        try processRouterSinglePacket(ep, &segment);
         segment.deinit();
         offset = end;
     }
 }
 
-fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacket) std.Io.Cancelable!void {
+fn processRouterSinglePacket(ep: Context, packet: *RoutedPacket) std.Io.Cancelable!void {
     const data = packet.constBytes();
     const from = packet.from;
 
@@ -509,7 +548,7 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
     }
 
     if ((data[0] & 0x80) == 0) {
-        routeShortHeader(ep, cid_map, packet);
+        routeShortHeader(ep, packet);
         return;
     }
 
@@ -519,7 +558,7 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
     var scid_len: usize = scid.len;
     var dcid: [quiche.QUICHE_MAX_CONN_ID_LEN]u8 = undefined;
     var dcid_len: usize = dcid.len;
-    var token: [256]u8 = undefined;
+    var token: [header_info_token_buf_len]u8 = undefined;
     var token_len: usize = token.len;
     const rc = quiche.quiche_header_info(
         data.ptr,
@@ -543,7 +582,7 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
     // Handshake/0-RTT/retransmitted packets after the first round-trip carry the
     // server-chosen DCID and must reach the same connection that issued it.
     if (CidKey.init(dcid[0..dcid_len])) |known_dcid| {
-        if (routeKnownDcid(ep, cid_map, known_dcid, packet)) return;
+        if (routeKnownDcid(ep, known_dcid, packet)) return;
     }
 
     if (!quiche.quiche_version_is_supported(version)) {
@@ -559,7 +598,7 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
             ep.addStat("router_rejected_initial_packets", 1);
             return;
         }
-        var out: [1500]u8 = undefined;
+        var out: [version_negotiation_buf_len]u8 = undefined;
         const written = quiche.quiche_negotiate_version(&scid, scid_len, &dcid, dcid_len, &out, out.len);
         if (written > 0) {
             const socket = ep.socket_slot.* orelse return error.Canceled;
@@ -588,11 +627,10 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
         return;
     }
 
-    // RFC 9000 §8.1.2: address validation. The first Initial from a peer
-    // arrives without a token; respond with RETRY containing a freshly-minted
-    // token bound to the peer's IP and the original DCID. The retried Initial
-    // carries the token and we authenticate it before allocating any quiche
-    // state — short-circuiting amplification attacks from spoofed sources.
+    // RFC 9000 §8.1.2 address validation: the first (tokenless) Initial gets a
+    // RETRY with a freshly-minted token bound to the peer's IP and original
+    // DCID. We authenticate the retried token before allocating any quiche
+    // state, short-circuiting amplification from spoofed sources.
     if (token_len == 0) {
         sendRetry(ep, packet.to, &from, scid[0..scid_len], dcid[0..dcid_len], version);
         return;
@@ -615,14 +653,13 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
     }
     ep.addStat("router_retry_token_validated", 1);
 
-    try acceptInitial(ep, cid_map, packet, dcid[0..dcid_len], retry.original_dcid.slice());
+    try acceptInitial(ep, packet, dcid[0..dcid_len], retry.original_dcid.slice());
 }
 
 // ----- server accept path -------------------------------------------------
 
 fn acceptInitial(
     ep: Context,
-    cid_map: *CidMap,
     initial_packet: *RoutedPacket,
     initial_dcid: []const u8,
     original_dcid: []const u8,
@@ -638,12 +675,11 @@ fn acceptInitial(
     defer accept_permit.cancel();
 
     const socket = ep.socket_slot.* orelse return error.Canceled;
-    startServerConnection(ep, cid_map, socket, local_addr, from, initial_dcid, original_dcid, initial_packet, &accept_permit);
+    startServerConnection(ep, socket, local_addr, from, initial_dcid, original_dcid, initial_packet, &accept_permit);
 }
 
 fn startServerConnection(
     ep: Context,
-    cid_map: *CidMap,
     socket: *transport_mod.SharedUdpSocket,
     local_addr: std.Io.net.IpAddress,
     peer_addr: std.Io.net.IpAddress,
@@ -662,7 +698,7 @@ fn startServerConnection(
             .peer = peer_addr,
             .outbound_batch_size = options.actor.outbound_batch_size,
             .core = ep.core,
-            .route_updates = ep.core.route_commands,
+            .route_table = &ep.core.route_table,
         },
         .control_queue_len = options.actor.control_queue_len,
         .stream_accept_queue_len = options.actor.stream_accept_queue_len,
@@ -675,6 +711,7 @@ fn startServerConnection(
         .stream_inbound_quantum_bytes = options.actor.stream_inbound_quantum_bytes,
         .stream_outbound_quantum_bytes = options.actor.stream_outbound_quantum_bytes,
         .outbound_pending_queue_len = options.actor.outbound_pending_queue_len,
+        .keep_alive_period_ns = options.transport.keep_alive_period_ms * std.time.ns_per_ms,
     }) catch {
         ep.addStat("router_packet_drops", 1);
         return;
@@ -682,21 +719,29 @@ fn startServerConnection(
     ep.addStat("connections_started", 1);
     defer pending.deinit();
 
-    // RETRY validation already pinned the connection's SCID (= retried
-    // Initial's DCID = the new_scid we picked when we sent the Retry packet).
-    // The actor's CID registry was populated at construction; we just need
-    // to map each registered CID into the router's cid_map.
+    // Map each CID the actor registered at construction into the shared route
+    // table. The rollback iterates an OWNED stack copy of the keys, not
+    // `reg.cids`: that borrows the actor's heap registry, freed once `spawn` +
+    // `conn.deinit()` tear the actor down on the failure path below — iterating
+    // the freed borrow could unmap a LIVE connection's routes if the block were
+    // reused. (RouteRegistrar.register copies for the same reason.)
     const reg = pending.routeRegistration();
+    var mapped_keys: [max_accept_route_cids]CidKey = undefined;
+    if (reg.cids.len > mapped_keys.len) {
+        ep.addStat("router_packet_drops", 1);
+        return;
+    }
     var mapped_routes: usize = 0;
     var routes_committed = false;
     defer if (!routes_committed) {
-        for (reg.cids[0..mapped_routes]) |cid| unmapRoute(ep, cid_map, cid);
+        for (mapped_keys[0..mapped_routes]) |cid| unmapRoute(ep, cid);
     };
     for (reg.cids) |cid| {
-        if (!mapRoute(ep, cid_map, cid, reg.channel)) {
+        if (!mapRoute(ep, cid, reg.channel)) {
             ep.addStat("router_packet_drops", 1);
             return;
         }
+        mapped_keys[mapped_routes] = cid;
         mapped_routes += 1;
     }
     switch (pending.enqueueInboundPacket(initial_packet)) {
@@ -762,10 +807,9 @@ fn sendRetry(
     const io = ep.io;
     const socket = ep.socket_slot.* orelse return;
 
-    // Generate the fresh server-chosen connection ID. The client echoes this
-    // back as the DCID of the retried Initial; that DCID becomes the
-    // connection's SCID once we accept it, so we do not need to track the
-    // value in router state — it round-trips through the peer.
+    // Fresh server-chosen connection ID. The client echoes it as the retried
+    // Initial's DCID, which becomes the connection's SCID on accept — so it
+    // round-trips through the peer and needs no router-side tracking.
     const new_scid = cid_gen.randomLocalCid() catch {
         ep.addStat("router_retry_send_failures", 1);
         return;
@@ -832,12 +876,11 @@ fn sendRouterDatagram(
 
 fn routeShortHeader(
     ep: Context,
-    cid_map: *CidMap,
     packet: *RoutedPacket,
 ) void {
     const data = packet.constBytes();
     if (extractShortHeaderDcid(data)) |dcid| {
-        if (routeKnownDcid(ep, cid_map, dcid, packet)) return;
+        if (routeKnownDcid(ep, dcid, packet)) return;
         ep.addStat("router_unknown_dcid_packets", 1);
     } else {
         ep.addStat("router_rejected_initial_packets", 1);
@@ -846,28 +889,20 @@ fn routeShortHeader(
 
 fn routeKnownDcid(
     ep: Context,
-    cid_map: *CidMap,
     dcid: CidKey,
     packet: *RoutedPacket,
 ) bool {
-    const io = ep.io;
-    var delivered: ?packet_route.EnqueueResult = null;
-    if (cid_map.get(dcid)) |target| {
-        delivered = target.sender().enqueue(io, packet);
+    switch (ep.core.route_table.deliver(ep.io, dcid, packet)) {
+        .queued => {
+            ep.addStat("router_packets_dispatched", 1);
+            return true;
+        },
+        .dropped => {
+            ep.addStat("router_packet_drops", 1);
+            return true;
+        },
+        .no_route => return false,
     }
-
-    if (delivered) |result| {
-        switch (result) {
-            .queued => {
-                ep.addStat("router_packets_dispatched", 1);
-            },
-            .dropped => {
-                ep.addStat("router_packet_drops", 1);
-            },
-        }
-        return true;
-    }
-    return false;
 }
 
 fn extractShortHeaderDcid(packet: []const u8) ?CidKey {
@@ -920,6 +955,8 @@ test "router splits GRO datagrams before CID dispatch" {
     var accept_available: std.atomic.Value(usize) = .init(0);
     var router_future_slot: ?std.Io.Future(RouterLoopError!void) = null;
     var handshake_waiters: std.Io.Group = .init;
+    var stopping: std.atomic.Value(bool) = .init(false);
+    var slab_pool_slot: ?*packet_route.SlabPool = null;
     const ep = Context{
         .allocator = allocator,
         .io = io,
@@ -930,16 +967,17 @@ test "router splits GRO datagrams before CID dispatch" {
         .accept_available = &accept_available,
         .router_future_slot = &router_future_slot,
         .handshake_waiters = &handshake_waiters,
+        .stopping = &stopping,
+        .slab_pool_slot = &slab_pool_slot,
         .raw = undefined,
     };
 
-    var cid_map = CidMap.init(allocator);
-    defer clearRouterCidMap(ep, &cid_map);
-
+    // Routes live in the shared core.route_table; core.release (deferred above)
+    // runs the backstop clear that releases the table's channel retains.
     const cid_a = [_]u8{0x11} ** local_conn_id_len;
     const cid_b = [_]u8{0x22} ** local_conn_id_len;
-    try std.testing.expect(mapRoute(ep, &cid_map, CidKey.init(&cid_a).?, route_a));
-    try std.testing.expect(mapRoute(ep, &cid_map, CidKey.init(&cid_b).?, route_b));
+    try std.testing.expect(mapRoute(ep, CidKey.init(&cid_a).?, route_a));
+    try std.testing.expect(mapRoute(ep, CidKey.init(&cid_b).?, route_b));
 
     const segment_len = 1 + local_conn_id_len + 3;
     var data: [segment_len * 2]u8 = undefined;
@@ -953,7 +991,7 @@ test "router splits GRO datagrams before CID dispatch" {
     })) orelse return error.TestUnexpectedResult;
     defer packet.deinit();
 
-    try processRouterPacket(ep, &cid_map, &packet);
+    try processRouterPacket(ep, &packet);
 
     var out_a: RoutedPacket = undefined;
     try std.testing.expect(route_a.receiver().tryRecv(io, &out_a));

@@ -1,12 +1,7 @@
 //! `Record`: per-stream state held by the connection actor in its streams
-//! table. Owns no thread-shared resources — every field here is touched
-//! only from the actor fiber.
-//!
-//! Holds a ref to the heap-allocated `SharedState` (the handle holds the
-//! other ref). The actor owns the pending-send scratch buffer used to
-//! batch outbound bytes into quiche, and tracks bookkeeping flags
-//! (fin_sent, peer credit reservation, outbound-ready dedup, deferred
-//! close-write reply).
+//! table. Every field is touched only from the actor fiber — no
+//! thread-shared resources. Holds one ref to the heap-allocated
+//! `SharedState` (the handle holds the other).
 
 const std = @import("std");
 const conn_commands = @import("../connection/commands.zig");
@@ -72,7 +67,7 @@ pub const Record = struct {
     pub fn refillPendingOutbound(self: *Record, io: std.Io) bool {
         if (self.pending_send_len != self.pending_send_off) return true;
         if (self.pending_send.len == 0) return false;
-        var queue = if (self.shared.outbound_queue) |*q| q else return false;
+        const queue = if (self.shared.outbound_queue) |*q| q else return false;
         const read_len = queue.tryGet(io, self.pending_send) catch return false;
         self.pending_send_off = 0;
         self.pending_send_len = read_len;
@@ -81,7 +76,7 @@ pub const Record = struct {
 
     pub fn outboundIdle(self: *Record, io: std.Io) bool {
         if (self.pending_send_len != self.pending_send_off) return false;
-        var queue = if (self.shared.outbound_queue) |*q| q else return true;
+        const queue = if (self.shared.outbound_queue) |*q| q else return true;
         return queue.used(io) == 0;
     }
 
@@ -112,7 +107,7 @@ pub const Record = struct {
 
     /// Mark FIN as sent on the wire. Fires any deferred close_write reply
     /// so the caller's `closeWrite` returns once the FIN is in quiche's
-    /// hands (matches existing semantics).
+    /// hands.
     pub fn markFinSent(self: *Record, io: std.Io) void {
         self.fin_sent = true;
         self.fin_requested = false;

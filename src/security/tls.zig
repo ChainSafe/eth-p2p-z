@@ -1,12 +1,8 @@
-//! libp2p-flavored TLS for QUIC.
-//!
-//! This is not generic TLS: certificates carry a libp2p `signed-key-extension`
-//! (OID `1.3.6.1.4.1.53594.1.1`) embedding the host's libp2p identity public
-//! key plus a signature binding the TLS keypair to that identity. The
-//! verifier on the peer side parses that extension and recovers the
-//! authenticated `keys.PublicKey`. Peers without the extension are rejected.
-//!
-//! This module is not appropriate for non-libp2p deployments.
+//! libp2p-flavored TLS for QUIC. Not generic TLS: certificates carry a libp2p
+//! `signed-key-extension` (OID `1.3.6.1.4.1.53594.1.1`) embedding the host's
+//! libp2p identity public key plus a signature binding the TLS keypair to that
+//! identity. The peer-side verifier parses that extension and recovers the
+//! authenticated `keys.PublicKey`; peers without it are rejected.
 
 const std = @import("std");
 const ssl = @import("ssl").c;
@@ -159,12 +155,36 @@ pub fn createSslContext(subject_key: *ssl.EVP_PKEY, cert: *ssl.X509) !*ssl.SSL_C
         return error.InitializationFailed;
     ssl.SSL_CTX_set_alpn_select_cb(ssl_ctx, alpnSelectCallbackfn, null);
 
+    // Wired only when SSLKEYLOGFILE is set, so it is inert in normal operation.
+    if (std.c.getenv("SSLKEYLOGFILE") != null)
+        ssl.SSL_CTX_set_keylog_callback(ssl_ctx, keylogCallbackFn);
+
     return ssl_ctx;
 }
 
-/// Generates a new key pair based on the specified key type.
-/// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
-/// Note: SECP256K1 is not supported and will result in an `Error.UnsupportedKeyType`.
+/// Appends one NSS-format secret line to SSLKEYLOGFILE so external tools can
+/// decrypt captured QUIC/TLS 1.3 traffic. Best-effort: I/O errors are ignored so
+/// it never disturbs the handshake; O_APPEND + single write keeps entries atomic.
+fn keylogCallbackFn(_: ?*const ssl.SSL, line: [*c]const u8) callconv(.c) void {
+    if (line == null) return;
+    const path_z = std.c.getenv("SSLKEYLOGFILE") orelse return;
+    const line_slice = std.mem.span(@as([*:0]const u8, @ptrCast(line)));
+    var buf: [512]u8 = undefined;
+    if (line_slice.len + 1 > buf.len) return;
+    @memcpy(buf[0..line_slice.len], line_slice);
+    buf[line_slice.len] = '\n';
+    const fd = std.c.open(
+        path_z,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
+        @as(c_uint, 0o600),
+    );
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, &buf, line_slice.len + 1);
+}
+
+/// Generates a new key pair for the given key type. SECP256K1 yields
+/// `Error.UnsupportedKeyType` (no BoringSSL support).
 pub fn generateKeyPair(cert_key_type: keys.KeyType) !*ssl.EVP_PKEY {
     var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
 
@@ -230,15 +250,26 @@ pub fn generateKeyPair(cert_key_type: keys.KeyType) !*ssl.EVP_PKEY {
     return maybe_subject_keypair orelse return error.OpenSSLFailed;
 }
 
-/// Builds a self-signed X.509 certificate suitable for libp2p's TLS handshake,
-/// The caller owns the returned certificate and must free it with ssl.X509.free().
+/// Deterministic Ed25519 key from a raw 32-byte private seed: same seed always
+/// yields the same key. Matches Go's `ed25519.NewKeyFromSeed(seed)`, so the
+/// derived libp2p peer-id is byte-identical across implementations. Caller owns
+/// the returned key and must free it with `ssl.EVP_PKEY_free()`.
+pub fn ed25519KeyFromSeed(seed: []const u8) !*ssl.EVP_PKEY {
+    if (seed.len != 32) return error.InvalidKeyLength;
+    return ssl.EVP_PKEY_new_raw_private_key(
+        ssl.EVP_PKEY_ED25519,
+        null,
+        seed.ptr,
+        seed.len,
+    ) orelse error.OpenSSLFailed;
+}
+
+/// Builds a self-signed X.509 certificate for libp2p's TLS handshake. Caller owns
+/// the returned cert and must free it with `ssl.X509_free()`.
 ///
-/// `host_public_key` contains the identity key that signs the libp2p extension.
-/// `host_sign_fn` is invoked with the corresponding context to sign the extension payload.
-/// `subjectKey` param represents the subject's key pair. Its public key is the certificate's
-/// main public key, and its private key signs the certificate.
-///
-/// The returned certificate is owned by the caller and must be freed with `ssl.X509_free()`.
+/// `host_public_key` is the identity key bound by the libp2p extension; `host_sign_fn`
+/// (with its ctx) signs the extension payload. `subjectKey` is the cert's own keypair:
+/// its public key is the cert subject key, its private key signs the cert.
 pub fn buildCert(
     allocator: Allocator,
     host_public_key: *const keys.PublicKey,
@@ -266,7 +297,7 @@ pub fn buildCert(
 
     const name = ssl.X509_NAME_new() orelse return error.CertNameCreationFailed;
     defer ssl.X509_NAME_free(name);
-    if (ssl.X509_NAME_add_entry_by_txt(name, "C", ssl.MBSTRING_ASC, "CN", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
+    if (ssl.X509_NAME_add_entry_by_txt(name, "C", ssl.MBSTRING_ASC, "US", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
     if (ssl.X509_NAME_add_entry_by_txt(name, "O", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
     if (ssl.X509_NAME_add_entry_by_txt(name, "CN", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
     if (ssl.X509_set_issuer_name(cert, name) <= 0) return error.CertIssuerSetFailed;
@@ -353,7 +384,8 @@ pub fn buildCert(
     return cert;
 }
 
-/// Encodes a public key into the libp2p PublicKey protobuf format.
+/// Encodes a public key into the libp2p PublicKey protobuf wire format and
+/// returns the raw bytes — the slice variant of `createProtobufEncodedPublicKey`.
 /// The caller owns the returned slice.
 pub fn createProtobufEncodedPublicKeyBuf(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
     var public_key_proto = try createProtobufEncodedPublicKey(allocator, pkey);
@@ -372,12 +404,9 @@ pub fn createProtobufEncodedPublicKeyBuf(allocator: Allocator, pkey: *ssl.EVP_PK
     return proto_bytes;
 }
 
-/// Encodes a public key into the libp2p PublicKey protobuf format.
-/// The caller owns the returned PublicKey struct.
-/// This function is a convenience wrapper around `createProtobufEncodedPublicKeyBuf`.
-/// It returns a `keys.PublicKey` struct instead of a raw byte slice.
-/// This is useful for compatibility with the `keys` module.
-// TODO: peer-id migrated to a separate module, will need to update this function
+/// Encodes a public key into the libp2p PublicKey protobuf format, returning a
+/// `keys.PublicKey` struct (vs a raw byte slice). The caller owns the returned
+/// struct's `data` slice.
 pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) !keys.PublicKey {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
     errdefer allocator.free(raw_pubkey);
@@ -399,7 +428,10 @@ pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY)
 
             const curve_nid = ssl.EC_GROUP_get_curve_name(group);
             switch (curve_nid) {
-                // TODO: BoringSSL does not support SECP256K1
+                // secp256k1 is out of scope for the *certificate* key by design:
+                // TLS 1.3 defines no signature scheme for it (only the secp*r1
+                // curves). It only appears as a host *identity*, verified in
+                // software via verifyHostSignature -> verifySecp256k1Signature.
                 ssl.NID_secp256k1 => return error.UnsupportedKeyType,
                 ssl.NID_X9_62_prime256v1 => break :blk 3,
                 else => return error.UnsupportedKeyType,
@@ -421,24 +453,22 @@ pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY)
 fn getRawPublicKeyBytes(allocator: Allocator, evp_key: *ssl.EVP_PKEY) ![]const u8 {
     const base_id = ssl.EVP_PKEY_base_id(evp_key);
 
-    // For Ed25519, we can use EVP_PKEY_get_raw_public_key
     if (base_id == ssl.EVP_PKEY_ED25519) {
+        // BoringSSL two-call idiom: query length, then fill.
         var len: usize = 0;
-        // First call to get the length
         if (ssl.EVP_PKEY_get_raw_public_key(evp_key, null, &len) != 1) {
             return error.RawPubKeyGetFailed;
         }
         const key = try allocator.alloc(u8, len);
         errdefer allocator.free(key);
 
-        // Second call to get the actual key
         if (ssl.EVP_PKEY_get_raw_public_key(evp_key, key.ptr, &len) != 1) {
             return error.RawPubKeyGetFailed;
         }
         return key;
     }
 
-    // For ECDSA and RSA, we use i2d_PUBKEY to get DER encoding (PKIX)
+    // ECDSA and RSA: i2d_PUBKEY gives the PKIX DER (SubjectPublicKeyInfo).
     if (base_id == ssl.EVP_PKEY_EC or base_id == ssl.EVP_PKEY_RSA) {
         var key_ptr: [*c]u8 = null;
         const len = ssl.i2d_PUBKEY(evp_key, &key_ptr);
@@ -530,21 +560,37 @@ pub fn extractPublicKey(allocator: Allocator, conn: *quiche.quiche_conn) !keys.P
     var cert_ptr: [*c]const u8 = null;
     var cert_len: usize = 0;
     quiche.quiche_conn_peer_cert(conn, &cert_ptr, &cert_len);
-    if (cert_ptr == null or cert_len == 0) return error.HandshakeFailed;
+    // Missing cert, parse failure, and a bad signature all mean the same to the
+    // caller: peer identity unverified. Surface a distinct PeerVerifyFailed (not
+    // opaque HandshakeFailed) so the actor records `peer_verify_failed`; OOM
+    // stays itself, as it is not a verification verdict.
+    if (cert_ptr == null or cert_len == 0) return error.PeerVerifyFailed;
 
     var der_ptr = cert_ptr;
-    const cert = ssl.d2i_X509(null, &der_ptr, @intCast(cert_len)) orelse return error.HandshakeFailed;
+    const cert = ssl.d2i_X509(null, &der_ptr, @intCast(cert_len)) orelse return error.PeerVerifyFailed;
     defer ssl.X509_free(cert);
 
-    const info = verifyAndExtractPeerInfo(allocator, cert) catch return error.HandshakeFailed;
+    const info = verifyAndExtractPeerInfo(allocator, cert) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.PeerVerifyFailed,
+    };
     if (!info.is_valid) {
         if (info.host_pubkey.data) |data| allocator.free(data);
-        return error.HandshakeFailed;
+        return error.PeerVerifyFailed;
     }
     return info.host_pubkey;
 }
 
-pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct { is_valid: bool, host_pubkey: keys.PublicKey, peer_id: PeerId } {
+/// Result of verifying a peer certificate. `host_pubkey.data` is heap-allocated
+/// and populated regardless of `is_valid`, so the caller must free it on BOTH
+/// the valid and invalid paths. `peer_id` is a value type owning no heap.
+pub const PeerVerification = struct {
+    is_valid: bool,
+    host_pubkey: keys.PublicKey,
+    peer_id: PeerId,
+};
+
+pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !PeerVerification {
     const ext_data = try extractExtensionFields(allocator, cert);
     defer {
         allocator.free(ext_data.host_pubkey);
@@ -561,6 +607,8 @@ pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !st
 
     const peer_id = try PeerId.fromPublicKey(allocator, &host_pubkey);
 
+    // X509_get_pubkey wants a mutable *X509 but only bumps the pubkey's refcount
+    // (no semantic mutation of the cert), so the const-cast is sound here.
     const cert_pkey = ssl.X509_get_pubkey(@constCast(cert));
     if (cert_pkey == null) return error.InvalidCertificate;
     defer ssl.EVP_PKEY_free(cert_pkey);
@@ -588,8 +636,7 @@ pub fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.E
             if (key_data.len != 32) {
                 return error.InvalidKeyLength;
             }
-            return ssl.EVP_PKEY_new_raw_public_key(ssl.EVP_PKEY_ED25519, null, // engine parameter (not used)
-                key_data.ptr, key_data.len) orelse error.OpenSSLFailed;
+            return ssl.EVP_PKEY_new_raw_public_key(ssl.EVP_PKEY_ED25519, null, key_data.ptr, key_data.len) orelse error.OpenSSLFailed;
         },
 
         .RSA => {
@@ -646,6 +693,8 @@ fn createEcdsaPkeyFromSec1(sec1_bytes: []const u8) !*ssl.EVP_PKEY {
         return error.OpenSSLFailed;
     }
 
+    // EVP_PKEY_assign_EC_KEY took ownership of ec_key on success; null the managed
+    // handle so the `defer EC_KEY_free` above doesn't double-free it.
     ec_key_managed = null;
     return pkey;
 }
@@ -762,7 +811,10 @@ pub fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const
     }
 }
 
-fn verifyHostSignature(host_pubkey: *const keys.PublicKey, data: []const u8, signature: []const u8) !bool {
+/// Verify a libp2p host signature over `data` using `host_pubkey`: software
+/// secp256k1 path for secp256k1 keys, BoringSSL EVP verify (Ed25519/ECDSA/RSA)
+/// otherwise. Also used by gossipsub to verify a publisher's message signature.
+pub fn verifyHostSignature(host_pubkey: *const keys.PublicKey, data: []const u8, signature: []const u8) !bool {
     switch (host_pubkey.type) {
         .SECP256K1 => return verifySecp256k1Signature(host_pubkey.data orelse return error.InvalidData, data, signature),
         else => {
@@ -785,7 +837,11 @@ fn verifySecp256k1Signature(pubkey_bytes: []const u8, data: []const u8, signatur
 
     const message = secp.Message{ .inner = digest };
 
-    const sig = secp.ecdsa.Signature.fromDer(signature) catch return error.InvalidData;
+    var sig = secp.ecdsa.Signature.fromDer(signature) catch return error.InvalidData;
+    // go-libp2p / rust-libp2p accept high-S signatures on verify, but
+    // secp256k1_ecdsa_verify rejects them — normalize to low-S first so we are no
+    // stricter than the reference impls (idempotent for already-low-S input).
+    sig.normalizeS();
 
     context.verifyEcdsa(message, sig, public_key) catch {
         return false;
@@ -1065,18 +1121,6 @@ fn checkCriticalExtensions(cert: *ssl.X509) !bool {
 }
 
 test "Build certificate using Ed25519 keys" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const fs = std.Io.Dir.cwd();
-    const file_path = "test_cert.pem";
-
-    fs.deleteFile(io, file_path) catch |err| {
-        if (err != error.FileNotFound) {
-            return err;
-        }
-    };
-
     const host_key = try generateKeyPair(.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
@@ -1095,12 +1139,9 @@ test "Build certificate using Ed25519 keys" {
     );
     defer ssl.X509_free(cert);
 
-    // TODO: Write the certificate to a file for checking the cert file outside, will use assert once verify side is implemented.
-    const file = try std.Io.Dir.cwd().createFile(io, "test_cert.pem", .{ .truncate = true });
-    defer file.close(io);
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
     defer std.testing.allocator.free(pem_buf);
-    try file.writeStreamingAll(io, pem_buf);
+    try std.testing.expect(pem_buf.len > 0);
 }
 
 test "Verify certificate with Ed25519 keys" {
@@ -1156,7 +1197,6 @@ test "Build certificate using ECDSA keys" {
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
     defer std.testing.allocator.free(pem_buf);
 
-    // Verify the certificate was created successfully
     try std.testing.expect(pem_buf.len > 0);
 }
 
@@ -1213,15 +1253,6 @@ test "Build certificate using RSA keys" {
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
     defer std.testing.allocator.free(pem_buf);
 
-    // Dump a sample RSA certificate for interop debugging.
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const file = try std.Io.Dir.cwd().createFile(io, "rsa_test_cert.pem", .{ .truncate = true });
-    defer file.close(io);
-    try file.writeStreamingAll(io, pem_buf);
-
-    // Verify the certificate was created successfully
     try std.testing.expect(pem_buf.len > 0);
 }
 
@@ -1254,4 +1285,26 @@ test "Verify certificate with RSA keys" {
     defer std.testing.allocator.free(expected_pubkey.data.?);
     const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
     try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
+}
+
+test "verifySecp256k1Signature round-trips and rejects a tampered payload" {
+    // Exercises verifySecp256k1Signature on its own: the cert plumbing
+    // (buildCert/verifyAndExtractPeerInfo) only handles BoringSSL key types.
+    const ctx = secp_context.get();
+    const sk = secp.SecretKey.generate();
+    const pk = secp.PublicKey.fromSecretKey(ctx.*, sk);
+    const pubkey_bytes = pk.serialize(); // 33-byte compressed point
+
+    const data = "libp2p-tls-handshake:dummy-spki-der";
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(data);
+    const digest = hasher.finalResult();
+    const message = secp.Message{ .inner = digest };
+    const sig = ctx.signEcdsa(&message, &sk);
+    const der = sig.serializeDer();
+
+    // Correct signature over the correct payload verifies.
+    try std.testing.expect(try verifySecp256k1Signature(&pubkey_bytes, data, der.data[0..der.len]));
+    // Same signature over a different payload must be rejected (not errored).
+    try std.testing.expect(!try verifySecp256k1Signature(&pubkey_bytes, "libp2p-tls-handshake:other", der.data[0..der.len]));
 }

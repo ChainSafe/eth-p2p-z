@@ -1,21 +1,18 @@
 //! Heap-allocated state shared between a `Stream` handle and the
-//! `ConnectionActor` (which keeps the actor-side `Record` in its streams
-//! table).
-//!
-//! Holds exactly the things that *both* sides need to touch:
+//! `ConnectionActor`. Holds only what both sides touch:
 //!   - Byte queues (inbound: actor → handle; outbound: handle → actor)
 //!   - Atomic state flags (closed, write/read shutdown, peer reset)
-//!   - Pointer back to the connection's `SharedState` so the handle can
-//!     post commands and signal the actor's wake mechanism without ever
-//!     holding a raw pointer into actor-private memory.
+//!   - Pointer to the connection's `SharedState` so the handle posts
+//!     commands and signals the actor's wake without ever holding a raw
+//!     pointer into actor-private memory.
 //!
-//! Refcount initialises to 2: one ref held by the `Stream` handle, one by
-//! the actor's `Record`. Whichever side drops its ref last frees the
-//! allocation. `closeOnHandleDrop` is implemented via a `drop_stream`
-//! command on the connection's inbox — the handle never reaches into the
-//! actor's data structures.
+//! Refcount starts at 1 (handle ref from `create`); the actor's `Record`
+//! takes a second in `StreamRecord.init` and drops it in `deinit`; the last
+//! drop frees. Handle teardown goes via a `drop_stream` command on the
+//! connection inbox — never by reaching into actor data structures.
 
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const byte_queue = @import("byte_queue.zig");
 const conn_shared = @import("../connection/shared_state.zig");
 
@@ -30,7 +27,7 @@ pub const SharedState = struct {
     io: std.Io,
     /// One ref for the handle. The record retains separately in
     /// `StreamRecord.init` and releases in its `deinit`.
-    refs: Atomic(usize) = .init(1),
+    rc: AtomicRc = .{},
 
     /// Connection this stream belongs to. The handle uses this to post
     /// commands (close, reset, ...) and to signal the actor's wake
@@ -50,10 +47,9 @@ pub const SharedState = struct {
     read_shutdown: Atomic(bool) = .init(false),
     inbound_reset_by_peer: Atomic(bool) = .init(false),
     outbound_reset_by_peer: Atomic(bool) = .init(false),
-    /// Set when this stream has been pushed onto the connection's
-    /// outbound-pending queue but the actor hasn't popped it yet.
-    /// Coalesces redundant pushes from a burst of writes. The handle CASes
-    /// false→true when it pushes; the actor stores false after popping.
+    /// True while this stream sits on the connection's outbound-pending
+    /// queue, coalescing redundant pushes from a burst of writes. Handle
+    /// CASes false→true when it pushes; actor stores false after popping.
     outbound_signaled: Atomic(bool) = .init(false),
 
     pub const Config = struct {
@@ -93,14 +89,11 @@ pub const SharedState = struct {
     }
 
     pub fn retain(self: *SharedState) void {
-        const previous = self.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        self.rc.retainChecked();
     }
 
     pub fn release(self: *SharedState) void {
-        const previous = self.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!self.rc.releaseChecked()) return;
         self.destroy();
     }
 
@@ -197,20 +190,10 @@ pub const SharedState = struct {
         if (self.inbound_queue) |*q| q.close(self.io);
     }
 
-    /// Actor-side: write capacity check before pulling from the outbound
-    /// queue. Returns true iff a write to the wire would have flow on
-    /// either side (queue has bytes, or FIN is pending).
-    pub fn outboundIdle(self: *SharedState) bool {
-        if (self.outbound_queue) |*q| return q.used(self.io) == 0;
-        return true;
-    }
-
     /// Handle-side: tell the actor this stream has new outbound bytes.
-    /// Coalesces concurrent writes via `outbound_signaled` so a burst of
-    /// writes results in at most one push to the connection's
-    /// outbound-pending queue. The waitset bit is always raised so the
-    /// actor will wake even on overflow (where it falls back to a full
-    /// stream scan).
+    /// `outbound_signaled` coalesces a burst of writes to at most one push.
+    /// The waitset bit is always raised so the actor wakes even on overflow
+    /// (where it falls back to a full stream scan).
     pub fn signalOutboundReady(self: *SharedState, io: std.Io) void {
         if (!self.outbound_signaled.swap(true, .acq_rel)) {
             // We transitioned false→true; we own the push.

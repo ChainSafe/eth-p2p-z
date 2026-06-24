@@ -1,6 +1,7 @@
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const endpoint_core = @import("../endpoint/core.zig");
-const route_commands_mod = @import("../router/route_commands.zig");
+const route_table_mod = @import("../router/route_table.zig");
 const socket_control = @import("socket_control.zig");
 
 /// Refcounted UDP socket resource shared between the endpoint's router fiber
@@ -10,7 +11,11 @@ pub const SharedUdpSocket = struct {
     io: std.Io,
     socket: std.Io.net.Socket,
     caps: socket_control.Capabilities,
-    refs: std.atomic.Value(usize) = .init(1),
+    /// Set on the first live UDP_SEGMENT send failure (some drivers pass the
+    /// setsockopt probe but fail real segmented sends); thereafter every
+    /// connection on this socket sends per-packet.
+    gso_broken: std.atomic.Value(bool) = .init(false),
+    rc: AtomicRc = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -29,14 +34,11 @@ pub const SharedUdpSocket = struct {
     }
 
     pub fn retain(shared: *SharedUdpSocket) void {
-        const previous = shared.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        shared.rc.retainChecked();
     }
 
     pub fn release(shared: *SharedUdpSocket) void {
-        const previous = shared.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!shared.rc.releaseChecked()) return;
 
         const allocator = shared.allocator;
         shared.socket.close(shared.io);
@@ -68,15 +70,28 @@ pub const SharedUdpSocket = struct {
     pub fn sendMany(shared: *const SharedUdpSocket, io: std.Io, messages: []std.Io.net.OutgoingMessage, flags: std.Io.net.SendFlags) std.Io.net.Socket.SendError!void {
         return shared.socket.sendMany(io, messages, flags);
     }
+
+    pub fn gsoUsable(shared: *const SharedUdpSocket) bool {
+        return shared.caps.udp_gso and !shared.gso_broken.load(.monotonic);
+    }
+
+    pub fn disableGso(shared: *SharedUdpSocket) void {
+        shared.gso_broken.store(true, .monotonic);
+    }
 };
 
 pub const NetworkTransport = struct {
     io: std.Io,
+    /// Retained/released via retainResources()/deinit() (refcounted).
     socket: *SharedUdpSocket,
     local: std.Io.net.IpAddress,
     peer: std.Io.net.IpAddress,
+    /// Retained/released via retainResources()/deinit() (refcounted).
     core: *endpoint_core.EndpointCore,
-    route_updates: *route_commands_mod.Queue.State,
+    /// BORROWED pointer into `core` (lifetime tied to core, which this
+    /// transport retains); NOT released here. The actor writes its CID
+    /// routes directly into this table — see route_table.zig.
+    route_table: *route_table_mod.RouteTable,
     outbound_batch_size: usize = 32,
 
     pub fn retainResources(t: *const NetworkTransport) void {
@@ -123,10 +138,10 @@ test "network transport retains and releases its shared resources" {
         .local = socket.address,
         .peer = socket.address,
         .core = core,
-        .route_updates = core.route_commands,
+        .route_table = &core.route_table,
     };
     transport.retainResources();
     transport.deinit();
-    try std.testing.expectEqual(@as(usize, 1), shared.refs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), shared.rc.count());
     shared.release();
 }

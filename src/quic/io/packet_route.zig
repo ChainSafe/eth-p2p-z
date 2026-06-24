@@ -1,4 +1,5 @@
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const channel = @import("channel.zig");
 const connection_waitset = @import("waitset.zig");
 
@@ -18,6 +19,10 @@ pub const RoutedPacket = struct {
     rx_mono_ns: ?u64 = null,
     rx_system_ns: ?u64 = null,
     gro_segment_size: ?u16 = null,
+    /// Non-null: `data` is a VIEW into this slab and `deinit` releases the held
+    /// slab reference (zero-copy recv path; GRO segments are sibling views).
+    /// Null: `data` is an owned heap copy (pool-exhausted fallback, non-recv).
+    slab: ?*SlabPool.Slab = null,
     data: []u8,
 
     pub const Meta = struct {
@@ -50,12 +55,41 @@ pub const RoutedPacket = struct {
         };
     }
 
+    /// A zero-copy packet view into `slab`'s buffer. Acquires one slab
+    /// reference (released by `deinit`); `view` must lie inside the slab.
+    pub fn initView(
+        slab: *SlabPool.Slab,
+        view: []u8,
+        from: std.Io.net.IpAddress,
+        to: std.Io.net.IpAddress,
+        meta: Meta,
+    ) ?RoutedPacket {
+        if (view.len > max_udp_payload_len) return null;
+        slab.retain();
+        return .{
+            .allocator = undefined, // never used while `slab` is set
+            .from = from,
+            .to = to,
+            .rx_mono_ns = meta.rx_mono_ns,
+            .rx_system_ns = meta.rx_system_ns,
+            .gro_segment_size = meta.gro_segment_size,
+            .slab = slab,
+            .data = view,
+        };
+    }
+
     pub fn deinit(p: *RoutedPacket) void {
-        if (p.data.len > 0) p.allocator.free(p.data);
+        if (p.slab) |slab| {
+            slab.release();
+            p.slab = null;
+        } else if (p.data.len > 0) {
+            p.allocator.free(p.data);
+        }
         p.data = &.{};
     }
 
     pub fn disarm(p: *RoutedPacket) void {
+        p.slab = null;
         p.data = &.{};
     }
 
@@ -78,6 +112,146 @@ pub const RoutedPacket = struct {
     }
 };
 
+/// A refcounted pool of large receive buffers ("slabs"). The recv fiber
+/// bump-fills the current slab — each datagram becomes a zero-copy
+/// `RoutedPacket` VIEW into it — and retires it once the tail can't hold a
+/// maximum datagram. A slab stays pinned while connections hold its views in
+/// their bounded inboxes, returning to the free list on the last release; when
+/// every slab is pinned the recv path heap-copies so the fiber never blocks.
+///
+/// Lifetime: the endpoint holds one pool reference (dropped in closeListener
+/// after the recv fiber exits), every live slab holds one, so in-flight views
+/// outlive the listener — the last view frees its slab, the last slab the pool.
+pub const SlabPool = struct {
+    allocator: std.mem.Allocator,
+    /// One spin lock guards free/live_slabs/closing. `Slab.release` runs on
+    /// whatever fiber drops the last view, with no `io` handle for an
+    /// `std.Io.Mutex`; critical sections are just a list op + counter.
+    spin: std.atomic.Value(bool) = .init(false),
+    free: std.ArrayList(*Slab) = .empty,
+    /// Slabs ever created and not yet destroyed (free + checked out).
+    live_slabs: usize = 0,
+    max_slabs: usize,
+    slab_bytes: usize,
+    closing: bool = false,
+    rc: AtomicRc = .{},
+
+    pub const Slab = struct {
+        pool: *SlabPool,
+        buf: []u8,
+        /// Views + the recv fiber's cursor hold. Reaching zero returns the
+        /// slab to the pool's free list (or destroys it when the pool is
+        /// closing).
+        rc: AtomicRc = .{},
+
+        pub fn retain(slab: *Slab) void {
+            slab.rc.retainChecked();
+        }
+
+        pub fn release(slab: *Slab) void {
+            if (!slab.rc.releaseChecked()) return;
+            slab.pool.recycle(slab);
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, max_slabs: usize, slab_bytes: usize) std.mem.Allocator.Error!*SlabPool {
+        std.debug.assert(slab_bytes >= max_udp_payload_len);
+        const pool = try allocator.create(SlabPool);
+        pool.* = .{
+            .allocator = allocator,
+            .max_slabs = max_slabs,
+            .slab_bytes = slab_bytes,
+        };
+        return pool;
+    }
+
+    /// Check a slab out with one reference (the caller's cursor hold), or null
+    /// when every slab is pinned (the caller falls back to heap copies).
+    pub fn acquire(pool: *SlabPool) ?*Slab {
+        pool.lock();
+        defer pool.unlock();
+        if (pool.closing) return null;
+        if (pool.free.pop()) |slab| {
+            slab.rc = .{}; // fresh single reference for the caller
+            return slab;
+        }
+        if (pool.live_slabs >= pool.max_slabs) return null;
+        const slab = pool.allocator.create(Slab) catch return null;
+        const buf = pool.allocator.alloc(u8, pool.slab_bytes) catch {
+            pool.allocator.destroy(slab);
+            return null;
+        };
+        slab.* = .{ .pool = pool, .buf = buf };
+        pool.live_slabs += 1;
+        pool.rc.retainChecked(); // the slab's reference on the pool
+        return slab;
+    }
+
+    /// The endpoint drops its pool reference; the pool (and any still-pinned
+    /// slabs) are freed once the last slab reference unwinds.
+    pub fn release(pool: *SlabPool) void {
+        {
+            pool.lock();
+            defer pool.unlock();
+            pool.closing = true;
+            // Free-listed slabs can be destroyed immediately; each drops its
+            // pool reference (never the last: the caller still holds one).
+            while (pool.free.pop()) |slab| {
+                pool.allocator.free(slab.buf);
+                pool.allocator.destroy(slab);
+                pool.live_slabs -= 1;
+                _ = pool.rc.releaseChecked();
+            }
+            pool.free.deinit(pool.allocator);
+            pool.free = .empty;
+        }
+        if (pool.rc.releaseChecked()) pool.destroy();
+    }
+
+    fn recycle(pool: *SlabPool, slab: *Slab) void {
+        // Drop the pool reference only AFTER unlocking: destroying the pool
+        // inside the lock could free it under a fiber spinning in lock().
+        // Deferring past unlock makes the last decrementer the last toucher.
+        var drop_ref = false;
+        {
+            pool.lock();
+            defer pool.unlock();
+            if (pool.closing) {
+                pool.allocator.free(slab.buf);
+                pool.allocator.destroy(slab);
+                pool.live_slabs -= 1;
+                drop_ref = true;
+            } else {
+                pool.free.append(pool.allocator, slab) catch {
+                    // OOM growing the free list: destroy the slab instead of
+                    // leaking it; capacity shrinks until memory recovers.
+                    pool.allocator.free(slab.buf);
+                    pool.allocator.destroy(slab);
+                    pool.live_slabs -= 1;
+                    drop_ref = true;
+                };
+            }
+        }
+        if (drop_ref and pool.rc.releaseChecked()) pool.destroy();
+    }
+
+    fn destroy(pool: *SlabPool) void {
+        const allocator = pool.allocator;
+        pool.free.deinit(allocator);
+        allocator.destroy(pool);
+    }
+
+    fn lock(pool: *SlabPool) void {
+        while (pool.spin.swap(true, .acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(pool: *SlabPool) void {
+        pool.spin.store(false, .release);
+    }
+};
+
 fn dropRoutedPacket(packet: *RoutedPacket, _: std.Io) void {
     packet.deinit();
 }
@@ -88,13 +262,11 @@ fn routedPacketCost(packet: *const RoutedPacket) usize {
 
 const PacketChannel = channel.Bounded(RoutedPacket, dropRoutedPacket, routedPacketCost);
 
-pub const IncomingPacket = RoutedPacket;
-
 pub const IncomingPacketChannel = struct {
     queue: *PacketChannel.State,
     notify_mutex: std.Io.Mutex = .init,
     waitset: ?*connection_waitset.WaitSet = null,
-    refs: std.atomic.Value(usize) = .init(1),
+    rc: AtomicRc = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -139,14 +311,11 @@ pub const IncomingPacketChannel = struct {
     }
 
     pub fn retain(inbox: *IncomingPacketChannel) void {
-        const previous = inbox.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        inbox.rc.retainChecked();
     }
 
     pub fn release(inbox: *IncomingPacketChannel) void {
-        const previous = inbox.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!inbox.rc.releaseChecked()) return;
 
         const allocator = inbox.queue.allocator;
         inbox.queue.release();

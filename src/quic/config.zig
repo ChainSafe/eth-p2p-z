@@ -8,6 +8,11 @@ const tls = @import("../security/tls.zig");
 pub const ConfigError = error{ QuicheConfigFailed, InvalidOptions };
 pub const default_handshake_timeout_ns: u64 = 10 * std.time.ns_per_s;
 
+/// RFC 9000 §14.1: a QUIC endpoint must support a 1200-byte UDP payload. Initials
+/// are padded to >=1200 and smaller ones are dropped by compliant peers (and by
+/// the router's min-Initial gate), so sub-1200 sizes silently break the handshake.
+const min_udp_payload_size: usize = 1200;
+
 pub const CongestionControl = enum {
     reno,
     cubic,
@@ -22,13 +27,16 @@ pub const CongestionControl = enum {
     }
 };
 
-/// QUIC transport-parameter and quiche-config knobs that are visible to the
-/// peer (idle timeout, flow control, congestion control, etc.). Splitting
-/// these out from the local-only actor/endpoint settings keeps two distinct
-/// concerns separate: things the peer negotiates against us, vs. things only
-/// our own IO loop sees.
+/// QUIC transport-parameter and quiche-config knobs visible to the peer (idle
+/// timeout, flow control, congestion control, etc.), kept separate from the
+/// local-only actor/endpoint settings the peer never negotiates against.
 pub const TransportOptions = struct {
     max_idle_timeout_ms: u64 = 30_000,
+    /// After this long with no outbound packet, the actor sends an ack-eliciting
+    /// PING (`quiche_conn_send_ack_eliciting`) resetting BOTH idle timers, so an
+    /// idle connection survives `max_idle_timeout_ms`. Must be
+    /// `< max_idle_timeout_ms`; 0 disables.
+    keep_alive_period_ms: u64 = 15_000,
     initial_max_data: u64 = 1024 * 1024,
     initial_max_stream_data_bidi_local: u64 = 256 * 1024,
     initial_max_stream_data_bidi_remote: u64 = 256 * 1024,
@@ -45,15 +53,13 @@ pub const TransportOptions = struct {
     /// address on quiche path migration.
     disable_active_migration: bool = true,
     enable_pacing: bool = true,
-    /// RFC 9000 §8.1: the server MUST NOT send more than `factor *` bytes
-    /// before validating the client's address. Quiche defaults to 3 already;
-    /// surface it here so operators can tighten or relax for tunnels.
+    /// RFC 9000 §8.1: the server MUST NOT send more than `factor *` bytes before
+    /// validating the client's address. Surfaced so operators can tune for tunnels.
     max_amplification_factor: u64 = 3,
     /// Maximum delay before sending an ACK frame, in milliseconds. Lower
     /// values reduce loss-recovery latency at the cost of more ACK traffic.
     max_ack_delay_ms: u64 = 25,
-    /// Congestion control algorithm. tokio-quiche defaults to BBR2; we use
-    /// CUBIC because libp2p sees a wider range of network conditions and
+    /// CUBIC (not BBR2): libp2p sees a wide range of network conditions and
     /// CUBIC is friendlier to non-BBR peers.
     congestion_control: CongestionControl = .cubic,
     /// HyStart++ (RFC 9406) — exits slow-start earlier on RTT growth.
@@ -71,12 +77,12 @@ pub const TransportOptions = struct {
     /// disables the cap (quiche pacer chooses based on cwnd/RTT).
     max_pacing_rate_bps: u64 = 0,
     /// When true, retired DCIDs are not reused for outgoing path probes,
-    /// which forces fresh CIDs after migration. Default matches quiche.
+    /// forcing fresh CIDs after migration.
     disable_dcid_reuse: bool = false,
     /// Delegate certificate-chain verification to quiche/BoringSSL. libp2p
     /// peer identity verification still runs after the TLS handshake.
     verify_peer: bool = false,
-    /// Send QUIC GREASE values. Matches tokio-quiche/quiche default behavior.
+    /// Send QUIC GREASE values.
     grease: bool = true,
     /// Enable TLS key logging for local diagnostics.
     log_keys: bool = false,
@@ -85,16 +91,20 @@ pub const TransportOptions = struct {
     enable_early_data: bool = false,
     /// ACK delay exponent transport parameter. RFC 9000 default is 3.
     ack_delay_exponent: u64 = 3,
-    /// Optional server-side stateless reset token.
+    /// Server-only: quiche reads it only for `is_server` connections, so on our
+    /// dual-role endpoint's shared config it applies to accepted connections and
+    /// is ignored for outbound dials.
     stateless_reset_token: ?[16]u8 = null,
-    /// Quiche CUBIC idle restart behavior toggle exposed for parity.
+    /// Toggle quiche's CUBIC idle-restart behavior.
     enable_cubic_idle_restart_fix: bool = false,
 };
 
-/// Per-connection actor tuning: inbound packet routing buffers, outbound
-/// batching, per-stream queues, and datagram pools. These never reach the
-/// wire — they only shape how our own actor handles packets it has already
-/// received or queued for send.
+/// Per-connection actor tuning (never reaches the wire): inbound routing
+/// buffers, outbound batching, per-stream queues, datagram pools.
+///
+/// The queue-length knobs ARE the cross-fiber backpressure budget — bounded
+/// credit between producer and consumer fibers — so they must stay >= 1 (a
+/// model-critical invariant, validated below).
 pub const ActorOptions = struct {
     /// Maximum queued inbound UDP payload bytes per connection. Packet metadata
     /// and preallocated queue slots are bounded separately by queue length.
@@ -103,16 +113,20 @@ pub const ActorOptions = struct {
     outbound_batch_size: usize = 32,
     control_queue_len: usize = 256,
     stream_inbound_queue_bytes: usize = 48 * 1024,
-    stream_outbound_queue_bytes: usize = 48 * 1024,
+    /// Per-stream outbound cross-fiber buffer (writer fiber -> connection actor).
+    /// `quantum` = credit chunk per drain (~one 64KB UDP-GSO super-packet); `queue`
+    /// = total the writer may get ahead. Do NOT exceed the per-stream QUIC send
+    /// window (`initial_max_stream_data_bidi_*`) — buffering past it is wasted.
+    /// Memory cost is `queue_bytes` x concurrent outbound streams.
+    stream_outbound_queue_bytes: usize = 128 * 1024,
     stream_inbound_quantum_bytes: usize = 32 * 1024,
-    stream_outbound_quantum_bytes: usize = 32 * 1024,
+    stream_outbound_quantum_bytes: usize = 64 * 1024,
     stream_accept_queue_len: usize = 64,
     recv_datagram_slots: usize = 48,
     send_datagram_queue_len: usize = 48,
-    /// Capacity of the per-connection MPSC queue that handles use to signal
-    /// "this stream has new outbound bytes" to the actor. Sized to cover the
-    /// expected concurrent-stream count; on overflow the actor falls back to
-    /// a full stream scan, which is correct but slower. Must be ≥ 1.
+    /// MPSC queue signaling "this stream has new outbound bytes" to the actor.
+    /// On overflow the actor falls back to a full stream scan (correct but
+    /// slower). Must be >= 1.
     outbound_pending_queue_len: usize = 256,
 };
 
@@ -120,8 +134,24 @@ pub const ActorOptions = struct {
 /// per-connection handshake deadline.
 pub const EndpointOptions = struct {
     connection_accept_queue_len: usize = 64,
+    /// Receive-slab pool: datagrams become zero-copy views into pooled buffers
+    /// (a GRO super-datagram splits into sibling views of one slab). Bounds how
+    /// many slabs may be pinned at once; exhaustion degrades to the heap-copy
+    /// path. 0 disables the pool.
+    recv_slab_slots: usize = 64,
+    /// Bytes per slab; must hold one maximum UDP datagram (65_535). The default
+    /// IS one datagram — finest pinning granularity (frees once its one packet
+    /// is consumed). Larger values amortize pool round-trips but pin the slab
+    /// until its LAST view releases, so one slow connection can hold slabs
+    /// hostage; raise only with measurements in hand.
+    recv_slab_slot_bytes: usize = 65_535,
     handshake_timeout_ns: u64 = default_handshake_timeout_ns,
     enable_udp_gro: bool = true,
+    /// Send-path UDP GSO (Linux >= 4.18, probed at bind): equal-sized packets to
+    /// one peer go out as one sendmsg with a UDP_SEGMENT cmsg. Falls back to
+    /// per-packet sends where unsupported or on the first live GSO failure (some
+    /// drivers pass the probe but fail real segmented sends).
+    enable_udp_gso: bool = true,
     /// Opt-in because packet-info rewrites quiche's local path address on
     /// wildcard sockets; transparent-proxy users can enable it together with
     /// source-address send control.
@@ -131,6 +161,15 @@ pub const EndpointOptions = struct {
     enable_orig_dst: bool = false,
     enable_rx_timestamps: bool = true,
     socket_mark: ?u32 = null,
+    /// Restrict the socket to plain `sendmsg`/`recvmsg` with no ancillary control
+    /// data — for the Shadow simulator, which supports none of `recvmmsg`/`sendmmsg`,
+    /// UDP GSO/GRO, `IP_PKTINFO`/`IPV6_RECVPKTINFO`, `IP_RECVORIGDSTADDR`,
+    /// ECN/`IP_RECVTOS`, or timestamp cmsgs. Forces all GRO/pktinfo/timestamp
+    /// toggles above off regardless of their value; this is exactly how macOS
+    /// already runs (and interops), so it's low-risk. Loses the per-packet local
+    /// destination (`IP_PKTINFO`), relying on the bound address instead — correct
+    /// for a single-homed bind.
+    shadow_compatible: bool = false,
 };
 
 pub const Options = struct {
@@ -152,8 +191,16 @@ pub fn validateOptions(opts: Options) ConfigError!Options {
 fn validateTransport(opts: TransportOptions) ConfigError!void {
     if (opts.max_recv_udp_payload_size > packet_route.max_udp_payload_len) return error.InvalidOptions;
     if (opts.max_send_udp_payload_size > connection_actor.max_flush_packet_len) return error.InvalidOptions;
-    if (opts.max_recv_udp_payload_size == 0 or opts.max_send_udp_payload_size == 0) return error.InvalidOptions;
+    // >= min_udp_payload_size also subsumes the non-zero requirement.
+    if (opts.max_recv_udp_payload_size < min_udp_payload_size) return error.InvalidOptions;
+    if (opts.max_send_udp_payload_size < min_udp_payload_size) return error.InvalidOptions;
     if (opts.max_amplification_factor == 0) return error.InvalidOptions;
+    // Keep-alive must fire BEFORE the (local) idle timer, or the PING lands after
+    // the connection has already idle-closed and the feature silently does nothing.
+    // (0 disables keep-alive.) This guards the local pair; the remote half — a peer
+    // advertising a SHORTER idle timeout — is handled at runtime by the actor
+    // clamping the period to peer_max_idle_timeout/2 (clampKeepAliveToPeerIdle).
+    if (opts.keep_alive_period_ms != 0 and opts.keep_alive_period_ms >= opts.max_idle_timeout_ms) return error.InvalidOptions;
     // RFC 9000 §13.2.1 caps `max_ack_delay` at 2^14 - 1 (16383ms).
     if (opts.max_ack_delay_ms >= (1 << 14)) return error.InvalidOptions;
     // RFC 9000 §18.2 caps ack_delay_exponent at 20.
@@ -185,6 +232,9 @@ fn validateActor(opts: ActorOptions) ConfigError!void {
 fn validateEndpoint(opts: EndpointOptions) ConfigError!void {
     if (opts.connection_accept_queue_len == 0) return error.InvalidOptions;
     if (opts.handshake_timeout_ns == 0) return error.InvalidOptions;
+    // A slab must hold at least one maximum UDP datagram or the recv path
+    // could never use it (permanent silent fallback).
+    if (opts.recv_slab_slots > 0 and opts.recv_slab_slot_bytes < 65_535) return error.InvalidOptions;
 }
 
 pub fn buildQuicheConfig(opts: Options) ConfigError!*quiche.quiche_config {
@@ -229,6 +279,8 @@ pub fn buildQuicheConfig(opts: Options) ConfigError!*quiche.quiche_config {
     if (t.stateless_reset_token) |token| {
         quiche.quiche_config_set_stateless_reset_token(cfg, token[0..].ptr);
     }
+    // Datagrams are always enabled for libp2p (the `true` is intentional, not an
+    // Option); only the queue sizes are user-tunable via ActorOptions.
     quiche.quiche_config_enable_dgram(cfg, true, w.recv_datagram_slots, w.send_datagram_queue_len);
     return cfg;
 }
@@ -273,6 +325,10 @@ test "rejects invalid transport options" {
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = connection_actor.max_flush_packet_len + 1 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = 0 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = 0 } }));
+    // Reject just-below the min_udp_payload_size floor; accept the boundary.
+    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = min_udp_payload_size - 1 } }));
+    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = min_udp_payload_size - 1 } }));
+    _ = try validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = min_udp_payload_size, .max_send_udp_payload_size = min_udp_payload_size } });
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_amplification_factor = 0 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_ack_delay_ms = 1 << 14 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .ack_delay_exponent = 21 } }));

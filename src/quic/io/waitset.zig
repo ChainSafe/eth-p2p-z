@@ -59,6 +59,21 @@ pub const WaitSet = struct {
         if (ws.peek().any()) return;
         return ws.signal.waitTimeout(io, observed, timeout);
     }
+
+    /// Park on an epoch edge, ignoring the readiness bits, for waiters that do
+    /// NOT clear the bits via `take` (e.g. a connection handle in acceptStream,
+    /// vs. the owning actor that takes the bits each loop). Such a waiter cannot
+    /// use the level-triggered `wait`/`waitTimeout`: those return on ANY set bit,
+    /// and the actor routinely sets bits this waiter never consumes, so it would
+    /// spin and starve the actor. Caller must capture `observed` via `observe`
+    /// BEFORE re-checking its condition, else a notify in between is lost.
+    pub fn waitEpoch(ws: *WaitSet, io: std.Io, observed: u32) std.Io.Cancelable!void {
+        return ws.signal.wait(io, observed);
+    }
+
+    pub fn waitEpochTimeout(ws: *WaitSet, io: std.Io, observed: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        return ws.signal.waitTimeout(io, observed, timeout);
+    }
 };
 
 test "connection waitset coalesces typed readiness" {

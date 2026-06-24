@@ -150,7 +150,11 @@ test "ipv6 unspecified listener accepts ipv4 dial via dual-stack socket" {
     defer fixture.deinit();
 
     const server_addr = fixture.server.bind(.{ .ip6 = .unspecified(0) }) catch |err| switch (err) {
-        error.AddressUnavailable, error.AddressFamilyUnsupported => return,
+        // Dual-stack rides on the OS default for AF_INET6 sockets (the bind
+        // path sets no `ip6_only` flag — the std and zio backends apply it
+        // with opposite meanings; see router loop.bind). Skip only where the
+        // sandbox lacks IPv6 entirely.
+        error.AddressUnavailable, error.AddressFamilyUnsupported, error.OptionUnsupported => return error.SkipZigTest,
         else => |e| return e,
     };
 

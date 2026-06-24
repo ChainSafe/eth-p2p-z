@@ -1,0 +1,428 @@
+//! End-to-end multi-executor integration tests (Layer 2-6 net): two real QUIC
+//! endpoints over loopback UDP on a REAL `zio.Runtime` with >=2 executors, with
+//! the server `accept()` on a concurrent fiber so dial+accept progress across
+//! executors under genuine cross-executor scheduling — the regression net for the
+//! multi-executor refactor of the upper layers.
+//!
+//! Pulls BoringSSL (via the quiche dep), so it is a separate, slower-compiling
+//! target from the Layer-0 zio-io-test. Run: `zig build zio-integ-test`.
+//!
+//! Teardown is cooperative (a stop flag + closing `route_commands` to wake the
+//! router's select arm), not `router_future.cancel()`: cancel-based teardown of
+//! the router's multi-arm `Select` deadlocks on macOS kqueue.
+
+const std = @import("std");
+const zio = @import("zio");
+const support = @import("quic/endpoint/test_support.zig");
+const switch_mod = @import("switch.zig");
+const identity = @import("identity.zig");
+const protocols = @import("protocols.zig");
+const quic = @import("quic.zig");
+const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
+
+const testing = std.testing;
+const AcceptCtx = support.AcceptCtx;
+const TwoEndpoints = support.TwoEndpoints;
+const closeStreamForTest = support.closeStreamForTest;
+const receiveTimeout = support.receiveTimeout;
+const default_handshake_timeout_ns = support.default_handshake_timeout_ns;
+const Switch = switch_mod.Switch;
+const SwitchConnection = switch_mod.SwitchConnection;
+
+/// Spin a multi-executor zio runtime and run `root(io)` to completion on the
+/// main executor; worker fibers (the server accept loop, the connection actors,
+/// the router) run on the other executor(s). Propagates the root fiber's error.
+fn runRoot(comptime executors: u8, comptime root: anytype) !void {
+    const rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(executors) });
+    defer rt.deinit();
+    var handle = try rt.spawn(root, .{rt.io()});
+    defer handle.cancel();
+    return handle.join();
+}
+
+/// Full loopback: dial + handshake (server accepts on a concurrent fiber),
+/// then a bidirectional stream echo. Shared by the exact(2) and exact(4) tests.
+fn loopbackHandshakeAndEcho(io: std.Io) !void {
+    const allocator = testing.allocator;
+
+    var fixture = try TwoEndpoints.init(
+        allocator,
+        io,
+        .{ .endpoint = .{ .connection_accept_queue_len = 1 } },
+        .{},
+    );
+    defer fixture.deinit();
+
+    const server_addr = try fixture.bindServerLoopback();
+    _ = try fixture.bindClientLoopback();
+
+    var server_pk = try fixture.server_host.publicKey(allocator);
+    defer if (server_pk.data) |data| allocator.free(data);
+
+    // Server accept runs on a concurrent fiber (a worker executor), so dial and
+    // accept make progress simultaneously across executors — no OS thread.
+    var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
+    var accept_future = try std.Io.concurrent(io, AcceptCtx.run, .{&accept_ctx});
+
+    const client_conn = try fixture.client.dial(server_addr, .{
+        .timeout = receiveTimeout(default_handshake_timeout_ns),
+        .expected_peer_key = &server_pk,
+    });
+    defer client_conn.deinit();
+
+    accept_future.await(io);
+    if (accept_ctx.err) |err| return err;
+    const server_conn = accept_ctx.conn orelse return error.TestExpectedConn;
+    defer server_conn.deinit();
+
+    try testing.expect(client_conn.stats().packets_sent > 0);
+    try testing.expect(server_conn.stats().packets_recv > 0);
+
+    // Bidirectional stream echo: client opens + writes, server accepts + reads +
+    // replies, client reads the reply. Exercises stream byte queues + the
+    // outbound-signal / accept-queue waitset paths across executors.
+    const outbound = try client_conn.openStream(io);
+    defer outbound.deinit();
+    defer closeStreamForTest(io, outbound);
+
+    const payload = "multiexecutor-loopback-ping";
+    try outbound.writeAll(io, payload, .{});
+
+    const inbound = try server_conn.acceptStream(io, .{});
+    defer inbound.deinit();
+    defer closeStreamForTest(io, inbound);
+
+    var recv_buf: [64]u8 = undefined;
+    try inbound.readAll(io, recv_buf[0..payload.len], .{});
+    try testing.expectEqualStrings(payload, recv_buf[0..payload.len]);
+
+    const reply = "pong";
+    try inbound.writeAll(io, reply, .{});
+
+    var reply_buf: [16]u8 = undefined;
+    try outbound.readAll(io, reply_buf[0..reply.len], .{});
+    try testing.expectEqualStrings(reply, reply_buf[0..reply.len]);
+}
+
+test "endpoint loopback: handshake + stream echo on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try loopbackHandshakeAndEcho(io);
+        }
+    }.root);
+}
+
+test "endpoint loopback: handshake + stream echo on exact(4)" {
+    try runRoot(4, struct {
+        fn root(io: std.Io) !void {
+            try loopbackHandshakeAndEcho(io);
+        }
+    }.root);
+}
+
+// ---------------------------------------------------------------------------
+// Switch connection teardown under multi-executor scheduling.
+//
+// Regression guard for a teardown deadlock: the inbound dispatcher parks inside
+// acceptStream on the connection's accept waitset for a stream that never
+// arrives; a cross-executor cancel to unblock it can lose its wakeup, hanging
+// the join forever. Teardown must instead use a PERSISTENT signal — closing the
+// connection marks it closed and notifies the accept waitset (level-triggered),
+// so the parked acceptStream wakes, observes isClosed(), returns
+// ConnectionClosed, and the dispatcher loop exits on its own. The loop surfaces
+// the intermittent lost-wakeup race: a hang is the deadlock, clean completion
+// proves the persistent-signal teardown reliable.
+
+/// Minimal inbound handler so the server has a registered protocol (an empty
+/// registry makes the dispatcher exit immediately with NoRegisteredProtocols,
+/// which would defeat the "dispatcher parked in acceptStream" precondition).
+const NoopHandler = struct {
+    fn run(_: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+        var b: [1]u8 = undefined;
+        stream.readAll(handler_io, &b, .{}) catch {};
+    }
+};
+
+fn switchDispatcherTeardownLoop(io: std.Io, iterations: usize) !void {
+    const allocator = testing.allocator;
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    var noop = NoopHandler{};
+    try server.addProtocolService(
+        "/test/teardown/1.0.0",
+        protocols.streamHandlerService(NoopHandler, NoopHandler.run, &noop),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        // Accept on a concurrent fiber so dial + accept make progress across
+        // executors (the multi-executor scheduling the deadlock needs).
+        const AcceptSwitchCtx = struct {
+            sw: *Switch,
+            conn: ?*SwitchConnection = null,
+            err: ?anyerror = null,
+
+            fn run(ctx: *@This()) void {
+                ctx.conn = ctx.sw.accept() catch |err| {
+                    ctx.err = err;
+                    return;
+                };
+            }
+        };
+        var accept_ctx = AcceptSwitchCtx{ .sw = server };
+        var accept_future = try std.Io.concurrent(io, AcceptSwitchCtx.run, .{&accept_ctx});
+
+        const client_conn = try client.dial(dial_addr, .{
+            .timeout = receiveTimeout(default_handshake_timeout_ns),
+        });
+        defer client_conn.deinit();
+
+        accept_future.await(io);
+        if (accept_ctx.err) |err| return err;
+        const server_conn = accept_ctx.conn orelse return error.TestExpectedConn;
+
+        // Start the inbound dispatcher: with no inbound stream pending it blocks
+        // inside acceptStream, parked on the connection's accept waitset. This is
+        // the precondition for the deadlock — teardown must unblock it.
+        try server_conn.startInboundDispatcher(.{});
+
+        // Give the dispatcher a moment to actually reach the parked wait
+        // (otherwise it might still be spawning and never exercise the race).
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+
+        // The operation under test: this drives shutdownAndDestroy -> cleanup,
+        // which must wake the parked dispatcher and join it without hanging.
+        server_conn.deinit();
+    }
+}
+
+// 50 bring-up/teardown cycles per executor count: the race surfaces on the
+// first iteration, so this is ample as a permanent guard while keeping the
+// default suite fast.
+const teardown_loop_iterations: usize = 50;
+
+test "switch connection teardown: parked dispatcher unblocks on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try switchDispatcherTeardownLoop(io, teardown_loop_iterations);
+        }
+    }.root);
+}
+
+test "switch connection teardown: parked dispatcher unblocks on exact(4)" {
+    try runRoot(4, struct {
+        fn root(io: std.Io) !void {
+            try switchDispatcherTeardownLoop(io, teardown_loop_iterations);
+        }
+    }.root);
+}
+
+// ---------------------------------------------------------------------------
+// Dual-stack listener on the production (zio) backend.
+//
+// Regression guard for the `ip6_only` backend divergence: std.Io.Threaded
+// applies the flag INVERTED (true -> IPV6_V6ONLY=0) while zio is literal (true
+// -> IPV6_V6ONLY=1), so the bind path sets no flag and relies on the OS default
+// (dual-stack on Linux and macOS), verifying it post-bind. Pins production-backend
+// behavior the std-backend twin in router/loop_tests.zig cannot see: a [::]
+// listener must accept an IPv4 dial.
+
+/// Bind the server on `[::]:0`, dial it over IPv4 loopback: the dual-stack
+/// listener must complete the handshake with the v4-mapped peer.
+fn loopbackDualStackDial(io: std.Io) !void {
+    const allocator = testing.allocator;
+
+    var fixture = try TwoEndpoints.init(
+        allocator,
+        io,
+        .{ .endpoint = .{ .connection_accept_queue_len = 1 } },
+        .{},
+    );
+    defer fixture.deinit();
+
+    const server_addr = fixture.server.bind(.{ .ip6 = .unspecified(0) }) catch |err| switch (err) {
+        // Some sandboxes lack IPv6 entirely; skip rather than fail there.
+        error.AddressUnavailable, error.AddressFamilyUnsupported, error.OptionUnsupported => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    _ = try fixture.bindClientLoopback();
+
+    var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
+    var accept_future = try std.Io.concurrent(io, AcceptCtx.run, .{&accept_ctx});
+
+    const dial_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(server_addr.getPort()) };
+    const client_conn = try fixture.client.dial(dial_addr, .{
+        .timeout = receiveTimeout(default_handshake_timeout_ns),
+    });
+    defer client_conn.deinit();
+
+    accept_future.await(io);
+    if (accept_ctx.err) |err| return err;
+    const server_conn = accept_ctx.conn orelse return error.TestExpectedConn;
+    defer server_conn.deinit();
+}
+
+test "endpoint loopback: ipv6 unspecified listener accepts an ipv4 dial on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try loopbackDualStackDial(io);
+        }
+    }.root);
+}
+
+// ---------------------------------------------------------------------------
+// Graceful half-close: a peer must observe EOF after the writer half-closes
+// (closeWrite -> FIN) and tears the stream down — the standard libp2p
+// /perf/1.0.0 responder pattern. Pins for our stream layer the quinn/quic-go
+// guarantee that buffered data + FIN are delivered even after the handle closes.
+
+const HalfCloseMode = enum {
+    // Switch inbound-handler teardown: graceful bidi close() then deinit().
+    close_then_deinit,
+    // Half-close the write side (FIN) then drop the handle.
+    close_write_then_deinit,
+};
+
+const HalfCloseServerCtx = struct {
+    conn: *quic.Connection,
+    io: std.Io,
+    mode: HalfCloseMode,
+    err: ?anyerror = null,
+
+    fn run(ctx: *HalfCloseServerCtx) void {
+        const io = ctx.io;
+        const inbound = ctx.conn.acceptStream(io, .{ .timeout = receiveTimeout(5 * std.time.ns_per_s) }) catch |err| {
+            ctx.err = err;
+            return;
+        };
+        // Drain the client's upload to EOF (needs the client's FIN). Reading
+        // the peer's FIN must NOT shut our own write side down — that is the
+        // half-close invariant this test pins.
+        var dbuf: [256]u8 = undefined;
+        while (true) {
+            _ = inbound.read(io, &dbuf, .{}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    ctx.err = err;
+                    inbound.deinit();
+                    return;
+                },
+            };
+        }
+        // Reply, half-close, then drop the handle immediately: the buffered
+        // reply + FIN must still reach the peer.
+        inbound.writeAll(io, "pong", .{}) catch |err| {
+            ctx.err = err;
+            inbound.deinit();
+            return;
+        };
+        switch (ctx.mode) {
+            .close_then_deinit => inbound.close(io) catch {},
+            .close_write_then_deinit => inbound.closeWrite(io) catch {},
+        }
+        inbound.deinit();
+    }
+};
+
+fn halfCloseEofRoot(io: std.Io, mode: HalfCloseMode) !void {
+    const allocator = testing.allocator;
+
+    var fixture = try TwoEndpoints.init(
+        allocator,
+        io,
+        .{ .endpoint = .{ .connection_accept_queue_len = 1 } },
+        .{},
+    );
+    defer fixture.deinit();
+
+    const server_addr = try fixture.bindServerLoopback();
+    _ = try fixture.bindClientLoopback();
+
+    var server_pk = try fixture.server_host.publicKey(allocator);
+    defer if (server_pk.data) |data| allocator.free(data);
+
+    var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
+    var accept_future = try std.Io.concurrent(io, AcceptCtx.run, .{&accept_ctx});
+
+    const client_conn = try fixture.client.dial(server_addr, .{
+        .timeout = receiveTimeout(default_handshake_timeout_ns),
+        .expected_peer_key = &server_pk,
+    });
+    defer client_conn.deinit();
+
+    accept_future.await(io);
+    if (accept_ctx.err) |err| return err;
+    const server_conn = accept_ctx.conn orelse return error.TestExpectedConn;
+    defer server_conn.deinit();
+
+    var server_ctx = HalfCloseServerCtx{ .conn = server_conn, .io = io, .mode = mode };
+    var server_future = try std.Io.concurrent(io, HalfCloseServerCtx.run, .{&server_ctx});
+
+    const outbound = try client_conn.openStream(io);
+    defer outbound.deinit();
+
+    try outbound.writeAll(io, "upload-payload", .{});
+    try outbound.closeWrite(io);
+
+    // Read the reply to EOF. A per-read timeout turns a lost FIN into a
+    // Timeout error (test failure) instead of a hang.
+    var received: usize = 0;
+    var rbuf: [256]u8 = undefined;
+    while (true) {
+        const n = outbound.read(io, &rbuf, .{ .timeout = receiveTimeout(3 * std.time.ns_per_s) }) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err, // Timeout/ResetByPeer here == the reply or FIN was lost.
+        };
+        received += n;
+    }
+
+    server_future.await(io);
+    if (server_ctx.err) |err| return err;
+
+    try testing.expectEqual(@as(usize, 4), received); // "pong"
+}
+
+test "loopback half-close: peer observes EOF after responder close + deinit on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try halfCloseEofRoot(io, .close_then_deinit);
+        }
+    }.root);
+}
+
+test "loopback half-close: peer observes EOF after responder closeWrite + deinit on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try halfCloseEofRoot(io, .close_write_then_deinit);
+        }
+    }.root);
+}

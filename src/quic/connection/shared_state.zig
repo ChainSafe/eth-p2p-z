@@ -16,6 +16,7 @@
 //! from the handle by construction.
 
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const handle_pool = @import("../datagram/handle_pool.zig");
 const datagram_queue = @import("../datagram/queue.zig");
 const stage_mod = @import("stage.zig");
@@ -46,7 +47,8 @@ pub const OutboundPendingQueue = std.Io.Queue(u64);
 pub const SharedState = struct {
     allocator: Allocator,
     io: std.Io,
-    refs: std.atomic.Value(usize) = .init(2),
+    /// Two holders at birth: one ref for the handle, one for the actor.
+    rc: AtomicRc = .initCount(2),
 
     // Channels (storage owned here; both sides hold pointers to `inbox`,
     // `accept_queue`, etc. but never to other parts of this struct).
@@ -144,14 +146,11 @@ pub const SharedState = struct {
     }
 
     pub fn retain(self: *SharedState) void {
-        const previous = self.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        self.rc.retainChecked();
     }
 
     pub fn release(self: *SharedState) void {
-        const previous = self.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!self.rc.releaseChecked()) return;
         self.destroy();
     }
 
@@ -241,6 +240,10 @@ pub const SharedState = struct {
         self.waitset.notify(self.io, .{ .accepted_stream_pop = true });
     }
 
+    /// Wakes handle-side `acceptStream` waiters via the waitset's epoch bump.
+    /// The named bit has no actor consumer, so a parked actor also wakes once
+    /// and no-ops — accepted, since a dedicated accept signal would need every
+    /// close path to bump it too, and missing one hangs acceptStream forever.
     pub fn notifyAcceptedStreamPush(self: *SharedState) void {
         self.waitset.notify(self.io, .{ .accepted_stream_push = true });
     }

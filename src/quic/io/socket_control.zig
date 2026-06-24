@@ -8,6 +8,7 @@ pub const control_buffer_align = @alignOf(linux.cmsghdr);
 
 const cmsg_header_len = cmsgAlign(@sizeOf(linux.cmsghdr));
 const cmsg_space_udp_gro = cmsgSpace(@sizeOf(u16));
+const cmsg_space_udp_segment = cmsgSpace(@sizeOf(u16));
 const cmsg_space_ip_pktinfo = cmsgSpace(@sizeOf(std.posix.in_pktinfo));
 const cmsg_space_ip6_pktinfo = cmsgSpace(@sizeOf(std.posix.in6_pktinfo));
 const cmsg_space_sockaddr = cmsgSpace(@sizeOf(std.posix.sockaddr.storage));
@@ -20,18 +21,26 @@ pub const recv_control_buffer_len: usize =
     2 * cmsg_space_sockaddr +
     cmsg_space_timespec;
 
-pub const send_control_buffer_len: usize = @max(cmsg_space_ip_pktinfo, cmsg_space_ip6_pktinfo);
+pub const send_control_buffer_len: usize =
+    @max(cmsg_space_ip_pktinfo, cmsg_space_ip6_pktinfo) + cmsg_space_udp_segment;
 
 pub const Options = struct {
     enable_udp_gro: bool = true,
+    enable_udp_gso: bool = true,
     enable_pktinfo: bool = false,
     enable_orig_dst: bool = false,
     enable_rx_timestamps: bool = true,
     socket_mark: ?u32 = null,
+    /// For the Shadow network simulator: ignore the toggles above and apply no
+    /// cmsg sockopts or socket mark, yielding the all-false `Capabilities` macOS
+    /// already produces (basic `sendmsg`/`recvmsg`, which passes QUIC interop).
+    shadow_compatible: bool = false,
 };
 
 pub const Capabilities = struct {
     udp_gro: bool = false,
+    /// Kernel supports UDP_SEGMENT (GSO, Linux >= 4.18).
+    udp_gso: bool = false,
     // Packet-info socket options are negotiated per address family; dual-stack
     // sockets can support source control for one family and reject the other.
     pktinfo_v4: bool = false,
@@ -43,6 +52,27 @@ pub const Capabilities = struct {
 };
 
 pub const ConfigureError = std.posix.SetSockOptError;
+
+/// IPV6_V6ONLY optname, hardcoded because `std.posix.IPV6` is `void` on macOS:
+/// 26 on Linux, 27 on the BSDs/macOS.
+const ipv6_v6only_optname: u32 = if (builtin.os.tag == .linux) 26 else 27;
+
+/// Whether an AF_INET6 UDP socket accepts IPv4-mapped traffic (IPV6_V6ONLY ==
+/// 0). Read-only: settable only before bind, so the bind path relies on the OS
+/// default (dual-stack) and verifies here. Null if the platform can't report it.
+pub fn dualStackEnabled(socket: *const std.Io.net.Socket) ?bool {
+    var value: c_int = -1;
+    var len: std.posix.socklen_t = @sizeOf(c_int);
+    const rc = std.c.getsockopt(
+        socket.handle,
+        std.posix.IPPROTO.IPV6,
+        ipv6_v6only_optname,
+        @ptrCast(&value),
+        &len,
+    );
+    if (rc != 0) return null;
+    return value == 0;
+}
 
 pub fn sourceControlEnabled(caps: Capabilities, from: std.Io.net.IpAddress) bool {
     return switch (from) {
@@ -61,6 +91,9 @@ pub const ParsedControl = struct {
 pub const OutgoingMeta = struct {
     caps: Capabilities = .{},
     from: ?std.Io.net.IpAddress = null,
+    /// When set (and the socket has `udp_gso`), the payload is a packed run of
+    /// datagrams of this size (the last may be shorter), segmented on egress.
+    gso_segment_len: ?u16 = null,
 };
 
 pub const ParseIncomingControlError = error{
@@ -71,12 +104,21 @@ pub const ParseIncomingControlError = error{
 pub fn configureUdpSocket(socket: *const std.Io.net.Socket, options: Options) ConfigureError!Capabilities {
     var caps: Capabilities = .{};
     if (builtin.os.tag != .linux) return caps;
+    // All-false caps: send path emits no source-address cmsg, receive loop takes
+    // the plain `recvmsg`.
+    if (options.shadow_compatible) return caps;
 
     const fd = socket.handle;
     const one: c_int = 1;
 
     if (options.enable_udp_gro) {
         caps.udp_gro = trySetSockOpt(fd, std.posix.IPPROTO.UDP, linux.UDP.GRO, c_int, one);
+    }
+    if (options.enable_udp_gso) {
+        // Probe only: UDP_SEGMENT=0 proves kernel support without enabling
+        // socket-wide segmentation (ENOPROTOOPT on < 4.18 leaves the cap
+        // false). Real segment sizes ride per-send cmsgs.
+        caps.udp_gso = trySetSockOpt(fd, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, c_int, 0);
     }
     if (options.enable_pktinfo) {
         caps.pktinfo_v4 = trySetSockOpt(fd, linux.SOL.IP, linux.IP.PKTINFO, c_int, one);
@@ -198,6 +240,12 @@ pub fn encodeOutgoingControl(buffer: []u8, meta: OutgoingMeta) []const u8 {
             }
         },
     };
+
+    if (meta.gso_segment_len) |seg_len| {
+        if (meta.caps.udp_gso) {
+            std.debug.assert(appendCmsg(buffer, &offset, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, std.mem.asBytes(&seg_len)));
+        }
+    }
 
     return buffer[0..offset];
 }
@@ -349,6 +397,28 @@ fn parseTimespecNs(data: []const u8) ?u64 {
     const nsec: u64 = @intCast(ts.nsec);
     if (sec > std.math.maxInt(u64) / std.time.ns_per_s) return null;
     return sec * std.time.ns_per_s + nsec;
+}
+
+test "shadow_compatible disables all cmsg capabilities" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var addr = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    const socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram });
+    defer socket.close(io);
+
+    // Every toggle on, yet shadow mode must yield all-false capabilities.
+    const caps = try configureUdpSocket(&socket, .{
+        .enable_udp_gro = true,
+        .enable_pktinfo = true,
+        .enable_orig_dst = true,
+        .enable_rx_timestamps = true,
+        .socket_mark = 0x42,
+        .shadow_compatible = true,
+    });
+    try std.testing.expectEqual(Capabilities{}, caps);
 }
 
 test "parseIncomingControl extracts GRO original destination and timestamp" {
@@ -520,4 +590,26 @@ test "encodeOutgoingControl respects packet info capability family" {
     }).len);
     try std.testing.expect(sourceControlEnabled(.{ .pktinfo_v4 = true }, v4_source));
     try std.testing.expect(!sourceControlEnabled(.{ .pktinfo_v4 = true }, v6_source));
+}
+
+test "encodeOutgoingControl appends a UDP_SEGMENT cmsg when GSO is usable" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var control: [send_control_buffer_len]u8 align(control_buffer_align) = undefined;
+    const out = encodeOutgoingControl(&control, .{
+        .caps = .{ .udp_gso = true },
+        .gso_segment_len = 1350,
+    });
+
+    var expected: [send_control_buffer_len]u8 align(control_buffer_align) = undefined;
+    var offset: usize = 0;
+    const seg: u16 = 1350;
+    try std.testing.expect(appendCmsg(&expected, &offset, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, std.mem.asBytes(&seg)));
+    try std.testing.expectEqualSlices(u8, expected[0..offset], out);
+
+    const none = encodeOutgoingControl(&control, .{
+        .caps = .{},
+        .gso_segment_len = 1350,
+    });
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }

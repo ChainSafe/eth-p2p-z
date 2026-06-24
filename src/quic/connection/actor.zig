@@ -103,12 +103,54 @@ fn applyOutgoingControl(
     message: *std.Io.net.OutgoingMessage,
     control_buffer: []u8,
     source_caps: socket_control.Capabilities,
-    selected_path: ?WriteState.Path,
+    from_addr: ?std.Io.net.IpAddress,
+    gso_segment_len: ?u16,
 ) void {
     message.control = socket_control.encodeOutgoingControl(control_buffer, .{
         .caps = source_caps,
-        .from = if (selected_path) |path| path.from else null,
+        .from = from_addr,
+        .gso_segment_len = gso_segment_len,
     });
+}
+
+/// Kernel caps for one UDP_SEGMENT send: 64 segments (UDP_MAX_SEGMENTS), and
+/// the whole superpacket must fit one UDP datagram (udp_sendmsg rejects
+/// payloads over 65535).
+const max_gso_segments: usize = 64;
+const max_gso_bytes: usize = 65535;
+
+/// How many consecutive collected packets from `start` can ride one
+/// UDP_SEGMENT send. Kernel rules: same destination; every segment has the first
+/// packet's length except the last, which may be shorter (and closes the group);
+/// at most `max_gso_segments` and `max_gso_bytes`. Plus our rule: a group shares
+/// one control buffer, so all members need the same pktinfo source (never
+/// coalesce across multipath paths).
+fn gsoGroupLen(
+    lens: []const usize,
+    dests: []const std.Io.net.IpAddress,
+    froms: []const ?std.Io.net.IpAddress,
+    start: usize,
+) usize {
+    const seg_len = lens[start];
+    var total: usize = seg_len;
+    var n: usize = 1;
+    while (start + n < lens.len and n < max_gso_segments) {
+        const next = start + n;
+        if (!dests[next].eql(&dests[start])) break;
+        if (!optionalFromEql(froms[next], froms[start])) break;
+        if (lens[next] > seg_len) break;
+        if (total + lens[next] > max_gso_bytes) break;
+        total += lens[next];
+        n += 1;
+        if (lens[next] < seg_len) break;
+    }
+    return n;
+}
+
+fn optionalFromEql(a: ?std.Io.net.IpAddress, b: ?std.Io.net.IpAddress) bool {
+    const av = a orelse return b == null;
+    const bv = b orelse return false;
+    return av.eql(&bv);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,14 +183,20 @@ pub const ConnectionActor = struct {
     stream_outbound_queue_bytes: usize = 0,
     stream_inbound_quantum_bytes: usize = 0,
     stream_outbound_quantum_bytes: usize = 0,
+    /// Keep-alive period in ns (0 = disabled): after this much outbound silence
+    /// the actor sends an ack-eliciting PING so an idle connection survives the
+    /// negotiated idle timeout (matching go-libp2p/quic-go KeepAlivePeriod).
+    /// Clamped to `peer_max_idle_timeout/2` if smaller once the handshake lands.
+    keep_alive_period_ns: u64 = 0,
+    /// Monotonic-ns deadline for the next keep-alive PING; reset to now+period on
+    /// every flushed packet. 0 means "not yet armed" — the first flushed packet
+    /// (a handshake flight) arms it, so it is non-zero before establishment.
+    keep_alive_next_ns: i96 = 0,
 
     // -- actor bookkeeping --
-    /// Spawned via `std.Io.concurrent` so the runtime owns the per-fiber
-    /// tracking allocation. The wrapper here is just a pointer + result
-    /// slot; the runtime touches its own heap allocation, never `self`.
-    /// `Future.cancel` blocks until the runtime is fully done with the
-    /// allocation, so freeing `self` after both `cancel`s is safe — no
-    /// post-call atomic UAF possible.
+    /// Spawned via `std.Io.concurrent`; the runtime owns the per-fiber tracking
+    /// allocation, not `self`. `Future.cancel` blocks until the runtime is fully
+    /// done with it, so freeing `self` after `cancel` returns cannot UAF.
     main_future: ?std.Io.Future(std.Io.Cancelable!void) = null,
     running: Atomic(bool) = .init(false),
     shutdown_requested: Atomic(bool) = .init(false),
@@ -173,6 +221,7 @@ pub const ConnectionActor = struct {
         stream_outbound_queue_bytes: usize = 0,
         stream_inbound_quantum_bytes: usize = 0,
         stream_outbound_quantum_bytes: usize = 0,
+        keep_alive_period_ns: u64 = 0,
     };
 
     /// Allocate a ConnectionActor on the heap and initialise its fields.
@@ -197,6 +246,7 @@ pub const ConnectionActor = struct {
             .stream_outbound_queue_bytes = params.stream_outbound_queue_bytes,
             .stream_inbound_quantum_bytes = params.stream_inbound_quantum_bytes,
             .stream_outbound_quantum_bytes = params.stream_outbound_quantum_bytes,
+            .keep_alive_period_ns = params.keep_alive_period_ns,
             .stats_snapshot = initial_stats,
         };
         self.transport.?.retainResources();
@@ -248,14 +298,10 @@ pub const ConnectionActor = struct {
         }
     }
 
-    /// Cancel any in-flight fibers and free the actor allocation. Safe
-    /// to call from any fiber other than the actor's own (calling from
-    /// inside `mainLoop` would deadlock on `Future.cancel`).
-    ///
-    /// `Future.cancel` blocks until the runtime has fully torn down its
-    /// internal Future allocation; after both cancels return, the
-    /// runtime is no longer touching anything reachable from `self`,
-    /// so freeing the actor allocation is safe.
+    /// Cancel any in-flight fibers and free the actor allocation. Must NOT be
+    /// called from the actor's own fiber — `Future.cancel` from inside `mainLoop`
+    /// would deadlock. Cancel returning means the runtime no longer touches
+    /// `self`, so the final free is safe.
     pub fn destroySpawned(self: *ConnectionActor) void {
         self.shutdown_requested.store(true, .release);
 
@@ -432,9 +478,12 @@ pub const ConnectionActor = struct {
     }
 
     fn shutdownAndCleanup(self: *ConnectionActor) void {
-        if (self.shutdown_requested.load(.acquire) or self.shared.isClosed()) {
-            self.closeApplicationQueues();
-        }
+        // Close the application-facing queues UNCONDITIONALLY (closes are
+        // idempotent): every loop exit must wake uncancelably-parked posters.
+        // Gating on shutdown_requested/isClosed would strand them against queues
+        // that only the final SharedState release closes — which a parked
+        // poster's own retain prevents (a deadlock).
+        self.closeApplicationQueues();
         if (self.conn) |conn| {
             if (self.transport) |transport| {
                 if (quiche.quiche_conn_is_closed(conn) or self.shutdown_requested.load(.acquire)) {
@@ -631,13 +680,11 @@ pub const ConnectionActor = struct {
         return stream_work_remains or write_work_remains;
     }
 
-    /// Pop stream IDs that handles have pushed to the connection's
-    /// outbound-pending queue and mark each corresponding `StreamRecord`
-    /// ready for `drainOutboundStreams`. The flag is cleared *before*
-    /// `markStreamOutboundReady` so a concurrent handle write detects
-    /// "actor has popped" and pushes a fresh signal — the byte queue is
-    /// the source of truth and `drainOneStreamOutbound` re-reads it on
-    /// each iteration of its inner loop, so no data is lost.
+    /// Pop pushed stream IDs and mark each `StreamRecord` ready for
+    /// `drainOutboundStreams`. Clear `outbound_signaled` *before* marking ready so
+    /// a concurrent handle write sees "actor has popped" and pushes a fresh signal;
+    /// the byte queue is the source of truth and is re-read each drain iteration,
+    /// so no data is lost.
     fn consumeOutboundPendingSignals(self: *ConnectionActor, io: std.Io) void {
         var buf: [16]u64 = undefined;
         while (true) {
@@ -677,8 +724,49 @@ pub const ConnectionActor = struct {
             if (self.shared.handshake.deadline()) |deadline_ns| {
                 deadline = minTimeout(transport.io, deadline, deadlineFromNs(deadline_ns));
             }
+        } else if (self.keep_alive_period_ns > 0 and self.keep_alive_next_ns != 0) {
+            // Established: wake to send a keep-alive PING before the idle timeout.
+            deadline = minTimeout(transport.io, deadline, deadlineFromNs(self.keep_alive_next_ns));
         }
         return deadline;
+    }
+
+    /// Send an ack-eliciting PING if the connection has been idle for a full
+    /// keep-alive period. Quiche resets BOTH peers' idle timers on an
+    /// ack-eliciting exchange, so this keeps an otherwise-silent connection alive
+    /// past `max_idle_timeout`.
+    fn maybeSendKeepAlive(self: *ConnectionActor, conn: *quiche.quiche_conn, io: std.Io) void {
+        if (self.keep_alive_period_ns == 0 or self.keep_alive_next_ns == 0) return;
+        if (self.lifecycle.isHandshake() or self.shared.isClosed()) return;
+        const now = io_time.monotonicNsSigned(io);
+        if (now < self.keep_alive_next_ns) return;
+        // Advance the deadline HERE, not only on a successful flush: a PING quiche
+        // can't put on the wire yet (cwnd-blocked / paced) would otherwise leave
+        // the deadline in the past and re-fire every loop turn. A real send resets
+        // it again via `flushScheduled`.
+        self.keep_alive_next_ns = now + @as(i96, @intCast(self.keep_alive_period_ns));
+        if (quiche.quiche_conn_send_ack_eliciting(conn) < 0) self.stats_snapshot.write_errors += 1;
+    }
+
+    /// On handshake completion, clamp the period to `min(configured,
+    /// peer_max_idle_timeout/2)`. A peer advertising a SHORTER idle timeout would
+    /// otherwise outrace the local-config period — the PING would fire after the
+    /// negotiated idle had already closed the connection. The peer's idle timeout
+    /// is only known after the handshake (the local pair is validated at config).
+    fn clampKeepAliveToPeerIdle(self: *ConnectionActor, conn: *quiche.quiche_conn, io: std.Io) void {
+        if (self.keep_alive_period_ns == 0) return;
+        var tp: quiche.quiche_transport_params = undefined;
+        if (!quiche.quiche_conn_peer_transport_params(conn, &tp)) return;
+        if (tp.peer_max_idle_timeout == 0) return; // peer disabled idle → no clamp
+        const peer_half_ns: u64 = (tp.peer_max_idle_timeout *| std.time.ns_per_ms) / 2;
+        if (peer_half_ns < self.keep_alive_period_ns) {
+            // Floor at 1ms so a pathological tiny peer idle can't drive the period
+            // to 0 (which would disable keep-alive / re-arm in the past).
+            self.keep_alive_period_ns = @max(peer_half_ns, std.time.ns_per_ms);
+            // Re-arm: a handshake flush already armed the deadline with the larger
+            // config period, so move it in to the clamped period from now.
+            self.keep_alive_next_ns = io_time.monotonicNsSigned(io) + @as(i96, @intCast(self.keep_alive_period_ns));
+        }
     }
 
     fn stagePostWait(
@@ -689,7 +777,7 @@ pub const ConnectionActor = struct {
         if (self.lifecycle.isHandshake() and self.handshakeTimedOut(transport.io)) {
             const empty: [0]u8 = .{};
             _ = quiche.quiche_conn_close(conn, false, 0, empty[0..].ptr, 0);
-            self.failHandshakeAndStamp(transport.io);
+            self.failHandshakeAndStamp(transport.io, .handshake_timeout);
             return;
         }
         if (quicheTimeoutExpired(conn)) {
@@ -699,6 +787,7 @@ pub const ConnectionActor = struct {
             self.refreshStats(transport.io);
             if (self.shared.isClosed()) return;
         }
+        self.maybeSendKeepAlive(conn, transport.io);
         _ = try self.stageOnFlush(conn, transport, .{});
         self.updateHandshake(transport.io);
     }
@@ -743,16 +832,29 @@ pub const ConnectionActor = struct {
         if (max_packets == 0) return true;
 
         var packets_released: usize = 0;
+        // Per-batch scratch declared once at function scope: one ~66 KiB Debug
+        // stack slot instead of re-scoping it each iteration. Packets go
+        // back-to-back into ONE flat buffer so a GSO group's segments already sit
+        // on the segment grid UDP_SEGMENT expects (see gsoGroupLen).
+        var payload_buf: [max_outbound_batch_size * max_flush_packet_len]u8 = undefined;
+        var offsets: [max_outbound_batch_size]usize = undefined;
+        var lens: [max_outbound_batch_size]usize = undefined;
+        var dests: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
+        // Each packet's pktinfo source, captured now while
+        // `self.write.selected_path` still describes THAT packet: it is nulled on
+        // DONE, wiped by reset(), and multipath switches it mid-batch, so reading
+        // it after the loop gives a stale or null source.
+        var froms: [max_outbound_batch_size]?std.Io.net.IpAddress = undefined;
+        var destinations: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
+        var messages: [max_outbound_batch_size]std.Io.net.OutgoingMessage = undefined;
+        var controls: [max_outbound_batch_size][socket_control.send_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
         while (packets_released < max_packets) {
             const batch_cap = @min(
                 @min(@max(transport.outbound_batch_size, @as(usize, 1)), max_outbound_batch_size),
                 max_packets - packets_released,
             );
-            var payloads: [max_outbound_batch_size][max_flush_packet_len]u8 = undefined;
-            var destinations: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
-            var messages: [max_outbound_batch_size]std.Io.net.OutgoingMessage = undefined;
-            var controls: [max_outbound_batch_size][socket_control.send_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
-            var batch_len: usize = 0;
+            var pkt_count: usize = 0;
+            var write_off: usize = 0;
             var quiche_done = false;
             var paced_pending = false;
 
@@ -762,27 +864,20 @@ pub const ConnectionActor = struct {
                     self.write.next_release_time_ns = null;
                 }
 
-                destinations[batch_len] = self.write.destination orelse return error.AddressInvalid;
-                @memcpy(payloads[batch_len][0..self.write.bytes_written], self.write.written());
-                messages[batch_len] = .{
-                    .address = &destinations[batch_len],
-                    .data_ptr = payloads[batch_len][0..].ptr,
-                    .data_len = self.write.bytes_written,
-                };
-                applyOutgoingControl(
-                    &messages[batch_len],
-                    controls[batch_len][0..],
-                    transport.socket.caps,
-                    self.write.selected_path,
-                );
-                batch_len += 1;
+                dests[pkt_count] = self.write.destination orelse return error.AddressInvalid;
+                froms[pkt_count] = if (self.write.selected_path) |path| path.from else null;
+                offsets[pkt_count] = write_off;
+                lens[pkt_count] = self.write.bytes_written;
+                @memcpy(payload_buf[write_off..][0..self.write.bytes_written], self.write.written());
+                write_off += self.write.bytes_written;
+                pkt_count += 1;
                 packets_released += 1;
                 self.write.reset();
             }
 
-            while (batch_len < batch_cap and packets_released < max_packets) {
+            while (pkt_count < batch_cap and packets_released < max_packets) {
                 var send_info: quiche.quiche_send_info = undefined;
-                const sent = try self.quicheConnSendOnSelectedPath(conn, transport, payloads[batch_len][0..].ptr, max_flush_packet_len, &send_info);
+                const sent = try self.quicheConnSendOnSelectedPath(conn, transport, payload_buf[write_off..].ptr, max_flush_packet_len, &send_info);
                 if (sent == quiche.QUICHE_ERR_DONE) {
                     self.write.selected_path = null;
                     if (self.write.pending_paths != null) continue;
@@ -795,41 +890,124 @@ pub const ConnectionActor = struct {
                 const destination = address.fromSockaddrStorage(@ptrCast(@alignCast(&send_info.to))) catch return error.AddressInvalid;
                 if (sendInfoReleaseNs(&send_info)) |release_at_ns| {
                     if (!releaseTimeDue(transport.io, release_at_ns)) {
-                        self.storePendingWrite(payloads[batch_len][0..len], destination, release_at_ns);
+                        self.storePendingWrite(payload_buf[write_off..][0..len], destination, release_at_ns);
                         paced_pending = true;
                         break;
                     }
                 }
 
-                destinations[batch_len] = destination;
-                messages[batch_len] = .{
-                    .address = &destinations[batch_len],
-                    .data_ptr = payloads[batch_len][0..].ptr,
-                    .data_len = len,
-                };
-                applyOutgoingControl(
-                    &messages[batch_len],
-                    controls[batch_len][0..],
-                    transport.socket.caps,
-                    self.write.selected_path,
-                );
-                batch_len += 1;
+                dests[pkt_count] = destination;
+                froms[pkt_count] = if (self.write.selected_path) |path| path.from else null;
+                offsets[pkt_count] = write_off;
+                lens[pkt_count] = len;
+                write_off += len;
+                pkt_count += 1;
                 packets_released += 1;
             }
 
-            if (batch_len > 0) {
-                transport.socket.sendMany(transport.io, messages[0..batch_len], .{}) catch |err| {
+            if (pkt_count > 0) {
+                // Coalesce: one OutgoingMessage per GSO group. A group of one is a
+                // plain packet send (no UDP_SEGMENT cmsg) — the only shape used
+                // when the bind-time probe left the cap false (macOS/Shadow/old
+                // kernels). Pacing is untouched: the batch already holds only
+                // packets due at collection time, so coalescing changes how the
+                // burst reaches the kernel, not when.
+                const gso_usable = transport.socket.gsoUsable();
+                var msg_count: usize = 0;
+                var gso_groups: u64 = 0;
+                var gso_segments: u64 = 0;
+                var i: usize = 0;
+                while (i < pkt_count) {
+                    const n = if (gso_usable) gsoGroupLen(lens[0..pkt_count], dests[0..pkt_count], froms[0..pkt_count], i) else 1;
+                    destinations[msg_count] = dests[i];
+                    messages[msg_count] = .{
+                        .address = &destinations[msg_count],
+                        .data_ptr = payload_buf[offsets[i]..].ptr,
+                        .data_len = (offsets[i + n - 1] + lens[i + n - 1]) - offsets[i],
+                    };
+                    applyOutgoingControl(
+                        &messages[msg_count],
+                        controls[msg_count][0..],
+                        transport.socket.caps,
+                        froms[i],
+                        if (n > 1) @intCast(lens[i]) else null,
+                    );
+                    if (n > 1) {
+                        gso_groups += 1;
+                        gso_segments += @intCast(n);
+                    }
+                    msg_count += 1;
+                    i += n;
+                }
+
+                var sent_via_gso = gso_groups > 0;
+                transport.socket.sendMany(transport.io, messages[0..msg_count], .{}) catch |err| gso_retry: {
+                    // Cancellation and transient network errors say nothing about
+                    // UDP_SEGMENT support, so propagate them (Canceled must unwind
+                    // teardown; a routing blip must not degrade the socket). Any
+                    // other error on a GSO batch means a driver that passes the
+                    // probe but fails real segmented sends: disable GSO and resend
+                    // per-packet. A duplicated datagram is legal (QUIC dedups at the
+                    // packet layer); a capability mismatch must not kill the conn.
+                    const capability_suspect = switch (err) {
+                        error.Canceled,
+                        error.NetworkDown,
+                        error.NetworkUnreachable,
+                        error.HostUnreachable,
+                        error.ConnectionRefused,
+                        error.SystemResources,
+                        => false,
+                        else => true,
+                    };
+                    if (gso_groups > 0 and capability_suspect) {
+                        transport.socket.disableGso();
+                        std.log.warn(
+                            "UDP GSO disabled for this socket: segmented send failed ({s}); resending the batch per-packet",
+                            .{@errorName(err)},
+                        );
+                        var pi: usize = 0;
+                        while (pi < pkt_count) : (pi += 1) {
+                            destinations[pi] = dests[pi];
+                            messages[pi] = .{
+                                .address = &destinations[pi],
+                                .data_ptr = payload_buf[offsets[pi]..].ptr,
+                                .data_len = lens[pi],
+                            };
+                            applyOutgoingControl(
+                                &messages[pi],
+                                controls[pi][0..],
+                                transport.socket.caps,
+                                froms[pi],
+                                null,
+                            );
+                        }
+                        transport.socket.sendMany(transport.io, messages[0..pkt_count], .{}) catch |retry_err| {
+                            self.stats_snapshot.write_errors += 1;
+                            return retry_err;
+                        };
+                        sent_via_gso = false;
+                        break :gso_retry;
+                    }
                     self.stats_snapshot.write_errors += 1;
                     return err;
                 };
+                if (sent_via_gso) {
+                    self.stats_snapshot.write_gso_groups += gso_groups;
+                    self.stats_snapshot.write_gso_segments += gso_segments;
+                }
                 self.stats_snapshot.write_batches += 1;
-                self.stats_snapshot.write_packets += @intCast(batch_len);
-                for (messages[0..batch_len]) |message| self.stats_snapshot.write_bytes += message.data_len;
+                self.stats_snapshot.write_packets += @intCast(pkt_count);
+                self.stats_snapshot.write_bytes += write_off;
+                // A flushed packet resets the idle timer on both ends, so push the
+                // next keep-alive out by a full period — a busy connection never
+                // sends a redundant PING; an idle one fires after `period` of silence.
+                if (self.keep_alive_period_ns > 0)
+                    self.keep_alive_next_ns = io_time.monotonicNsSigned(transport.io) + @as(i96, @intCast(self.keep_alive_period_ns));
                 if (!paced_pending) self.write.selected_path = null;
             }
 
             if (quiche_done or paced_pending) return false;
-            if (batch_len == 0) return false;
+            if (pkt_count == 0) return false;
         }
 
         return true;
@@ -931,6 +1109,17 @@ pub const ConnectionActor = struct {
     }
 
     fn closeFromActorErrorCode(self: *ConnectionActor, actor_error: conn_stats.ActorError) void {
+        if (self.lifecycle.closeResult() == .none) self.lifecycle.closing(.failed);
+        self.stats_snapshot.actor_fatal_errors += 1;
+        self.stats_snapshot.last_actor_error = actor_error;
+        if (self.stats_snapshot.close_reason == .none or self.stats_snapshot.close_reason == .closed) {
+            self.stats_snapshot.close_reason = .actor_error;
+        }
+        // Publish the fully-stamped fatal-error stats BEFORE markClosed flips the
+        // stage to .closed: markClosed wakes a dialer parked in waitHandshake
+        // (handshake.close -> done.set), whose failReason()/classifyHandshakeFailure
+        // must see last_actor_error + close_reason=.actor_error, not an opaque error.
+        if (self.shared.handshake.isHandshaking()) self.publishStats();
         if (!self.shared.isClosed()) {
             if (self.conn) |conn| {
                 const empty: [0]u8 = .{};
@@ -938,13 +1127,6 @@ pub const ConnectionActor = struct {
             }
             self.shared.markClosed();
         }
-        if (self.lifecycle.closeResult() == .none) self.lifecycle.closing(.failed);
-        self.stats_snapshot.actor_fatal_errors += 1;
-        self.stats_snapshot.last_actor_error = actor_error;
-        if (self.stats_snapshot.close_reason == .none or self.stats_snapshot.close_reason == .closed) {
-            self.stats_snapshot.close_reason = .actor_error;
-        }
-        if (self.shared.handshake.isHandshaking()) self.failHandshake();
         self.closeApplicationQueues();
         self.notifyShutdown();
     }
@@ -1003,24 +1185,41 @@ pub const ConnectionActor = struct {
         if (self.handshakeTimedOut(io)) {
             const empty: [0]u8 = .{};
             _ = quiche.quiche_conn_close(conn, false, 0, empty[0..].ptr, 0);
-            self.failHandshakeAndStamp(io);
+            self.failHandshakeAndStamp(io, .handshake_timeout);
             return;
         }
 
         if (quiche.quiche_conn_is_draining(conn)) {
-            self.failHandshakeAndStamp(io);
+            // Defer to quiche's CONNECTION_CLOSE codes (peer/local error).
+            self.failHandshakeAndStamp(io, null);
             return;
         }
 
         if (quiche.quiche_conn_is_closed(conn)) {
             const empty: [0]u8 = .{};
             _ = quiche.quiche_conn_close(conn, false, 0, empty[0..].ptr, 0);
-            self.failHandshakeAndStamp(io);
+            self.failHandshakeAndStamp(io, null);
             return;
         }
 
         if (quiche.quiche_conn_is_established(conn) or quiche.quiche_conn_is_in_early_data(conn)) {
-            self.completeHandshake(io) catch self.failHandshakeAndStamp(io);
+            // Record the specific cause (e.g. PeerVerifyFailed) before failing so
+            // the dialer can surface it instead of an opaque HandshakeFailed.
+            if (self.completeHandshake(io)) |_| {
+                // Now established: the peer's transport params are known, so clamp
+                // the keep-alive period to the negotiated idle timeout.
+                self.clampKeepAliveToPeerIdle(conn, io);
+            } else |err| {
+                self.stats_snapshot.last_actor_error = conn_stats.ActorError.fromError(err);
+                // The connection is already established at the quiche/TLS layer, so
+                // this is our own libp2p-identity rejection (or a local fault while
+                // completing). Tell the peer with a CONNECTION_CLOSE instead of
+                // letting it wait out its idle timeout — the timeout/closed branches
+                // above already close; this one must too.
+                const empty: [0]u8 = .{};
+                _ = quiche.quiche_conn_close(conn, false, 0x1, empty[0..].ptr, 0);
+                self.failHandshakeAndStamp(io, null);
+            }
         }
     }
 
@@ -1042,13 +1241,31 @@ pub const ConnectionActor = struct {
         self.lifecycle.running();
     }
 
-    fn failHandshakeAndStamp(self: *ConnectionActor, io: std.Io) void {
-        self.shared.markClosed();
-        self.stats_snapshot.close_reason = .handshake_failed;
+    /// Fail the handshake, recording why. `explicit_reason`, when given, is the
+    /// caller's definitive cause (e.g. `.handshake_timeout`) and overrides any
+    /// quiche-derived reason; `null` defers to quiche's CONNECTION_CLOSE codes
+    /// (falling back to `.handshake_failed`).
+    fn failHandshakeAndStamp(self: *ConnectionActor, io: std.Io, explicit_reason: ?conn_stats.CloseReason) void {
+        // Capture quiche's peer/local CONNECTION_CLOSE codes so the dialer can
+        // tell a TLS alert (CRYPTO_ERROR) from a transport-parameter error.
+        // refreshCloseErrorStats sets close_reason itself (e.g. .idle_timeout
+        // unconditionally on a timed-out conn), so the explicit reason below MUST
+        // run after it to win — do not reorder or add an early return.
+        if (self.conn) |conn| refreshCloseErrorStats(conn, &self.stats_snapshot);
+        if (explicit_reason) |reason| {
+            self.stats_snapshot.close_reason = reason;
+        } else if (self.stats_snapshot.close_reason == .none) {
+            self.stats_snapshot.close_reason = .handshake_failed;
+        }
         self.stats_snapshot.last_updated_mono_ns = io_time.monotonicNs(io);
-        self.shared.handshake.fail(io);
         self.lifecycle.fail();
+        // Publish BEFORE any wake: markClosed() and handshake.fail() both wake a
+        // dialer parked in waitHandshake that reads conn.stats() immediately, which
+        // could otherwise observe a stale snapshot. Publishing first orders it
+        // happens-before via the stats mutex + handshake event.
         self.publishStats();
+        self.shared.markClosed();
+        self.shared.handshake.fail(io);
     }
 
     // ----- CID lifecycle -------------------------------------------------
@@ -1074,15 +1291,17 @@ pub const ConnectionActor = struct {
     }
 
     fn queueCidUnmap(self: *ConnectionActor, transport: *const NetworkTransport, cid: CidKey) void {
-        const queued = transport.route_updates.sender().trySend(transport.io, .{ .unmap_cid = cid }) catch {
-            self.noteRouteCommandFailure(transport.io);
-            return;
-        };
-        if (!queued) self.noteRouteCommandFailure(transport.io);
+        _ = self;
+        // Direct, synchronous removal from the shared route table (the recv
+        // fiber only reads it). A missing entry is a harmless overlap with the
+        // listener-teardown clear — not a failure.
+        if (transport.route_table.unmap(transport.io, cid)) {
+            transport.subStat("cid_map_entries", 1);
+        }
     }
 
-    fn currentSourceCidKey(self: *ConnectionActor, conn: *quiche.quiche_conn) ?CidKey {
-        _ = self;
+    /// Free function (no actor state): reads quiche's current source CID for `conn`.
+    fn currentSourceCidKey(conn: *quiche.quiche_conn) ?CidKey {
         var source_id_ptr: [*c]const u8 = null;
         var source_id_len: usize = 0;
         quiche.quiche_conn_source_id(conn, &source_id_ptr, &source_id_len);
@@ -1094,6 +1313,9 @@ pub const ConnectionActor = struct {
         const conn = self.conn orelse return 0;
         var added: usize = 0;
 
+        // The SINGULAR accessor is borrow-safe: quiche's `Connection::source_id`
+        // returns a ConnectionId borrowing the connection's own storage, so the
+        // out-pointer stays valid while `conn` lives.
         var source_id_ptr: [*c]const u8 = null;
         var source_id_len: usize = 0;
         quiche.quiche_conn_source_id(conn, &source_id_ptr, &source_id_len);
@@ -1101,15 +1323,12 @@ pub const ConnectionActor = struct {
             if (try self.registerCid(source_id_ptr[0..source_id_len])) added += 1;
         }
 
-        const iter = quiche.quiche_conn_source_ids(conn) orelse return added;
-        defer quiche.quiche_connection_id_iter_free(iter);
-
-        var cid_ptr: [*c]const u8 = null;
-        var cid_len: usize = 0;
-        while (quiche.quiche_connection_id_iter_next(iter, &cid_ptr, &cid_len)) {
-            if (cid_ptr == null or cid_len != local_cid_len) continue;
-            if (try self.registerCid(cid_ptr[0..cid_len])) added += 1;
-        }
+        // Deliberately NO `quiche_conn_source_ids` iterator:
+        // `quiche_connection_id_iter_next` returns a pointer into a ConnectionId
+        // CLONE dropped before the call returns — a use-after-free that yields
+        // garbage cids and collides two connections in the shared route table. At
+        // setup a connection has exactly ONE source id (the singular call above);
+        // every later SCID is minted by refreshSourceCids from OUR buffer.
         return added;
     }
 
@@ -1118,7 +1337,7 @@ pub const ConnectionActor = struct {
     fn refreshSourceCids(self: *ConnectionActor) CidRefreshError!usize {
         const conn = self.conn orelse return error.ConnectionClosed;
         const transport = self.transport orelse return 0;
-        const existing_cid = self.currentSourceCidKey(conn) orelse return error.QuicheCidFailed;
+        const existing_cid = currentSourceCidKey(conn) orelse return error.QuicheCidFailed;
         var issued: usize = 0;
         while (quiche.quiche_conn_scids_left(conn) > 0) {
             const cid = cid_gen.randomLocalCid() catch return error.QuicheCidFailed;
@@ -1128,12 +1347,21 @@ pub const ConnectionActor = struct {
             const rc = quiche.quiche_conn_new_scid(conn, &cid, cid.len, &reset_token, false, &seq);
             if (rc < 0) return error.QuicheCidFailed;
             if (try self.registerCid(&cid)) issued += 1;
-            const queued = try transport.route_updates.sender().trySend(transport.io, .{
-                .map_cid = .{ .existing_cid = existing_cid, .new_cid = new_cid },
-            });
-            if (!queued) {
-                self.noteRouteCommandFailure(transport.io);
-                return error.QuicheCidFailed;
+            // Map the new CID directly into the shared route table so it is
+            // routable the instant quiche_conn_new_scid returns, before the
+            // NEW_CONNECTION_ID frame reaches the peer — otherwise packets to the
+            // new CID would drop in the gap.
+            switch (transport.route_table.mapFromExisting(transport.io, existing_cid, new_cid)) {
+                .mapped => transport.addStat("cid_map_entries", 1),
+                .already_mapped => {},
+                // The connection's routes were already cleared (listener
+                // teardown won the race): packets to the new CID would drop
+                // loss-like anyway. Count it; not an actor error.
+                .unknown_existing => transport.addStat("cid_map_unknown_existing", 1),
+                .failed => {
+                    self.noteRouteCommandFailure(transport.io);
+                    return error.QuicheCidFailed;
+                },
             }
         }
         _ = self.drainRetiredSourceCids();
@@ -1142,14 +1370,15 @@ pub const ConnectionActor = struct {
 
     fn drainRetiredSourceCids(self: *ConnectionActor) usize {
         const conn = self.conn orelse return 0;
-        var removed: usize = 0;
+        // Drain quiche's retired-SCID queue WITHOUT reading the out-pointer:
+        // `quiche_conn_retired_scid_next` has the same use-after-free as the
+        // connection-id iterator (ConnectionId dropped before the call returns).
+        // The retired cid lingers in our registry/route table until teardown:
+        // dead weight, not a hazard — quiche drops stray packets for it.
         var cid_ptr: [*c]const u8 = null;
         var cid_len: usize = 0;
-        while (quiche.quiche_conn_retired_scid_next(conn, &cid_ptr, &cid_len)) {
-            if (cid_ptr == null or cid_len != local_cid_len) continue;
-            if (self.unregisterCid(cid_ptr[0..cid_len])) removed += 1;
-        }
-        return removed;
+        while (quiche.quiche_conn_retired_scid_next(conn, &cid_ptr, &cid_len)) {}
+        return 0;
     }
 
     fn drainPathEvents(self: *ConnectionActor) usize {
@@ -1706,8 +1935,16 @@ pub const ConnectionActor = struct {
         return work_remains;
     }
 
+    /// Reap a stream only when BOTH directions are done. `quiche_conn_stream_finished`
+    /// is read-side only (true once the peer's FIN is read), so reaping on it alone
+    /// would shut our still-open write side and break the request/response half-close
+    /// (read peer FIN, then write reply). Also require `record.fin_sent`, which both
+    /// keeps the write side and defers reaping until a flow-controlled FIN has gone
+    /// out, so buffered data + FIN are never discarded.
     fn collectFinishedStream(self: *ConnectionActor, conn: *quiche.quiche_conn, stream_id: u64) void {
         if (!quiche.quiche_conn_stream_finished(conn, stream_id)) return;
+        const record = self.streams.get(stream_id) orelse return;
+        if (!record.fin_sent) return;
         if (self.removeStream(stream_id, false)) {
             self.stats_snapshot.streams_collected_after_fin += 1;
         }
@@ -1789,11 +2026,10 @@ pub const ConnectionActor = struct {
 // Free helpers
 // ---------------------------------------------------------------------------
 
-/// Hand a single inbound packet (or GRO super-packet) to quiche. Side
-/// effects beyond `quiche_conn_recv` — path event drain, source-CID
-/// refresh, readable-stream discovery, datagram delivery — are deferred to
-/// `postRecvBatch` (Cut 3) so they run once per actor tick instead of
-/// once per packet.
+/// Hand a single inbound packet (or GRO super-packet) to quiche. Everything
+/// beyond `quiche_conn_recv` (path events, source-CID refresh, readable-stream
+/// discovery, datagram delivery) is deferred to `postRecvBatch`, so it runs once
+/// per actor tick instead of once per packet.
 pub fn recvRoutedPacket(conn: *quiche.quiche_conn, packet: *RoutedPacket) NetworkError!void {
     var peer_storage: address.PosixAddress = undefined;
     var local_storage: address.PosixAddress = undefined;
@@ -1977,14 +2213,83 @@ test "applyOutgoingControl respects source-control capabilities" {
     };
     var control: [socket_control.send_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
 
-    applyOutgoingControl(&message, control[0..], .{ .pktinfo_v4 = true }, .{
-        .from = .{ .ip4 = .loopback(9000) },
-        .to = destination,
-    });
+    applyOutgoingControl(&message, control[0..], .{ .pktinfo_v4 = true }, .{ .ip4 = .loopback(9000) }, null);
 
     if (builtin.os.tag == .linux) {
         try std.testing.expect(message.control.len > 0);
     } else {
         try std.testing.expectEqual(@as(usize, 0), message.control.len);
     }
+}
+
+test "gsoGroupLen: equal-sized packets to one destination form one group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const lens = [_]usize{ 1350, 1350, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null, null };
+    try std.testing.expectEqual(@as(usize, 4), gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: a shorter packet joins as the final segment and closes the group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const lens = [_]usize{ 1350, 1350, 900, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null, null };
+    try std.testing.expectEqual(@as(usize, 3), gsoGroupLen(&lens, &dests, &froms, 0));
+    try std.testing.expectEqual(@as(usize, 1), gsoGroupLen(&lens, &dests, &froms, 3));
+}
+
+test "gsoGroupLen: a larger packet cannot join — it starts its own group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const lens = [_]usize{ 100, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null };
+    try std.testing.expectEqual(@as(usize, 1), gsoGroupLen(&lens, &dests, &froms, 0));
+    try std.testing.expectEqual(@as(usize, 2), gsoGroupLen(&lens, &dests, &froms, 1));
+}
+
+test "gsoGroupLen: a destination change closes the group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const b = std.Io.net.IpAddress{ .ip4 = .loopback(2) };
+    const lens = [_]usize{ 1350, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, b };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null };
+    try std.testing.expectEqual(@as(usize, 2), gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: a source-path change closes the group (one control buffer per group)" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const src = std.Io.net.IpAddress{ .ip4 = .loopback(7) };
+    const lens = [_]usize{ 1350, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ src, src, null };
+    try std.testing.expectEqual(@as(usize, 2), gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: caps at the kernel segment limit" {
+    // 64 x 1000 = 64000 fits the byte cap, so the segment cap binds here.
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    var lens: [max_gso_segments + 3]usize = undefined;
+    var dests: [max_gso_segments + 3]std.Io.net.IpAddress = undefined;
+    var froms: [max_gso_segments + 3]?std.Io.net.IpAddress = undefined;
+    for (&lens, &dests, &froms) |*l, *d, *f| {
+        l.* = 1000;
+        d.* = a;
+        f.* = null;
+    }
+    try std.testing.expectEqual(max_gso_segments, gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: caps total bytes at one UDP datagram (65535)" {
+    // 32 x 2048 = 65536, one byte over the limit, so the group closes at 31.
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    var lens: [32]usize = undefined;
+    var dests: [32]std.Io.net.IpAddress = undefined;
+    var froms: [32]?std.Io.net.IpAddress = undefined;
+    for (&lens, &dests, &froms) |*l, *d, *f| {
+        l.* = 2048;
+        d.* = a;
+        f.* = null;
+    }
+    try std.testing.expectEqual(@as(usize, 31), gsoGroupLen(&lens, &dests, &froms, 0));
 }

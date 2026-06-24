@@ -65,11 +65,19 @@ const Impl = struct {
         self.state = null;
         self.unlockHandle();
         if (state) |st| {
-            // Best-effort drop notification: if not already closed, ask the
-            // actor to abrupt-close (RESET_STREAM(0)). Fire-and-forget.
+            // Fire-and-forget drop. If the write side was gracefully finished
+            // (FIN already queued), use close_stream so buffered data + FIN still
+            // flush; abrupt drop_stream (RESET_STREAM) would discard them.
+            // Otherwise the app abandoned an open write side, so RESET it
+            // (dropping an unfinished stream resets it, per quinn/quic-go).
             if (!st.isClosed()) {
+                const write_finished = st.isWriteShutdown();
                 st.markClosedLocal();
-                postFireAndForget(st, .{ .drop_stream = st.stream_id }, st.io);
+                if (write_finished) {
+                    postFireAndForget(st, .{ .close_stream = .{ .stream_id = st.stream_id } }, st.io);
+                } else {
+                    postFireAndForget(st, .{ .drop_stream = st.stream_id }, st.io);
+                }
             }
             st.release();
         }
@@ -93,6 +101,11 @@ pub const Stream = opaque {
         return @ptrCast(@alignCast(self));
     }
 
+    /// Destroy the handle. CONTRACT — external synchronization required: no
+    /// other fiber may be inside, or subsequently enter, ANY method of this
+    /// handle once deinit starts; the memory is freed here, so a racing call is
+    /// a use-after-free (the internal lock only serializes the state-pointer
+    /// swap, not handle lifetime).
     pub fn deinit(self: *Stream) void {
         self.impl().deinit();
     }
@@ -143,6 +156,10 @@ pub const Stream = opaque {
     /// Graceful bidirectional close. Schedules FIN on the write side and
     /// STOP_SENDING(0) on the read side. After this returns, subsequent
     /// reads/writes return `error.StreamShutdown`.
+    ///
+    /// Fire-and-forget: returns as soon as the close command is posted; it does
+    /// NOT wait for the FIN to reach the wire. Use `closeWrite` when FIN ordering
+    /// must be observed (it waits for the reply after the FIN is handed to quiche).
     pub fn close(self: *Stream, io: std.Io) CloseError!void {
         const state = self.impl().liveRetained() orelse return;
         defer state.release();
@@ -176,6 +193,28 @@ pub const Stream = opaque {
         var reply: VoidReply = .{};
         if (!postCommittedCommand(state, .{ .close_write_stream = .{ .stream_id = state.stream_id, .reply = &reply } }, io)) return;
         reply.event.waitUncancelable(io);
+    }
+
+    /// FIN-only graceful close for tearing down an inbound protocol-handler
+    /// stream: finishes the write side (like `closeWrite`) then marks the handle
+    /// closed, but unlike `close` does NOT send STOP_SENDING(0). STOP_SENDING on a
+    /// stream whose peer may still be reading a server-pushed response (e.g.
+    /// identify) races that read on some stacks (py-libp2p reports "fail to read
+    /// from multiselect communicator"). The actor reaps the record via its normal
+    /// finished-stream sweep once the peer also finishes. Finish-send-only matches
+    /// rust-libp2p `Stream::poll_close` and go-libp2p `CloseWrite`.
+    pub fn closeGraceful(self: *Stream, io: std.Io) ShutdownWriteError!void {
+        const state = self.impl().liveRetained() orelse return;
+        defer state.release();
+        if (state.isClosed()) return;
+        if (!state.isWriteShutdown()) {
+            state.markWriteShutdownLocal();
+            var reply: VoidReply = .{};
+            if (postCommittedCommand(state, .{ .close_write_stream = .{ .stream_id = state.stream_id, .reply = &reply } }, io)) {
+                reply.event.waitUncancelable(io);
+            }
+        }
+        state.markClosedLocal();
     }
 
     /// Abrupt bidirectional close. RESET_STREAM(code) on the write side,
@@ -229,7 +268,7 @@ fn readShared(state: *SharedState, io: std.Io, buf: []u8, opts: ReadOptionsImpl)
         if (state.isInboundResetByPeer()) return error.ResetByPeer;
         return error.StreamShutdown;
     }
-    var queue = if (state.inbound_queue) |*q| q else return error.ConnectionClosed;
+    const queue = if (state.inbound_queue) |*q| q else return error.ConnectionClosed;
 
     const deadline = opts.timeout.toDeadline(io);
     while (true) {
@@ -260,7 +299,7 @@ fn writeShared(state: *SharedState, io: std.Io, buf: []const u8, opts: WriteOpti
     if (state.isOutboundResetByPeer()) return error.ResetByPeer;
     if (state.isClosed()) return error.ConnectionClosed;
     if (state.isWriteShutdown()) return error.StreamShutdown;
-    var queue = if (state.outbound_queue) |*q| q else return error.ConnectionClosed;
+    const queue = if (state.outbound_queue) |*q| q else return error.ConnectionClosed;
 
     const deadline = opts.timeout.toDeadline(io);
     while (true) {
@@ -275,8 +314,8 @@ fn writeShared(state: *SharedState, io: std.Io, buf: []const u8, opts: WriteOpti
             return written;
         }
 
-        // Note: surface queue-full pressure through the connection's
-        // pending counter so the actor can fold it into stats.
+        // Surface queue-full pressure through the connection's pending
+        // counter so the actor can fold it into stats.
         _ = state.conn.outbound_stream_queue_full.fetchAdd(1, .acq_rel);
 
         if (opts.timeout != .none and io_time.timeoutExpired(io, deadline)) return error.Timeout;
@@ -350,20 +389,66 @@ pub const StreamReader = struct {
     fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const r: *StreamReader = @alignCast(@fieldParentPtr("interface", io_r));
         var iovecs_buffer: [8][]u8 = undefined;
-        const dest_n, _ = try io_r.writableVector(&iovecs_buffer, data);
+        const dest_n, const data_capacity = try io_r.writableVector(&iovecs_buffer, data);
         const dest = iovecs_buffer[0..dest_n];
         std.debug.assert(dest.len > 0);
         std.debug.assert(dest[0].len > 0);
 
-        return r.stream.read(r.io, dest[0], .{}) catch |err| switch (err) {
-            error.EndOfStream => error.EndOfStream,
+        const n = r.stream.read(r.io, dest[0], .{}) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
             else => {
                 r.err = err;
                 return error.ReadFailed;
             },
         };
+        if (data_capacity == 0) {
+            // Zero caller capacity means the read landed in `interface.buffer`,
+            // so advance `end` and report 0 bytes-to-`data`. Returning `n` would
+            // make the fill loop re-read and drop these bytes.
+            io_r.end += n;
+            return 0;
+        }
+        return n;
     }
 };
+
+test "StreamReader: a refill into the reader's own buffer surfaces the bytes" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const conn_state = try shared_state_mod.ConnSharedState.create(allocator, io, .{
+        .inbox_capacity = 1,
+        .accept_capacity = 1,
+    });
+    defer {
+        conn_state.release();
+        conn_state.release();
+    }
+
+    const state = try SharedState.create(allocator, io, conn_state, .{
+        .stream_id = 0,
+        .inbound_queue_bytes = 1024,
+        .outbound_queue_bytes = 1024,
+    });
+    const stream = try create(allocator, state);
+    defer stream.deinit();
+
+    try std.testing.expect(state.inbound_queue.?.tryPutAll(io, "abc"));
+    state.closeInbound();
+
+    // takeByte refills through readVec with no caller slices, so the read
+    // lands in the reader's internal buffer. Bytes must come out in order then
+    // EndOfStream; a refill that forgets to advance `end` discards them and
+    // reports a premature EOS.
+    var buffer: [16]u8 = undefined;
+    var r = stream.reader(io, &buffer);
+    try std.testing.expectEqual(@as(u8, 'a'), try r.interface.takeByte());
+    try std.testing.expectEqual(@as(u8, 'b'), try r.interface.takeByte());
+    try std.testing.expectEqual(@as(u8, 'c'), try r.interface.takeByte());
+    try std.testing.expectError(error.EndOfStream, r.interface.takeByte());
+}
 
 pub const StreamWriter = struct {
     io: std.Io,

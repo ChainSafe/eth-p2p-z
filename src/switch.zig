@@ -1,15 +1,12 @@
 //! libp2p protocol multiplexer over a QUIC endpoint.
 //!
-//! The Switch is the libp2p layer over a `quic.QuicEndpoint`: it wraps the
-//! endpoint's connection-level API with multiaddr-aware helpers, runs
+//! The Switch wraps a `quic.QuicEndpoint` with multiaddr-aware helpers, runs
 //! multistream-select for inbound streams, and dispatches them to registered
 //! protocol handlers. Identity / TLS / endpoint lifetime are NOT a Switch
-//! concern — construct your `QuicEndpoint` (typically via
-//! `quic.QuicEndpoint.initWithIdentity`) and hand it to `Switch.init`. The
-//! Switch borrows it and owns the managed connections returned by `dial` and
-//! `accept`. A managed connection may be deinited directly; any still-live
-//! managed connections are canceled before the Switch frees its handler
-//! registry. The endpoint can be deinited once Switch teardown is complete.
+//! concern: construct the endpoint and hand it to `Switch.init`. The Switch
+//! BORROWS the endpoint and OWNS the managed connections from `dial`/`accept`.
+//! Still-live managed connections are canceled before the Switch frees its
+//! handler registry; deinit the endpoint only after Switch teardown completes.
 
 const std = @import("std");
 const identity = @import("identity.zig");
@@ -17,8 +14,17 @@ const protocols = @import("protocols.zig");
 const quic = @import("quic.zig");
 const PeerId = @import("peer_id").PeerId;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
+const channel = @import("quic/io/channel.zig");
+const io_time = @import("quic/io/time.zig");
 
 const command_queue_capacity = 32;
+/// Aggregate cap on concurrent inbound stream-handler fibers across all
+/// connections — the cross-connection limit QUIC can't express (the
+/// per-connection limit is already the QUIC stream credit
+/// `initial_max_streams_bidi`, one handler per inbound stream). Claimed
+/// non-blockingly; a full aggregate closes the inbound stream rather than
+/// parking the dispatcher.
+const default_max_inflight_handlers_total: usize = 256;
 const default_negotiation_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
 };
@@ -31,13 +37,70 @@ pub const Switch = struct {
     services: std.StringHashMap(protocols.AnyProtocolService),
     services_lock: std.Io.Mutex = .init,
     registry_frozen: bool = false,
+    /// When true (default), every managed connection — dialed OR accepted —
+    /// automatically starts serving inbound streams, because libp2p connections
+    /// are bidirectional: a dialer that doesn't serve the peer's inbound streams
+    /// makes them negotiation-timeout and get scored down / disconnected
+    /// (go-libp2p and rust-libp2p both always serve inbound on every connection).
+    /// Set false BEFORE dialing/listening to opt out (pure-outbound, or to drive
+    /// `startInboundDispatcher` yourself). NOTE: auto-dispatch freezes the
+    /// protocol registry on the first connection, so register all services first.
+    auto_inbound_dispatch: bool = true,
     connections: std.ArrayList(*SwitchConnection) = .empty,
     connections_lock: std.Io.Mutex = .init,
+    /// Background accept fiber spawned by `serve`; null until then. Owned by the
+    /// Switch: `deinit` wakes a parked accept via `closeListener` and joins it.
+    accept_future: ?std.Io.Future(void) = null,
+    /// Available slots in the aggregate handler cap, shared by every connection's
+    /// dispatcher. Claimed non-blockingly via `channel.tryDecrementToFloor`.
+    handler_slots_total: std.atomic.Value(usize) = .init(default_max_inflight_handlers_total),
+    /// Optional observer of peer-level connect/disconnect. Set via
+    /// `setPeerEventCallback`; null until then. The callbacks fire OUTSIDE
+    /// `connections_lock` (see `manageConnection` / `unregisterConnection`).
+    peer_event_callback: ?PeerEventCallback = null,
+
+    /// Observer of peer-level lifecycle (connected: handshake done, peer id
+    /// known; disconnected). The callbacks run on the fiber that called
+    /// `dial`/`accept` (connected) or `SwitchConnection.deinit` (disconnected),
+    /// ALWAYS outside `connections_lock`. They must be cheap, non-blocking, and
+    /// must not re-enter Switch connection management (dial/accept/deinit) in a
+    /// way that could block or deadlock.
+    pub const PeerEventCallback = struct {
+        ctx: *anyopaque,
+        /// Inbound dispatch is owned by the Switch (auto_inbound_dispatch /
+        /// startInboundDispatcher); this callback must NOT start or drive inbound
+        /// dispatch itself. It fires before the Switch posts its auto-start, so a
+        /// callback that started dispatch would just be the no-op'd loser of the
+        /// race with the owning dispatcher.
+        on_connected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void,
+        /// Fired once per CONNECTION unregister, not per peer: two connections to
+        /// one peer (simultaneous dial) each fire. `conn` identifies WHICH
+        /// connection died so the observer can ignore one it never adopted —
+        /// keying teardown on PeerId alone would let a redundant connection's
+        /// close destroy the live peer's state. The pointer is an identity token
+        /// only: the connection may already be torn down, so do not dereference.
+        on_disconnected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection) void,
+    };
+
+    pub const Options = struct {
+        max_inflight_handlers_total: usize = default_max_inflight_handlers_total,
+    };
+    pub const OptionsError = error{InvalidOptions};
+
+    fn validateOptions(opts: Options) OptionsError!void {
+        // A zero cap would reject every inbound stream — reject the config rather
+        // than silently clamp.
+        if (opts.max_inflight_handlers_total == 0) return error.InvalidOptions;
+    }
 
     pub const InitError = std.mem.Allocator.Error;
     pub const DispatchError = error{
         NoRegisteredProtocols,
         ConnectionClosed,
+        /// The aggregate handler cap is full; the inbound stream was gracefully
+        /// closed (non-blocking back-pressure). The dispatcher loop treats this as
+        /// "skip and keep accepting" (after a short backoff), not a fatal error.
+        HandlerLimitReached,
     } || std.mem.Allocator.Error || std.Io.ConcurrentError || quic.Connection.AcceptStreamError;
     pub const AddProtocolServiceError = error{RegistryFrozen} || std.mem.Allocator.Error;
     pub const DispatchOptions = struct {
@@ -47,17 +110,25 @@ pub const Switch = struct {
     pub const OpenProtocolStreamOptions = struct {
         negotiation_timeout: std.Io.Timeout = default_negotiation_timeout,
     };
+    /// Result of a multi-protocol open: the negotiated stream plus the protocol
+    /// id the peer accepted. `selected` ALIASES one element of the caller's
+    /// proposed slice (not a copy), so that slice must stay alive as long as
+    /// `selected` is read — a static/comptime list (as gossipsub uses) is safe.
+    pub const SelectedStream = struct {
+        stream: *quic.Stream,
+        selected: protocols.ProtocolId,
+    };
     pub const OpenProtocolStreamError = error{
         ConnectionClosed,
         SelectedProtocolMismatch,
-    } || quic.Connection.OpenStreamError || protocols.multistream.Error;
-    pub const StartInboundDispatchError = error{ ConnectionClosed, AlreadyDispatching } || std.Io.Cancelable || std.Io.ConcurrentError;
+    } || quic.Connection.OpenStreamError || protocols.multistream.Error || std.Io.ConcurrentError;
+    pub const StartInboundDispatchError = error{ConnectionClosed} || std.Io.Cancelable || std.Io.ConcurrentError;
     pub const CloseError = error{ConnectionClosed} || quic.Connection.CloseError;
 
     pub const ListenError = error{AddressInvalid} || quic.QuicEndpoint.ListenError;
     pub const DialOptions = struct { timeout: std.Io.Timeout = .none };
     pub const DialError = error{ AddressInvalid, PeerIdentityMismatch } || quic.QuicEndpoint.DialError || std.Io.ConcurrentError;
-    pub const AcceptError = std.Io.Cancelable || std.Io.ConcurrentError || std.mem.Allocator.Error;
+    pub const AcceptError = quic.QuicEndpoint.AcceptError || std.Io.ConcurrentError || std.mem.Allocator.Error;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, endpoint: *quic.QuicEndpoint) InitError!*Switch {
         const sw = try allocator.create(Switch);
@@ -70,7 +141,52 @@ pub const Switch = struct {
         return sw;
     }
 
+    /// Like `init`, but with a custom aggregate handler cap.
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        endpoint: *quic.QuicEndpoint,
+        opts: Options,
+    ) (InitError || OptionsError)!*Switch {
+        try validateOptions(opts);
+        const sw = try allocator.create(Switch);
+        sw.* = .{
+            .allocator = allocator,
+            .io = io,
+            .endpoint = endpoint,
+            .services = std.StringHashMap(protocols.AnyProtocolService).init(allocator),
+            .handler_slots_total = .init(opts.max_inflight_handlers_total),
+        };
+        return sw;
+    }
+
+    /// Registers (or replaces) the peer connect/disconnect observer. Intended to
+    /// be called once after construction, before any dial/accept, by the service
+    /// that wants the events (e.g. a gossipsub router registering itself).
+    pub fn setPeerEventCallback(sw: *Switch, cb: PeerEventCallback) void {
+        sw.peer_event_callback = cb;
+    }
+
+    /// Unregisters the peer connect/disconnect observer. The observing service
+    /// MUST call this before freeing the object `ctx` points at, so no later
+    /// event fires into freed memory. Writes the field without synchronization,
+    /// so the caller must ensure no concurrent connect/disconnect (a
+    /// dial/accept/deinit firing the callback) is in flight.
+    pub fn clearPeerEventCallback(sw: *Switch) void {
+        sw.peer_event_callback = null;
+    }
+
     pub fn deinit(sw: *Switch) void {
+        // Stop the background accept loop BEFORE tearing down connections, so it
+        // can't accept/append concurrently: `closeListener` wakes a parked
+        // accept() with ListenerClosed (persistent signal, not a bare cancel of a
+        // parked wait), then we join the fiber.
+        if (sw.accept_future) |*future| {
+            sw.closeListener(sw.io);
+            future.await(sw.io);
+            sw.accept_future = null;
+        }
+
         while (true) {
             sw.connections_lock.lockUncancelable(sw.io);
             const conn = if (sw.connections.items.len > 0) sw.connections.pop().? else null;
@@ -84,6 +200,11 @@ pub const Switch = struct {
             }
         }
         sw.connections.deinit(sw.allocator);
+
+        // The aggregate slot counter is freed with the Switch below. Safe only
+        // because the loop above tore down every connection first, joining all
+        // handler fibers — so no handler can still touch the counter. Preserve
+        // that ordering before any fire-and-forget teardown.
 
         sw.services_lock.lockUncancelable(sw.io);
         var it = sw.services.iterator();
@@ -127,11 +248,92 @@ pub const Switch = struct {
         return sw.manageConnection(conn);
     }
 
+    /// THE standard way a server serves inbound connections: spawns a
+    /// Switch-owned fiber that loops `accept()`, so every inbound connection is
+    /// managed and — with `auto_inbound_dispatch` — has its dispatcher started,
+    /// with no caller accept loop. Background-fiber model like go-libp2p's Host
+    /// (vs rust-libp2p's app-driven poll loop). The fiber is joined in `deinit`.
+    /// Usage: `listen()`, register all handlers (registry freezes on first
+    /// connection), then `serve()`.
+    ///
+    /// Idempotent. Do NOT also drive `accept()` manually — both consume the same
+    /// accept queue. Reach for a manual `accept()` loop ONLY for per-connection
+    /// access the dispatcher doesn't give (e.g. running identify as a CLIENT on
+    /// each inbound peer when the peer-event callback is already taken), or tests.
+    pub fn serve(sw: *Switch, io: std.Io) std.Io.ConcurrentError!void {
+        if (sw.accept_future != null) return;
+        sw.accept_future = try std.Io.concurrent(io, acceptLoop, .{sw});
+    }
+
+    fn acceptLoop(sw: *Switch) void {
+        while (true) {
+            // manageConnection (inside accept) tracks the connection in
+            // `connections` and starts its dispatcher via auto_inbound_dispatch,
+            // so there is nothing to do per connection here.
+            _ = sw.accept() catch |err| {
+                switch (err) {
+                    // Clean stops: ListenerClosed is the graceful shutdown signal
+                    // from `closeListener` (incl. the implicit one in `deinit`);
+                    // Canceled is a direct fiber cancel. Neither is a failure.
+                    error.ListenerClosed, error.Canceled => {},
+                    else => std.log.warn("switch accept loop terminated: {any}", .{err}),
+                }
+                return;
+            };
+        }
+    }
+
+    /// Graceful-shutdown helper: unblock a fiber parked in `accept`, which then
+    /// returns `error.ListenerClosed` (distinct from `error.Canceled`) so an
+    /// accept loop can stop cleanly. The endpoint is NOT torn down — existing
+    /// connections keep working — so a caller can quiesce inbound accepts before
+    /// `deinit`. Idempotent (later `endpoint.deinit` teardown won't double-close).
+    /// `io` is taken for call-site symmetry; the Switch uses its own stored `io`.
+    pub fn closeListener(sw: *Switch, io: std.Io) void {
+        _ = io;
+        sw.endpoint.stopAccepting();
+    }
+
+    /// Alias for `closeListener`, named for the operation it performs (stop
+    /// accepting new inbound connections).
+    pub fn stopAccepting(sw: *Switch, io: std.Io) void {
+        sw.closeListener(io);
+    }
+
     /// Returns the libp2p peer id of the remote, derived from the verified
     /// public key on the connection's TLS handshake.
     pub fn connectionPeerId(allocator: std.mem.Allocator, conn: *const quic.Connection) std.mem.Allocator.Error!PeerId {
         var pub_key = conn.remotePublicKey();
         return PeerId.fromPublicKey(allocator, &pub_key);
+    }
+
+    /// Snapshot the peer ids of all currently-managed connections. Caller owns
+    /// the returned slice (free with `allocator.free`). The connection list IS
+    /// the registry; no separate one is kept.
+    pub fn snapshotPeerIds(sw: *Switch, allocator: std.mem.Allocator) std.mem.Allocator.Error![]PeerId {
+        sw.connections_lock.lockUncancelable(sw.io);
+        defer sw.connections_lock.unlock(sw.io);
+        const out = try allocator.alloc(PeerId, sw.connections.items.len);
+        for (sw.connections.items, 0..) |conn, i| out[i] = conn.peerId();
+        return out;
+    }
+
+    /// The first managed connection to `peer_id`, or null.
+    /// NOTE: the returned pointer is only valid while the connection stays
+    /// registered; callers use it promptly (single-executor model).
+    pub fn connectionForPeer(sw: *Switch, peer_id: PeerId) ?*SwitchConnection {
+        sw.connections_lock.lockUncancelable(sw.io);
+        defer sw.connections_lock.unlock(sw.io);
+        for (sw.connections.items) |conn| {
+            const have = conn.peerId();
+            if (std.mem.eql(u8, have.bytes[0..have.len], peer_id.bytes[0..peer_id.len])) return conn;
+        }
+        return null;
+    }
+
+    /// Whether `peer_id` currently has a managed connection.
+    pub fn isConnected(sw: *Switch, peer_id: PeerId) bool {
+        return sw.connectionForPeer(peer_id) != null;
     }
 
     pub fn addProtocolService(sw: *Switch, id: protocols.ProtocolId, service: protocols.AnyProtocolService) AddProtocolServiceError!void {
@@ -168,42 +370,85 @@ pub const Switch = struct {
             conn.deinit();
             return err;
         };
-        errdefer actor.destroyUnspawned();
+        // Exactly one actor-cleanup path may run on error: both free
+        // `inbox_storage` and destroy `actor`, so two stacked errdefers would
+        // double-free. Guard on spawn state — before spawn `destroyUnspawned`,
+        // after `shutdownAndDestroy`.
+        var actor_spawned = false;
+        errdefer if (actor_spawned) actor.shutdownAndDestroy() else actor.destroyUnspawned();
 
         const managed = try sw.allocator.create(SwitchConnection);
+        errdefer sw.allocator.destroy(managed);
         managed.* = .{
             .allocator = sw.allocator,
             .io = sw.io,
             .sw = sw,
             .actor = actor,
         };
-        errdefer {
-            actor.shutdownAndDestroy();
-            sw.allocator.destroy(managed);
-        }
 
         try actor.spawn();
+        actor_spawned = true;
 
-        sw.connections_lock.lockUncancelable(sw.io);
-        defer sw.connections_lock.unlock(sw.io);
-        try sw.connections.append(sw.allocator, managed);
-        managed.registered = true;
+        // Register under the lock, then fire the connect event OUTSIDE it: the
+        // observer may post to its own inbox, and holding connections_lock across
+        // that risks lock-ordering / blocking. peer_id and remote_addr are set in
+        // the actor's init before spawn, so they are valid to read after unlock.
+        {
+            sw.connections_lock.lockUncancelable(sw.io);
+            defer sw.connections_lock.unlock(sw.io);
+            try sw.connections.append(sw.allocator, managed);
+            managed.registered = true;
+        }
+
+        // Only a genuinely-registered connection reaches here: the append above
+        // is the last fallible step, so there is no error path between
+        // registration and firing.
+        //
+        // Fires BEFORE the auto-start dispatch below, so the observer learns the
+        // peer connected before any inbound handler runs.
+        if (sw.peer_event_callback) |cb| {
+            cb.on_connected(cb.ctx, managed.peerId(), managed, managed.remoteAddress());
+        }
+
+        // Serve the peer's inbound streams by default (connections are
+        // bidirectional), but only with a non-empty registry: an empty one makes
+        // the dispatcher exit immediately, and consumers registering handlers
+        // later (or driving dispatch manually) start it themselves. Best-effort
+        // and idempotent with any later startInboundDispatcher call; opt out via
+        // `sw.auto_inbound_dispatch`.
+        if (sw.auto_inbound_dispatch and sw.hasRegisteredServices()) {
+            managed.startInboundDispatch(.{}) catch |err| {
+                std.log.warn("switch: auto inbound-dispatch failed: {s}", .{@errorName(err)});
+            };
+        }
         return managed;
     }
 
     fn unregisterConnection(sw: *Switch, conn: *SwitchConnection) void {
-        sw.connections_lock.lockUncancelable(sw.io);
-        defer sw.connections_lock.unlock(sw.io);
+        // Capture the peer id while registered, remove under the lock, then fire
+        // the disconnect event OUTSIDE it (as in `manageConnection`).
+        // `did_unregister` guards a double-fire: an already-unregistered
+        // connection returns early without firing.
+        var did_unregister = false;
+        const peer_id = conn.peerId();
+        {
+            sw.connections_lock.lockUncancelable(sw.io);
+            defer sw.connections_lock.unlock(sw.io);
 
-        if (!conn.registered) return;
-        for (sw.connections.items, 0..) |item, index| {
-            if (item == conn) {
-                _ = sw.connections.swapRemove(index);
-                conn.registered = false;
-                return;
+            if (!conn.registered) return;
+            for (sw.connections.items, 0..) |item, index| {
+                if (item == conn) {
+                    _ = sw.connections.swapRemove(index);
+                    break;
+                }
             }
+            conn.registered = false;
+            did_unregister = true;
         }
-        conn.registered = false;
+
+        if (did_unregister) {
+            if (sw.peer_event_callback) |cb| cb.on_disconnected(cb.ctx, peer_id, conn);
+        }
     }
 
     fn supportedProtocolIds(sw: *Switch) std.mem.Allocator.Error![][]const u8 {
@@ -217,6 +462,12 @@ pub const Switch = struct {
         var it = sw.services.iterator();
         while (it.next()) |entry| try ids.append(sw.allocator, entry.key_ptr.*);
         return ids.toOwnedSlice(sw.allocator);
+    }
+
+    fn hasRegisteredServices(sw: *Switch) bool {
+        sw.services_lock.lockUncancelable(sw.io);
+        defer sw.services_lock.unlock(sw.io);
+        return sw.services.count() > 0;
     }
 
     fn freezeProtocolRegistry(sw: *Switch) void {
@@ -255,6 +506,29 @@ pub const SwitchConnection = struct {
         var reply: OpenProtocolStreamReply = .{};
         try conn.post(.{ .open_protocol_stream = .{
             .protocol_id = protocol_id,
+            .opts = opts,
+            .reply = &reply,
+        } });
+        reply.event.waitUncancelable(conn.io);
+        return reply.result;
+    }
+
+    /// Open an outbound stream proposing `protocol_ids` in preference order and
+    /// return the stream plus the protocol the peer accepted: the initiator
+    /// proposes each id in turn until the responder accepts one (vs
+    /// `openProtocolStream`, which proposes a single id). Lets gossipsub speak the
+    /// highest /meshsub version a peer supports, falling back to older ones.
+    ///
+    /// `protocol_ids` is borrowed; `result.selected` aliases one of its elements
+    /// (see `SelectedStream`), so it must outlive the caller's use of `selected`.
+    pub fn openProtocolStreamMulti(
+        conn: *SwitchConnection,
+        protocol_ids: []const protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+    ) Switch.OpenProtocolStreamError!Switch.SelectedStream {
+        var reply: OpenProtocolStreamMultiReply = .{};
+        try conn.post(.{ .open_protocol_stream_multi = .{
+            .protocol_ids = protocol_ids,
             .opts = opts,
             .reply = &reply,
         } });
@@ -338,6 +612,11 @@ const Command = union(enum) {
         opts: Switch.OpenProtocolStreamOptions,
         reply: *OpenProtocolStreamReply,
     },
+    open_protocol_stream_multi: struct {
+        protocol_ids: []const protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+        reply: *OpenProtocolStreamMultiReply,
+    },
     dispatch_inbound_stream: struct {
         opts: Switch.DispatchOptions,
         reply: *DispatchInboundStreamReply,
@@ -369,6 +648,16 @@ const OpenProtocolStreamReply = struct {
     result: Switch.OpenProtocolStreamError!*quic.Stream = error.ConnectionClosed,
 
     fn complete(reply: *OpenProtocolStreamReply, io: std.Io, result: Switch.OpenProtocolStreamError!*quic.Stream) void {
+        reply.result = result;
+        reply.event.set(io);
+    }
+};
+
+const OpenProtocolStreamMultiReply = struct {
+    event: std.Io.Event = .unset,
+    result: Switch.OpenProtocolStreamError!Switch.SelectedStream = error.ConnectionClosed,
+
+    fn complete(reply: *OpenProtocolStreamMultiReply, io: std.Io, result: Switch.OpenProtocolStreamError!Switch.SelectedStream) void {
         reply.result = result;
         reply.event.set(io);
     }
@@ -471,6 +760,13 @@ const SwitchConnectionActor = struct {
                 actor.inbox.putOneUncancelable(actor.io, .{ .shutdown = &reply }) catch break :blk false;
                 break :blk true;
             };
+            // The `.shutdown` command is only seen between commands; while
+            // actorMain is parked inside one it never reaches it. So also cancel
+            // the main future — every blocking point is a cancel point that
+            // unwinds to fiber exit. Cancel before waiting on the reply: a parked
+            // actorMain completes it only once cancel unparks it (via its defer's
+            // completePending).
+            future.cancel(actor.io) catch {};
             if (sent) reply.event.waitUncancelable(actor.io);
             _ = future.await(actor.io) catch {};
             actor.main_future = null;
@@ -485,14 +781,37 @@ const SwitchConnectionActor = struct {
         actor.closing = true;
         actor.inbox.close(actor.io);
         actor.dispatcher_running = false;
-        actor.dispatcher_group.cancel(actor.io);
-        actor.handler_group.cancel(actor.io);
+
+        // Close the connection BEFORE joining the dispatcher/handler fibers.
+        //
+        // The dispatcher parks in `acceptStream`, a futex-style wait on the
+        // connection's accept waitset. Joining via `Group.cancel` needs that wait
+        // unblocked first, and relying on the cross-executor cancel to do it is
+        // fragile: on a multi-executor runtime the cancel's wakeup can be lost
+        // while the fiber is parked, so the join blocks forever. Closing first
+        // marks the connection closed and NOTIFIES the accept waitset (a
+        // persistent, level-triggered signal), waking the wait via notify — it
+        // observes the closed connection and exits on its own; in-flight handlers
+        // likewise unblock once their streams see it. The later `cancel` calls
+        // then only JOIN already-unblocking fibers (a backstop), never deadlock.
+        // The connection is deinited LAST, after both groups join, so no fiber
+        // can still touch it.
         if (actor.conn) |conn| {
             const prev = actor.io.swapCancelProtection(.blocked);
             defer _ = actor.io.swapCancelProtection(prev);
             conn.close(actor.io, 0, "switch connection shutdown") catch {};
+
+            actor.dispatcher_group.cancel(actor.io);
+            actor.handler_group.cancel(actor.io);
+
             conn.deinit();
             actor.conn = null;
+        } else {
+            // No live connection to notify through; cancel the groups directly.
+            // With nothing parked in acceptStream against a live connection, this
+            // join cannot lose a wakeup the way the connection-backed wait can.
+            actor.dispatcher_group.cancel(actor.io);
+            actor.handler_group.cancel(actor.io);
         }
     }
 
@@ -505,33 +824,73 @@ const SwitchConnectionActor = struct {
         }
     }
 
-    fn openProtocolStream(
-        actor: *SwitchConnectionActor,
+    /// Open + initiator-negotiate on a `handler_group` fiber, off the command
+    /// fiber, so a slow responder doesn't queue this connection's other commands
+    /// behind it. Touches only the `conn` handle (resolved at spawn), never
+    /// `actor.conn`/`actor.closing`: the handle stays valid because handler_group
+    /// is cancelled+joined before `cleanup` deinits it. Completes `reply` on every
+    /// path including cancellation (stream ops surface Canceled as a value, never
+    /// unwinding past completion), since the caller parks uncancelably on it.
+    fn outboundNegotiationMulti(
+        io: std.Io,
+        conn: *quic.Connection,
+        protocol_ids: []const protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+        reply: *OpenProtocolStreamMultiReply,
+    ) void {
+        reply.complete(io, openAndNegotiate(io, conn, protocol_ids, opts));
+    }
+
+    /// A one-element list can only return that id, so the mismatch check is just
+    /// a guard against the responder echoing a candidate it was not offered.
+    fn outboundNegotiationSingle(
+        io: std.Io,
+        conn: *quic.Connection,
         protocol_id: protocols.ProtocolId,
         opts: Switch.OpenProtocolStreamOptions,
-    ) Switch.OpenProtocolStreamError!*quic.Stream {
-        const conn = actor.liveConnection() orelse return error.ConnectionClosed;
-        const stream = try conn.openStream(actor.io);
+        reply: *OpenProtocolStreamReply,
+    ) void {
+        const result = openAndNegotiate(io, conn, &.{protocol_id}, opts);
+        const selected = result catch |err| {
+            reply.complete(io, err);
+            return;
+        };
+        if (!std.mem.eql(u8, selected.selected, protocol_id)) {
+            closeStreamForCleanup(io, selected.stream);
+            selected.stream.deinit();
+            reply.complete(io, error.SelectedProtocolMismatch);
+            return;
+        }
+        reply.complete(io, selected.stream);
+    }
+
+    fn openAndNegotiate(
+        io: std.Io,
+        conn: *quic.Connection,
+        protocol_ids: []const protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+    ) Switch.OpenProtocolStreamError!Switch.SelectedStream {
+        const stream = try conn.openStream(io);
         var stream_live = true;
         errdefer if (stream_live) {
-            closeStreamForCleanup(actor.io, stream);
+            closeStreamForCleanup(io, stream);
             stream.deinit();
         };
 
-        const selected = try protocols.multistream.negotiate(actor.io, stream, &.{protocol_id}, .{
+        // The initiator proposes each id in `protocol_ids` (preference order)
+        // until the responder accepts one; `selected` aliases that element, so it
+        // stays valid as long as the caller's slice does — and it does, since the
+        // caller blocks on the reply for the whole negotiation.
+        const selected = try protocols.multistream.negotiate(io, stream, protocol_ids, .{
             .role = .initiator,
             .timeout = opts.negotiation_timeout,
         });
-        if (!std.mem.eql(u8, selected, protocol_id)) return error.SelectedProtocolMismatch;
         stream_live = false;
-        return stream;
+        return .{ .stream = stream, .selected = selected };
     }
 
     fn dispatchInboundStream(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions) Switch.DispatchError!void {
         const conn = actor.liveConnection() orelse return error.ConnectionClosed;
-        const supported = try actor.sw.supportedProtocolIds();
-        errdefer actor.allocator.free(supported);
-        if (supported.len == 0) return error.NoRegisteredProtocols;
 
         const stream = try conn.acceptStream(actor.io, .{ .timeout = opts.accept_timeout });
         var stream_live = true;
@@ -540,17 +899,35 @@ const SwitchConnectionActor = struct {
             stream.deinit();
         };
 
+        // Claim an aggregate handler slot. A full aggregate isn't retryable on
+        // this stream: close it gracefully and return HandlerLimitReached — the
+        // peer's negotiation fails but can't tell a limit from a finished handler.
+        if (!channel.tryDecrementToFloor(&actor.sw.handler_slots_total)) return error.HandlerLimitReached;
+        errdefer _ = actor.sw.handler_slots_total.fetchAdd(1, .release);
+
+        // Build the supported-protocol list only after admission, so a refused
+        // stream (the common path under load) never allocates or takes the
+        // services lock. The errdefer above rolls the slot back on these paths.
+        const supported = try actor.sw.supportedProtocolIds();
+        errdefer actor.allocator.free(supported);
+        if (supported.len == 0) return error.NoRegisteredProtocols;
+
         try actor.handler_group.concurrent(
             actor.io,
             runNegotiatedProtocolHandler,
             .{ actor.sw, actor.io, stream, supported, opts.negotiation_timeout, actor.peer_id, actor.remote_addr },
         );
+        // Spawn is the last fallible step, so on success no errdefer fires: the
+        // handler now owns the stream, the slot, and `supported`, and releases
+        // them in its defers. Only the stream cleanup needs disarming.
         stream_live = false;
     }
 
     fn startInboundDispatch(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions) Switch.StartInboundDispatchError!void {
         _ = actor.liveConnection() orelse return error.ConnectionClosed;
-        if (actor.dispatcher_running) return error.AlreadyDispatching;
+        // Idempotent: a second start (e.g. auto-dispatch in manageConnection plus
+        // an explicit startInboundDispatcher call) is a no-op, not an error.
+        if (actor.dispatcher_running) return;
         actor.sw.freezeProtocolRegistry();
         try actor.dispatcher_group.concurrent(actor.io, inboundDispatcher, .{ actor, opts });
         actor.dispatcher_running = true;
@@ -565,9 +942,16 @@ const SwitchConnectionActor = struct {
     fn close(actor: *SwitchConnectionActor, code: u64, reason: []const u8) Switch.CloseError!void {
         const conn = actor.liveConnection() orelse return error.ConnectionClosed;
         actor.closing = true;
+
+        // Close the connection BEFORE stopping the dispatcher / joining handlers,
+        // for the same persistent-signal reason as `cleanup`: closing wakes a
+        // dispatcher parked in acceptStream so it exits on its own, and the joins
+        // then only reap already-unblocking fibers. Capture and return the close
+        // result after the joins so the caller still sees the real outcome.
+        const result = conn.close(actor.io, code, reason);
         actor.stopInboundDispatch();
         actor.handler_group.cancel(actor.io);
-        return conn.close(actor.io, code, reason);
+        return result;
     }
 
     fn stats(actor: *SwitchConnectionActor) quic.ConnectionStats {
@@ -594,14 +978,38 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
         };
         switch (command) {
             .open_protocol_stream => |cmd| {
-                const result = actor.openProtocolStream(cmd.protocol_id, cmd.opts) catch |err| {
-                    cmd.reply.complete(actor.io, err);
-                    if (err == error.Canceled) return error.Canceled;
+                const conn = actor.liveConnection() orelse {
+                    cmd.reply.complete(actor.io, error.ConnectionClosed);
                     continue;
                 };
-                cmd.reply.complete(actor.io, result);
+                // Spawn can only fail with ConcurrencyUnavailable, never Canceled; complete the caller and continue.
+                actor.handler_group.concurrent(
+                    actor.io,
+                    SwitchConnectionActor.outboundNegotiationSingle,
+                    .{ actor.io, conn, cmd.protocol_id, cmd.opts, cmd.reply },
+                ) catch |err| cmd.reply.complete(actor.io, err);
+            },
+            .open_protocol_stream_multi => |cmd| {
+                const conn = actor.liveConnection() orelse {
+                    cmd.reply.complete(actor.io, error.ConnectionClosed);
+                    continue;
+                };
+                actor.handler_group.concurrent(
+                    actor.io,
+                    SwitchConnectionActor.outboundNegotiationMulti,
+                    .{ actor.io, conn, cmd.protocol_ids, cmd.opts, cmd.reply },
+                ) catch |err| cmd.reply.complete(actor.io, err);
             },
             .dispatch_inbound_stream => |cmd| {
+                // The continuous dispatcher already owns this connection's accept
+                // queue, so a manual single-shot dispatch is satisfied-by-the-running
+                // dispatcher: a second consumer would race it for one stream and one
+                // would starve. Report success and skip (mirrors the idempotent-no-op
+                // at startInboundDispatch).
+                if (actor.dispatcher_running) {
+                    cmd.reply.complete(actor.io, {});
+                    continue;
+                }
                 actor.dispatchInboundStream(cmd.opts) catch |err| {
                     cmd.reply.complete(actor.io, err);
                     if (err == error.Canceled) return error.Canceled;
@@ -642,6 +1050,7 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
 fn completeCommandClosed(io: std.Io, command: Command) void {
     switch (command) {
         .open_protocol_stream => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
+        .open_protocol_stream_multi => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
         .dispatch_inbound_stream => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
         .start_inbound_dispatch => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
         .stop_inbound_dispatch => |reply| reply.complete(io),
@@ -662,6 +1071,21 @@ fn inboundDispatcher(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions
                 return;
             },
             error.OutOfMemory => return,
+            error.ConcurrencyUnavailable => {
+                // Out of fibers/threads — like OutOfMemory, looping would
+                // tight-spin (accept and roll back instantly), so exit. The
+                // connection stays up; inbound dispatch stops.
+                std.log.warn("switch dispatcher exiting: cannot spawn handler (concurrency unavailable)", .{});
+                return;
+            },
+            error.HandlerLimitReached => {
+                // Aggregate cap full. Keep accepting but back off, so a flood of
+                // queued streams can't spin the loop accepting-and-closing at full
+                // speed; a slot frees within a handler's lifetime so a coarse poll
+                // suffices. Cancel = teardown.
+                io_time.ms(5).sleep(actor.io) catch return;
+                continue;
+            },
             else => |e| {
                 std.log.debug("switch dispatcher: per-stream error: {}", .{e});
                 continue;
@@ -679,6 +1103,10 @@ fn runNegotiatedProtocolHandler(
     peer_id: PeerId,
     remote_addr: std.Io.net.IpAddress,
 ) std.Io.Cancelable!void {
+    // Return the aggregate slot last (this defer runs after the stream is torn
+    // down), so the slot only frees once this handler is fully done. A plain
+    // atomic add — nobody waits on the counter, so no wake is needed.
+    defer _ = sw.handler_slots_total.fetchAdd(1, .release);
     defer sw.allocator.free(supported);
     defer {
         const prev = io.swapCancelProtection(.blocked);
@@ -723,7 +1151,11 @@ fn runNegotiatedProtocolHandler(
 }
 
 fn closeStreamForCleanup(io: std.Io, stream: *quic.Stream) void {
-    stream.close(io) catch |err| std.log.debug("failed to close QUIC stream during cleanup: {}", .{err});
+    // FIN-only: finish our write side but do NOT STOP_SENDING(0) the read side,
+    // because a handler may have pushed a response (e.g. identify) the peer is
+    // still reading and an eager STOP_SENDING races that read on some stacks
+    // (matches go-libp2p `CloseWrite` / rust-libp2p `Stream::poll_close`).
+    stream.closeGraceful(io) catch |err| std.log.debug("failed to close QUIC stream during cleanup: {}", .{err});
 }
 
 /// libp2p-format multiaddr text for an IPv4/IPv6 UDP/quic-v1 endpoint.
@@ -826,6 +1258,11 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     defer server.deinit();
     const client = try Switch.init(allocator, io, client_endpoint);
     defer client.deinit();
+    // This test drives inbound dispatch MANUALLY, so it opts out of auto
+    // inbound-dispatch — otherwise the auto continuous dispatcher races the
+    // manual single-stream accept on the same connection.
+    server.auto_inbound_dispatch = false;
+    client.auto_inbound_dispatch = false;
 
     const HandlerEvent = struct {
         len: usize = 0,
@@ -958,7 +1395,10 @@ test "switch dispatches inbound streams to registered protocol handlers" {
         try std.testing.expectEqualStrings("ipfs/0.1.0", identify.reader.getProtocolVersion());
         try std.testing.expectEqualStrings("eth-p2p-z/test", identify.reader.getAgentVersion());
         try std.testing.expectEqual(@as(usize, 1), identify.reader.listenAddrsCount());
-        try std.testing.expectEqualStrings(identify_listen_addrs[0], identify.reader.listenAddrsNext().?);
+        // listenAddrs are BINARY multiaddrs on the wire; decode before comparing.
+        var got_listen = try Multiaddr.fromBytes(allocator, identify.reader.listenAddrsNext().?);
+        defer got_listen.deinit(allocator);
+        try std.testing.expectEqualStrings(identify_listen_addrs[0], got_listen.bytes);
         try std.testing.expectEqual(@as(usize, 2), identify.reader.protocolsCount());
         try std.testing.expectEqualStrings(identify_protocols[0], identify.reader.protocolsNext().?);
         try std.testing.expectEqualStrings(identify_protocols[1], identify.reader.protocolsNext().?);
@@ -1033,4 +1473,815 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     client_conn_live = false;
     server_conn.deinit();
     server_conn_live = false;
+}
+
+test "serve accepts and dispatches every inbound connection without a manual accept loop" {
+    // `serve` spawns a Switch-owned accept loop, so a server just listen()s,
+    // registers handlers, and serve()s. Two clients dial the same server and the
+    // handler must run for BOTH connections — guarding the multi-connection case
+    // a one-shot accept() would miss (e.g. py-libp2p opens a second connection
+    // after identify).
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var c1_key = try identity.KeyPair.generate(.ED25519);
+    defer c1_key.deinit();
+    var c2_key = try identity.KeyPair.generate(.ED25519);
+    defer c2_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const c1_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &c1_key, .{});
+    defer c1_endpoint.deinit();
+    const c2_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &c2_key, .{});
+    defer c2_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const c1 = try Switch.init(allocator, io, c1_endpoint);
+    defer c1.deinit();
+    const c2 = try Switch.init(allocator, io, c2_endpoint);
+    defer c2.deinit();
+
+    // Echo one byte and record that the handler ran. Capacity 2 = one slot per
+    // expected connection.
+    const EchoHandler = struct {
+        queue: *std.Io.Queue(u8),
+        fn run(self: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            var buf: [1]u8 = undefined;
+            try stream.readAll(handler_io, &buf, .{});
+            try stream.writeAll(handler_io, &buf, .{});
+            try self.queue.putOne(handler_io, buf[0]);
+        }
+    };
+    var queue_buffer: [2]u8 = undefined;
+    var queue = std.Io.Queue(u8).init(&queue_buffer);
+    var handler = EchoHandler{ .queue = &queue };
+    try server.addProtocolService(
+        "/test/serve/1.0.0",
+        protocols.streamHandlerService(EchoHandler, EchoHandler.run, &handler),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    // The point of the test: start serving with NO manual accept() call anywhere.
+    try server.serve(io);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const c1_conn = try c1.dial(dial_addr, .{});
+    defer c1_conn.deinit();
+    const c2_conn = try c2.dial(dial_addr, .{});
+    defer c2_conn.deinit();
+
+    inline for (.{ .{ c1_conn, @as(u8, 0xA1) }, .{ c2_conn, @as(u8, 0xB2) } }) |pair| {
+        const conn = pair[0];
+        const byte = pair[1];
+        const stream = try conn.openProtocolStream("/test/serve/1.0.0", .{});
+        defer stream.deinit();
+        defer stream.close(io) catch {};
+        var out = [_]u8{byte};
+        try stream.writeAll(io, &out, .{});
+        var in: [1]u8 = undefined;
+        try stream.readAll(io, &in, .{});
+        try std.testing.expectEqual(byte, in[0]);
+    }
+
+    // The registered handler ran for BOTH connections, in either accept order.
+    const first = try queue.getOne(io);
+    const second = try queue.getOne(io);
+    try std.testing.expect((first == 0xA1 and second == 0xB2) or (first == 0xB2 and second == 0xA1));
+}
+
+test "openProtocolStreamMulti negotiates the best protocol the peer supports" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+    // This test drives inbound dispatch MANUALLY (its own dispatch thread), so it
+    // opts out of auto inbound-dispatch — otherwise the auto continuous dispatcher
+    // races the manual single-stream accept on the same connection and one of them
+    // starves on a second stream that never arrives (a timeout-bounded flake).
+    server.auto_inbound_dispatch = false;
+    client.auto_inbound_dispatch = false;
+
+    // Server registers middle + low but NOT high. The client proposes
+    // [high, middle, low]; the responder rejects "high" and accepts "middle" (the
+    // first it supports), so the negotiated protocol must be "middle".
+    const high = "/test/multi/3.0.0";
+    const middle = "/test/multi/2.0.0";
+    const low = "/test/multi/1.0.0";
+
+    const OneByteHandler = struct {
+        fn run(_: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            var b: [1]u8 = undefined;
+            try stream.readAll(handler_io, &b, .{});
+        }
+    };
+    var one_byte = OneByteHandler{};
+    // Register middle and low (each a distinct service instance — registering one
+    // instance under several keys would double-free on Switch teardown).
+    try server.addProtocolService(middle, protocols.streamHandlerService(OneByteHandler, OneByteHandler.run, &one_byte));
+    try server.addProtocolService(low, protocols.streamHandlerService(OneByteHandler, OneByteHandler.run, &one_byte));
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    errdefer if (client_conn_live) client_conn.deinit();
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    errdefer if (server_conn_live) server_conn.deinit();
+
+    const DispatchCtx = struct {
+        conn: *SwitchConnection,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.conn.dispatchInboundStream(.{
+                .accept_timeout = .{ .duration = .{ .raw = .fromNanoseconds(std.time.ns_per_s), .clock = .awake } },
+            }) catch |err| {
+                ctx.err = err;
+            };
+        }
+    };
+
+    var dispatch_ctx = DispatchCtx{ .conn = server_conn };
+    const dispatch_thread = try std.Thread.spawn(.{}, DispatchCtx.run, .{&dispatch_ctx});
+
+    const proposed = [_]protocols.ProtocolId{ high, middle, low };
+    const result = try client_conn.openProtocolStreamMulti(&proposed, .{});
+    defer result.stream.deinit();
+    defer closeStreamForCleanup(io, result.stream);
+    // "high" is unregistered → rejected; "middle" is the first the peer accepts.
+    try std.testing.expectEqualStrings(middle, result.selected);
+    // Send the one byte the handler reads so it returns cleanly.
+    try result.stream.writeAll(io, "x", .{});
+
+    dispatch_thread.join();
+    if (dispatch_ctx.err) |err| return err;
+
+    client_conn.deinit();
+    client_conn_live = false;
+    server_conn.deinit();
+    server_conn_live = false;
+}
+
+test "manual dispatchInboundStream is a no-op when the continuous dispatcher already owns inbound" {
+    // With auto_inbound_dispatch at its default (TRUE), accept() auto-starts the
+    // continuous dispatcher, which then OWNS the connection's accept queue. A manual
+    // dispatchInboundStream on the same connection must NOT spin up a second consumer
+    // (the two would race for one stream and one would starve); it must report
+    // success via the no-op path. The continuous dispatcher must still service the
+    // peer's stream — proving no second consumer stole it.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+    // Leave server.auto_inbound_dispatch at its default TRUE: accept() auto-starts
+    // the continuous dispatcher that owns inbound here.
+
+    // Echo one byte and record that the auto-dispatcher's handler ran.
+    const EchoHandler = struct {
+        queue: *std.Io.Queue(u8),
+        fn run(self: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            var buf: [1]u8 = undefined;
+            try stream.readAll(handler_io, &buf, .{});
+            try stream.writeAll(handler_io, &buf, .{});
+            try self.queue.putOne(handler_io, buf[0]);
+        }
+    };
+    var queue_buffer: [1]u8 = undefined;
+    var queue = std.Io.Queue(u8).init(&queue_buffer);
+    var handler = EchoHandler{ .queue = &queue };
+    try server.addProtocolService(
+        "/test/noop/1.0.0",
+        protocols.streamHandlerService(EchoHandler, EchoHandler.run, &handler),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+    // accept() runs auto-start: the continuous dispatcher now owns server inbound.
+    const server_conn = try server.accept();
+    defer server_conn.deinit();
+
+    // The no-op path returns immediately (it never calls acceptStream), so a short
+    // timeout still proves "success, not error": a real second consumer would block
+    // here until the timeout. Assert void, not an error.
+    try server_conn.dispatchInboundStream(.{
+        .accept_timeout = .{ .duration = .{ .raw = .fromNanoseconds(100 * std.time.ns_per_ms), .clock = .awake } },
+    });
+
+    // The continuous auto-dispatcher still services the client's stream: it echoes
+    // the byte and records that its handler ran — so no second consumer stole it.
+    const stream = try client_conn.openProtocolStream("/test/noop/1.0.0", .{});
+    defer stream.deinit();
+    defer closeStreamForCleanup(io, stream);
+    var out = [_]u8{0x7E};
+    try stream.writeAll(io, &out, .{});
+    var in: [1]u8 = undefined;
+    try stream.readAll(io, &in, .{});
+    try std.testing.expectEqual(@as(u8, 0x7E), in[0]);
+    try std.testing.expectEqual(@as(u8, 0x7E), try queue.getOne(io));
+}
+
+test "a stalled outbound negotiation does not block the connection's command lane" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+    const server_conn = try server.accept();
+    defer server_conn.deinit();
+
+    // The server never dispatches inbound streams, so the client's proposal
+    // gets no response and negotiate parks in its read until the timeout below.
+    const OpenCtx = struct {
+        conn: *SwitchConnection,
+        io: std.Io,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            const stream = ctx.conn.openProtocolStream("/stall/1.0.0", .{
+                .negotiation_timeout = .{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } },
+            }) catch |err| {
+                ctx.err = err;
+                return;
+            };
+            // Unexpected: the test asserts failure below; clean up the stream anyway.
+            closeStreamForCleanup(ctx.io, stream);
+            stream.deinit();
+        }
+    };
+    var open_ctx = OpenCtx{ .conn = client_conn, .io = io };
+    const open_thread = try std.Thread.spawn(.{}, OpenCtx.run, .{&open_ctx});
+
+    // Let the open command park in negotiation, then hit the same inbox with
+    // stats(). Serialized behind the parked negotiation it takes ~5 s; served
+    // concurrently, one command round trip. The 2 s bound sits well above the
+    // round trip and well under the stall, so it can't flake either way.
+    io_time.ms(200).sleep(io) catch {};
+    const stats_start_ns = io_time.monotonicNs(io);
+    _ = client_conn.stats();
+    const elapsed_ns = io_time.monotonicNs(io) - stats_start_ns;
+
+    open_thread.join();
+    try std.testing.expect(open_ctx.err != null);
+    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
+}
+
+test "switch fires peer connect and disconnect events on both ends" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_peer_id = try server_key.peerId(allocator);
+    const client_peer_id = try client_key.peerId(allocator);
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    // Records every peer-event the Switch fires. A mutex keeps the recorder
+    // sound even though connect/disconnect events run on whichever fiber called
+    // dial/accept/deinit (which need not be the test fiber).
+    const Recorder = struct {
+        io: std.Io,
+        lock: std.Io.Mutex = .init,
+        connected: std.ArrayList(PeerId) = .empty,
+        disconnected: std.ArrayList(PeerId) = .empty,
+
+        fn onConnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void {
+            _ = conn;
+            _ = remote_addr;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            self.connected.append(std.testing.allocator, peer) catch unreachable;
+        }
+
+        fn onDisconnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection) void {
+            _ = conn;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            self.disconnected.append(std.testing.allocator, peer) catch unreachable;
+        }
+
+        fn callback(self: *@This()) Switch.PeerEventCallback {
+            return .{
+                .ctx = self,
+                .on_connected = onConnected,
+                .on_disconnected = onDisconnected,
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.connected.deinit(std.testing.allocator);
+            self.disconnected.deinit(std.testing.allocator);
+        }
+    };
+
+    var server_recorder = Recorder{ .io = io };
+    defer server_recorder.deinit();
+    var client_recorder = Recorder{ .io = io };
+    defer client_recorder.deinit();
+
+    server.setPeerEventCallback(server_recorder.callback());
+    client.setPeerEventCallback(client_recorder.callback());
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    errdefer if (client_conn_live) client_conn.deinit();
+
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    errdefer if (server_conn_live) server_conn.deinit();
+
+    // manageConnection fires on_connected synchronously before dial/accept
+    // returns, so the records are visible now. The client learns the server's
+    // peer id; the server learns the client's.
+    try std.testing.expectEqual(@as(usize, 1), client_recorder.connected.items.len);
+    try std.testing.expect(client_recorder.connected.items[0].eql(&server_peer_id));
+    try std.testing.expectEqual(@as(usize, 1), server_recorder.connected.items.len);
+    try std.testing.expect(server_recorder.connected.items[0].eql(&client_peer_id));
+
+    try std.testing.expectEqual(@as(usize, 0), client_recorder.disconnected.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server_recorder.disconnected.items.len);
+
+    // Tearing down the client connection fires on_disconnected with the
+    // server's peer id on the client side.
+    client_conn.deinit();
+    client_conn_live = false;
+    try std.testing.expectEqual(@as(usize, 1), client_recorder.disconnected.items.len);
+    try std.testing.expect(client_recorder.disconnected.items[0].eql(&server_peer_id));
+
+    server_conn.deinit();
+    server_conn_live = false;
+    try std.testing.expectEqual(@as(usize, 1), server_recorder.disconnected.items.len);
+    try std.testing.expect(server_recorder.disconnected.items[0].eql(&client_peer_id));
+}
+
+test "switch rejects inbound handlers past the aggregate cap, recycling slots" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    // Aggregate cap = 2.
+    const server = try Switch.initWithOptions(allocator, io, server_endpoint, .{ .max_inflight_handlers_total = 2 });
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    const GateCtx = struct {
+        inflight: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+    };
+    const GatedHandler = struct {
+        ctx: *GateCtx,
+        // Records peak concurrency, then PARKS on `release` so the gate-saturated
+        // state is stable to observe (no sleep/timing race). release is set by
+        // the test once the gate has filled.
+        fn run(self: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            _ = stream;
+            const now = self.ctx.inflight.fetchAdd(1, .acq_rel) + 1;
+            var p = self.ctx.peak.load(.acquire);
+            while (now > p) {
+                if (self.ctx.peak.cmpxchgWeak(p, now, .acq_rel, .acquire)) |actual| p = actual else break;
+            }
+            self.ctx.release.wait(handler_io) catch {};
+            _ = self.ctx.inflight.fetchSub(1, .acq_rel);
+            _ = self.ctx.completed.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var ctx = GateCtx{};
+    var handler = GatedHandler{ .ctx = &ctx };
+    try server.addProtocolService(
+        "/test/gate/1.0.0",
+        protocols.streamHandlerService(GatedHandler, GatedHandler.run, &handler),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |a| allocator.free(a);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+    const server_conn = try server.accept();
+    defer server_conn.deinit();
+    try server_conn.startInboundDispatcher(.{});
+
+    // Two streams fill the aggregate cap. openProtocolStream returns once the
+    // server has negotiated, i.e. once each handler was admitted (slot claimed).
+    const s1 = try client_conn.openProtocolStream("/test/gate/1.0.0", .{});
+    defer {
+        closeStreamForCleanup(io, s1);
+        s1.deinit();
+    }
+    const s2 = try client_conn.openProtocolStream("/test/gate/1.0.0", .{});
+    defer {
+        closeStreamForCleanup(io, s2);
+        s2.deinit();
+    }
+
+    // Wait until both handlers have entered run() and parked, so both slots are
+    // definitively held.
+    var attempts: usize = 0;
+    while (ctx.inflight.load(.acquire) < 2) {
+        if (attempts >= 600) {
+            std.debug.print(
+                "aggregate cap never reached within ~3s: inflight={d}, expected 2\n",
+                .{ctx.inflight.load(.acquire)},
+            );
+            return error.SaturationTimeout;
+        }
+        attempts += 1;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 2), ctx.inflight.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), ctx.peak.load(.acquire));
+
+    // Both slots are held. Two MORE inbound streams must be rejected (the server
+    // gracefully closes them) rather than queued or blocking — so the client's
+    // openProtocolStream fails. QUIC stream-credit (100) >> the cap (2), so these
+    // streams do reach the switch and get rejected there. With a higher cap they
+    // would be admitted and succeed, so this genuinely binds the cap.
+    var rejected: usize = 0;
+    for (0..2) |_| {
+        if (client_conn.openProtocolStream("/test/gate/1.0.0", .{})) |extra| {
+            closeStreamForCleanup(io, extra); // unexpected admission past the cap
+            extra.deinit();
+        } else |_| {
+            rejected += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), rejected);
+    // The rejects ran no handler: still exactly the cap in flight, peak never exceeded it.
+    try std.testing.expectEqual(@as(usize, 2), ctx.inflight.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), ctx.peak.load(.acquire));
+
+    // Release the two; they finish and RETURN their slots.
+    ctx.release.set(io);
+    attempts = 0;
+    while (ctx.completed.load(.acquire) < 2) {
+        if (attempts >= 600) {
+            std.debug.print("admitted handlers did not complete within ~3s: completed={d}\n", .{ctx.completed.load(.acquire)});
+            return error.CompletionTimeout;
+        }
+        attempts += 1;
+        io_time.ms(5).sleep(io) catch {};
+    }
+
+    // Slots are recycled, not leaked: a new inbound stream is admitted again.
+    // Retry to absorb the brief window between a handler's completed++ and its
+    // slot-return defer running.
+    attempts = 0;
+    const s3 = blk: {
+        while (true) {
+            if (client_conn.openProtocolStream("/test/gate/1.0.0", .{})) |s| break :blk s else |_| {}
+            if (attempts >= 600) return error.SlotsNotRecycled;
+            attempts += 1;
+            io_time.ms(5).sleep(io) catch {};
+        }
+    };
+    defer {
+        closeStreamForCleanup(io, s3);
+        s3.deinit();
+    }
+    // Its handler runs (release already set) and completes; peak never exceeds the cap.
+    attempts = 0;
+    while (ctx.completed.load(.acquire) < 3) {
+        if (attempts >= 600) return error.RecycledHandlerDidNotComplete;
+        attempts += 1;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 2), ctx.peak.load(.acquire));
+}
+
+test "closeListener unblocks a waiting accept for graceful shutdown" {
+    // The core graceful-shutdown proof: a fiber parked in Switch.accept() (no
+    // pending inbound) must be released cleanly by closeListener — returning the
+    // distinct error.ListenerClosed (NOT error.Canceled) — so the accept loop
+    // exits promptly, and a subsequent deinit completes with no hang or leak.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    // An accept loop that mirrors the interop binary's: it accepts in a loop and
+    // treats ListenerClosed (and Canceled) as a clean stop. Records the terminal
+    // error and the number of accepts so the test can assert what unblocked it.
+    const AcceptLoop = struct {
+        sw: *Switch,
+        done: std.Io.Event = .unset,
+        terminal: ?anyerror = null,
+        accepts: usize = 0,
+
+        fn run(self: *@This()) void {
+            while (true) {
+                const conn = self.sw.accept() catch |err| {
+                    self.terminal = err;
+                    self.done.set(self.sw.io);
+                    return;
+                };
+                self.accepts += 1;
+                conn.deinit();
+            }
+        }
+    };
+
+    var loop = AcceptLoop{ .sw = server };
+    var loop_future = try std.Io.concurrent(io, AcceptLoop.run, .{&loop});
+
+    // Give the fiber time to actually park inside accept() with nothing pending,
+    // so we are exercising the blocked-accept wakeup (not a pre-close fast path).
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expect(!loop.done.isSet());
+
+    // Ask the listener to stop accepting. The parked accept() must wake.
+    server.closeListener(io);
+
+    // The accept fiber must exit promptly. Bounded wait so a regression (the old
+    // lost-wake hang) fails the test instead of blocking the suite forever.
+    var waited_ms: usize = 0;
+    while (!loop.done.isSet()) {
+        if (waited_ms >= 5000) return error.AcceptDidNotUnblock;
+        io_time.ms(10).sleep(io) catch {};
+        waited_ms += 10;
+    }
+    loop_future.await(io);
+
+    // It unblocked with the clean closed error, distinct from a fiber cancel, and
+    // never spuriously accepted a connection (none was dialed).
+    try std.testing.expectEqual(@as(anyerror, error.ListenerClosed), loop.terminal.?);
+    try std.testing.expectEqual(@as(usize, 0), loop.accepts);
+
+    // closeListener is idempotent: a second call (and the implicit close inside
+    // server.deinit() / endpoint.deinit() below) must not double-close or fault.
+    server.closeListener(io);
+
+    // A fresh accept after the listener is closed returns the clean error too,
+    // rather than hanging.
+    try std.testing.expectError(error.ListenerClosed, server.accept());
+}
+
+test "closeListener is idempotent across repeated calls and teardown" {
+    // Closing the accept queue is guarded by the channel's own `closed` flag, so
+    // calling closeListener many times (and again implicitly inside deinit) must
+    // not double-close, fault, or leak. This exercises the idempotency directly,
+    // without a parked accept fiber: just close repeatedly on a bound listener.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    // Several closes in a row, each a no-op after the first.
+    server.closeListener(io);
+    server.closeListener(io);
+    server.stopAccepting(io);
+
+    // Every accept after closing reports the clean closed error, never hangs.
+    try std.testing.expectError(error.ListenerClosed, server.accept());
+    try std.testing.expectError(error.ListenerClosed, server.accept());
+
+    // The deferred server.deinit() / endpoint.deinit() below run the listener's
+    // full teardown, which closes the same accept channel once more — still safe.
+}
+
+test "closeListener drains a queued-but-unaccepted inbound connection without leak" {
+    // An inbound connection buffered in the accept queue but never handed to a
+    // Switch.accept() caller must be released by closing the listener (and the
+    // following endpoint teardown), not orphaned — the testing allocator's leak
+    // check is the assertion.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    // Dial in: the server's router completes the handshake and BUFFERS the
+    // resulting connection in the accept queue. We deliberately do NOT call
+    // server.accept(), so the inbound connection stays queued and unaccepted.
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+
+    // Give the server's router fiber time to publish the accepted connection into
+    // the accept queue, so it is genuinely buffered before we stop accepting.
+    var waited_ms: usize = 0;
+    while (server_endpoint.stats().connections_established == 0) {
+        if (waited_ms >= 5000) return error.InboundNeverQueued;
+        io_time.ms(10).sleep(io) catch {};
+        waited_ms += 10;
+    }
+    // A small extra settle so the publish into the queue has definitely landed.
+    io_time.ms(50).sleep(io) catch {};
+
+    // Stop accepting WITHOUT ever calling server.accept(): the connection stays
+    // buffered in the closed accept queue. The listener teardown (server.deinit
+    // -> endpoint.deinit) must drain and release it; a leak fails the test.
+    server.closeListener(io);
+    server.closeListener(io); // still idempotent with a buffered item present.
 }
